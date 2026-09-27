@@ -35,7 +35,6 @@ import shutil
 import subprocess
 import sys
 import time
-import uuid
 from pathlib import Path
 from urllib.parse import quote
 
@@ -943,13 +942,8 @@ def loop_done_no_pr(root: Path, reason: str | None, pr: str | None = None) -> in
                   followUps=[item['url'] for item in items], at=time.time())
     path = root / '.workbench/state/loop-done.json'
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
-        try:
-            temporary.write_text(json.dumps(record, indent=2), encoding='utf-8')
-            os.replace(temporary, path)
-        finally:
-            temporary.unlink(missing_ok=True)
+        from conductor import atomic_json
+        atomic_json(path, record)
     except OSError as err:
         print(f'wb: loop-state done --no-pr: cannot record completion: {err}', file=sys.stderr)
         return 2

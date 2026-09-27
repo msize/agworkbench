@@ -2,8 +2,10 @@
 """closer - the autonomous close after a merge or closed no-op issue: one implementation, two callers.
 
 The relay runs it after a MERGED PR's final notices are drained or a closed no-op issue is recorded.
-The conductor runs it as a backstop for a terminal member whose relay has gone (#33). Neither closes on a timeout alone: after CLOSE_WAIT only
-unread pre-merge implementer mail is overridden (#44); every other blocker still refuses.
+The conductor runs it as a backstop for a terminal member whose relay has gone (#33). Neither closes
+on a timeout alone: after CLOSE_WAIT only unread implementer mail from before the merge or no-PR
+done record is overridden (#44); every other blocker still refuses. No-PR closes require a fresh
+GitHub CLOSED check before touching a helper or issue session.
 
 Stepwise on purpose: `step_helpers()` and `agent_blockers()` each look once and return, keeping
 their evidence (settled pane hashes) in the object, so the relay can loop on them while it keeps
@@ -18,11 +20,12 @@ delivering mail, and the conductor can advance one check per tick without blocki
   (a helper started with a shell, the old way, never qualifies), and it has been unchanged for
   CLOSE_SETTLE seconds. No prompt parsing.
 - The issue session (exactly the two agent panes) closes only when the planner recorded
-  `loop-state done` for this PR, no mail is unread, no .git/index.lock exists, and both agent panes
+  `loop-state done` for this PR or a `done --no-pr` record for this issue, no mail is unread,
+  no .git/index.lock exists, and both agent panes
   are idle with a provably empty composer and unchanged for CLOSE_SETTLE seconds.
 - Mail the implementer never has to act on does not count as unread (#44): the relay's own final
-  notices for this PR (`github-pr<N>-...`), and anything created at or after the merge
-  (`close_merged_at` in relay.json). Other unread implementer mail is a soft blocker: it waits for
+  notices for this PR (`github-pr<N>-...`), and anything created at or after the merge or no-PR done
+  time (`close_merged_at` in relay.json). Other unread implementer mail is a soft blocker: it waits for
   CLOSE_WAIT, and then the close goes ahead and logs the ids.
 """
 
@@ -154,7 +157,7 @@ class Closer:
         return True
 
     def merge_time(self, number: int | None) -> datetime | None:
-        """When the PR merged, as the relay recorded it with the pending close; None when unknown."""
+        """The merge or no-PR done time saved with the pending close; None when unknown."""
         try:
             state = json.loads((self.hub_dir / 'state' / 'relay.json').read_text(encoding='utf-8-sig'))
         except (OSError, ValueError):
@@ -292,7 +295,7 @@ class Closer:
             created = parse_time(message.get('created'))
             if ((number is not None and sender == 'github' and path.stem.startswith(f'github-pr{number}-'))
                     or (merged_at is not None and created is not None and created >= merged_at)):
-                # The relay's own final notice, or sent after the merge: nothing the PR still needs.
+                # The relay's final PR notice, or mail after the merge/no-PR done time: no action needed.
                 ignored.append(path.stem)
                 continue
             soft.append(path.stem)

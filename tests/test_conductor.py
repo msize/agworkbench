@@ -990,6 +990,9 @@ class CloseBackstop(unittest.TestCase):
         self.run_for(1000)
         self.assertEqual([], self.actions)
         self.assertIn('reopened', self.member(7)['closeStuck'])
+        self.assertIn('reopened', self.w.notify.call_args.args[0])
+        self.assertIn('NOT closing: issue #7 was reopened',
+                      (self.state / 'relay-close.log').read_text(encoding='utf-8'))
         self.assertNotIn('close_pending', q.read_json(self.state / 'relay.json'))
 
     def test_closed_no_pr_backstop_closes_and_starts_cleanup(self):
@@ -1015,6 +1018,22 @@ class CloseBackstop(unittest.TestCase):
         self.run_for(1000)
         self.assertEqual([], self.actions)
         self.assertTrue(self.member(7)['closePending'])
+        self.assertLessEqual(self.w.gh.call_count, 2)
+
+    def test_closed_no_pr_backstop_lookup_failure_is_logged_and_notified_at_timeout(self):
+        with self.store.transaction() as data:
+            data['members'][0].update(state='closed', phase='closed', pr=None, reason='duplicate')
+        q.atomic_json(self.state / 'relay.json', {'close_pending': 'no-pr'})
+        q.atomic_json(self.state / 'loop-done.json', {'pr': None, 'noPr': True, 'issue': 7})
+        self.relay_gone()
+        self.finished_helper()
+        self.w.gh = Mock(side_effect=OSError('offline'))
+        self.run_for(900 + closer.CLOSE_WAIT + 80)
+        self.assertEqual([], self.actions)
+        self.assertIn('issue state unknown: offline', self.member(7)['closeStuck'])
+        self.assertIn('issue state unknown: offline', self.w.notify.call_args.args[0])
+        self.assertIn('NOT closing: issue state unknown: offline',
+                      (self.state / 'relay-close.log').read_text(encoding='utf-8'))
 
     def test_closed_no_pr_handoff_keeps_the_conductor_running(self):
         with self.store.transaction() as data:

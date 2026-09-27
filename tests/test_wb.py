@@ -87,6 +87,8 @@ class QueueReports(unittest.TestCase):
         self.assertIn('loop-state blocked --reason "mail waiter configuration error"', text)
         self.assertIn('AGREED: no-op', text)
         self.assertIn('loop-state done --no-pr --reason', text)
+        self.assertIn('loop-state blocked --reason "no-op: <evidence>; close the issue to finish"', text)
+        self.assertIn('wb.py status blocked --sound', text)
 
     def test_no_pr_requires_a_closed_issue_and_publishes_queue_completion(self):
         (self.state / 'waiting.json').write_text('{}', encoding='utf-8')

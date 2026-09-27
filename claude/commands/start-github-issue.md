@@ -262,10 +262,13 @@ or not planned, give Codex the evidence (duplicate issue, fixing commit, or pass
 agree on the no-op verdict as `AGREED: no-op`. Post that evidence as an issue comment with the
 `<!-- agworkbench:planner -->` marker. With `autonomous=true`, close the issue with the matching
 GitHub reason (`gh issue close <N> --reason "not planned"` for a duplicate or declined work;
-`--reason "completed"` when already fixed). Without autonomy, wait for the human to decide and
-close it. Once GitHub reports CLOSED, run
+`--reason "completed"` when already fixed). Without autonomy, report
+`loop-state blocked --reason "no-op: <evidence>; close the issue to finish"` in queue mode, then
+set `wb.py status blocked --sound` and wait for the human to decide and close it. Once GitHub
+reports CLOSED, run `wb.py status active` and then
 `python "$AGWORKBENCH/lib/wb.py" loop-state done --no-pr --reason "<why>"` as the last act,
-including in queue mode; do not report `loop-state blocked` for a closed no-op issue.
+including in queue mode. A blocked queue member can report `done --no-pr` directly; a
+`loop-state resumed` report is not needed. Do not report `loop-state blocked` for a closed no-op issue.
 
 Write `.workbench/plan.md`:
 

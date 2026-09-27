@@ -103,7 +103,8 @@ def repo_name(value):
     return value.lower()
 
 
-CLOSE_BACKSTOP_AFTER = 900.0   # a merged member's close pending this long gets the backstop (#33)
+CLOSE_BACKSTOP_AFTER = 900.0   # a merged or no-PR closed member's pending close gets the backstop (#33)
+CLOSE_ISSUE_CHECK_INTERVAL = 60.0  # GitHub CLOSED gate during a no-PR backstop wait
 TRIAGE_JOB_TIMEOUT = 600.0     # one triage.py run for one member (#34)
 TRIAGE_PAUSE = 1800.0          # after a triage run stopped on a usage limit/auth or incomplete facts
 RELAY_ALIVE = 'the relay is alive but its close has been pending for 15 minutes'
@@ -971,10 +972,10 @@ class Worker:
                 self.mark(waiting[0]['number'], triageResult=f'failed: {err}'[:300])
 
     # --- the close backstop (#33) -------------------------------------------------------------------
-    # The relay closes a merged member's sessions. When that relay is gone (killed, closed, never
+    # The relay closes a merged or no-PR closed member's sessions. When it is gone (killed, closed, never
     # restarted) and its close has been pending for CLOSE_BACKSTOP_AFTER, the conductor runs the same
     # close (closer.py) one step per tick. While the relay is alive it only flags `closeStuck`: one
-    # closer at a time. Never on a timeout alone: after CLOSE_WAIT only unread pre-merge implementer
+    # closer at a time. Never on a timeout alone: after CLOSE_WAIT only unread pre-close implementer
     # mail is overridden (#44). A relay whose own close gave up in queue mode hands it over (#44):
     # it keeps close_pending, records close_handoff and closes its session, and this retries it once.
 
@@ -1044,19 +1045,26 @@ class Worker:
                 # member would let the conductor finish in the middle of this attempt.
                 self.mark(number, closeStuck=None)
         attempt = watch['attempt']
+        def refuse(reason, *, stuck=None):
+            attempt.log(f'NOT closing: {reason}')
+            self.notify(f'#{number}: autonomous close stopped: {reason}')
+            self.end_close(m, pr, hub_dir, stuck=stuck or reason)
+
         if pr is None:
             if not attempt.no_pr_done():
                 if attempt.timed_out():
-                    self.end_close(m, pr, hub_dir, stuck='the planner has not recorded `wb.py loop-state done --no-pr`')
+                    refuse('the planner has not recorded `wb.py loop-state done --no-pr`')
                 return
-            closed, detail = attempt.issue_closed(self.gh)
+            if self.clock() >= watch.get('next_issue_check', 0):
+                watch['issue_result'] = attempt.issue_closed(self.gh)
+                watch['next_issue_check'] = self.clock() + CLOSE_ISSUE_CHECK_INTERVAL
+            closed, detail = watch['issue_result']
             if closed is False:
-                attempt.log(f'NOT closing: issue #{number} was reopened')
-                self.end_close(m, pr, hub_dir, stuck=f'issue #{number} was reopened')
+                refuse(f'issue #{number} was reopened')
                 return
             if closed is None:
                 if attempt.timed_out():
-                    self.end_close(m, pr, hub_dir, stuck=f'issue state unknown: {detail}')
+                    refuse(f'issue state unknown: {detail}')
                 return
         attempt.step_helpers()
         reasons = attempt.agent_blockers(pr)
@@ -1066,9 +1074,9 @@ class Worker:
                     closed, detail = attempt.issue_closed(self.gh)
                     if closed is not True:
                         if closed is False:
-                            self.end_close(m, pr, hub_dir, stuck=f'issue #{number} was reopened')
+                            refuse(f'issue #{number} was reopened')
                         elif attempt.timed_out():
-                            self.end_close(m, pr, hub_dir, stuck=f'issue state unknown: {detail}')
+                            refuse(f'issue state unknown: {detail}')
                         return
                 attempt.close_issue_session()
                 attempt.start_cleanup(pr)
@@ -1076,9 +1084,9 @@ class Worker:
                 attempt.log('NOT closing: autonomy was turned off')
             self.end_close(m, pr, hub_dir, stuck=None)
         elif attempt.timed_out():
-            attempt.log(f'NOT closing, still waiting after {closer.CLOSE_WAIT:.0f}s: ' + '; '.join(reasons))
-            self.notify(f'#{number}: autonomous close stopped: ' + '; '.join(reasons))
-            self.end_close(m, pr, hub_dir, stuck='the backstop close timed out: ' + '; '.join(reasons))
+            detail = '; '.join(reasons)
+            refuse(f'still waiting after {closer.CLOSE_WAIT:.0f}s: {detail}',
+                   stuck='the backstop close timed out: ' + detail)
 
     def end_close(self, m, pr, hub_dir, stuck):
         path = hub_dir / 'state' / 'relay.json'
@@ -1308,7 +1316,7 @@ def close_key(m):
 
 def handed_off(m):
     """A relay handed this member's close to the conductor (#44): its relay.json holds close_handoff
-    and close_pending for the member's PR. Read under the queue's state lock by run(), so a relay that
+    and close_pending for the close key (PR number or "no-pr"). Read under the queue's state lock by run(), so a relay that
     saw this conductor running before closing its session is never left without one."""
     pr = close_key(m)
     if pr is None:

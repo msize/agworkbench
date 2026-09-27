@@ -966,12 +966,29 @@ class Relay:
             except (agw.CtlError, OSError) as err:
                 self.log(f"could not notify: {err}")
 
+    def refuse_close(self, close: "closer.Closer", number: int | None, reasons: str | list[str],
+                     *, handoff: bool = True) -> None:
+        """Refuse a close without letting a failed queue handoff crash the relay."""
+        import agw
+        items = [reasons] if isinstance(reasons, str) else reasons
+        detail = '; '.join(items)
+        close.log(f"NOT closing{', ' if detail.startswith('still waiting after') else ': '}{detail}")
+        self.close_alert(detail)
+        handed = False
+        if handoff:
+            try:
+                handed = self.hand_off_close(close, number, items)
+            except (agw.CtlError, OSError) as err:
+                close.log(f'could not hand the close to the queue conductor: {err}')
+        if not handed:
+            self.finish_close()
+
     def close_after_merge(self, number: int | None) -> None:
-        """After a merged PR and a complete drain, on an autonomous checkout: close the issue's
+        """After a merged PR drain, or a no-PR done record on a CLOSED issue: close the issue's
         helpers as soon as each is proven done and untouched (#33), the issue session only when both
         agents are provably done and idle, then this relay's own session. Mail keeps flowing while it
-        waits; a stop request, unread mail to the planner (a human's above all) or autonomy turned
-        off stops it; never on a timeout
+        waits; number=None requires fresh GitHub CLOSED checks before any session closes. A stop
+        request, unread planner mail (a human's above all), or autonomy turned off stops it; never on a timeout
         alone (after it, only unread implementer mail is overridden, #44). A refusal is handed to the
         queue conductor's backstop when there is a running one and the session is provably ours (#44)."""
         import agw
@@ -985,6 +1002,9 @@ class Relay:
             # A restarted relay owns the close again; the conductor defers to it while it lives.
             self._save()
         left_open: list[str] = []
+        next_issue_check = 0.0
+        issue_verified = False
+        issue_detail = ''
         while True:
             if self.stop_file.exists():
                 # The launcher is restarting this relay; the pending close resumes after it.
@@ -997,26 +1017,21 @@ class Relay:
                 if not close.no_pr_done():
                     reason = 'the planner has not recorded `wb.py loop-state done --no-pr`'
                     if close.timed_out():
-                        close.log(f'NOT closing: {reason}')
-                        self.close_alert(reason)
-                        if not self.hand_off_close(close, number, [reason]):
-                            self.finish_close()
+                        self.refuse_close(close, number, reason)
                         return
                     pause(self.mail_interval)
                     continue
-                closed, detail = close.issue_closed(lambda *args: gh_json(list(args)))
-                if closed is False:
-                    close.log(f'NOT closing: issue #{close.issue} was reopened')
-                    self.close_alert(f'issue #{close.issue} was reopened')
-                    self.finish_close()
-                    return
-                if closed is None:
+                if now() >= next_issue_check:
+                    closed, detail = close.issue_closed(lambda *args: gh_json(list(args)))
+                    next_issue_check = now() + self.pr_interval
+                    issue_verified = closed is True
+                    issue_detail = detail
+                    if closed is False:
+                        self.refuse_close(close, number, f'issue #{close.issue} was reopened', handoff=False)
+                        return
+                if not issue_verified:
                     if close.timed_out():
-                        reason = f'issue state unknown: {detail}'
-                        close.log(f'NOT closing: {reason}')
-                        self.close_alert(reason)
-                        if not self.hand_off_close(close, number, [reason]):
-                            self.finish_close()
+                        self.refuse_close(close, number, f'issue state unknown: {issue_detail}')
                         return
                     pause(self.mail_interval)
                     continue
@@ -1027,17 +1042,23 @@ class Relay:
                 close.log(f"helper check failed: {err}")
             reasons = close.agent_blockers(number)
             if not reasons or close.overdue_ok():
+                if number is None:
+                    closed, detail = close.issue_closed(lambda *args: gh_json(list(args)))
+                    if closed is False:
+                        self.refuse_close(close, number, f'issue #{close.issue} was reopened', handoff=False)
+                        return
+                    if closed is None:
+                        issue_verified = False
+                        issue_detail = detail
+                        next_issue_check = now() + self.pr_interval
+                        if close.timed_out():
+                            self.refuse_close(close, number, f'issue state unknown: {detail}')
+                            return
+                        pause(self.mail_interval)
+                        continue
                 break
             if close.timed_out():
-                close.log(f"NOT closing, still waiting after {closer.CLOSE_WAIT:.0f}s: " + '; '.join(reasons))
-                self.close_alert('; '.join(reasons))
-                try:
-                    handed = self.hand_off_close(close, number, reasons)
-                except (agw.CtlError, OSError) as err:
-                    close.log(f"could not hand the close to the queue conductor: {err}")
-                    handed = False
-                if not handed:
-                    self.finish_close()
+                self.refuse_close(close, number, f"still waiting after {closer.CLOSE_WAIT:.0f}s: " + '; '.join(reasons))
                 return
             pause(self.mail_interval)
         if not close.autonomous():
@@ -1048,14 +1069,6 @@ class Relay:
             close.log('[dry-run] would close the issue session and the relay')
             return
         try:
-            if number is None:
-                closed, detail = close.issue_closed(lambda *args: gh_json(list(args)))
-                if closed is not True:
-                    reason = f'issue #{close.issue} was reopened' if closed is False else f'issue state unknown: {detail}'
-                    close.log(f'NOT closing: {reason}')
-                    self.close_alert(reason)
-                    self.finish_close()
-                    return
             close.close_issue_session()
             # Before this relay's own session goes (that ends this process), and detached from it (#41).
             close.start_cleanup(number)
@@ -1390,6 +1403,30 @@ class Relay:
                   for box in {box for box, _ in targets} for path in self.hub.unread(box)}
         return {(box, mid) for box, mid in targets & unread if mid not in announced}
 
+    def no_pr_close_due(self) -> str | None:
+        """Return the no-PR done time only while the issue is closed and the branch has no open PR."""
+        close = self.closer()
+        if not close.no_pr_done():
+            return None
+        try:
+            done = json.loads((self.hub_dir / 'state' / 'loop-done.json').read_text(encoding='utf-8-sig'))
+            at = datetime.fromtimestamp(done['at'], timezone.utc).isoformat()
+        except (OSError, ValueError, OverflowError, KeyError, TypeError):
+            return None
+        prs = gh_json(['pr', 'list', '--repo', self.repo, '--head', self.branch, '--state', 'open', '--json', 'number'])
+        if not isinstance(prs, list):
+            self.log(f'cannot check open PRs for {self.branch}; no-PR close waits')
+            return None
+        if prs:
+            self.log(f'an open PR exists for {self.branch}; no-PR close waits')
+            return None
+        closed, detail = close.issue_closed(lambda *args: gh_json(list(args)))
+        if closed is False:
+            self.log(f'issue #{close.issue} is open; no-PR close waits')
+        elif closed is None:
+            self.log(f'cannot check issue #{close.issue} for no-PR close: {detail}')
+        return at if closed is True else None
+
     def run(self) -> int:
         self.log(f"relay up: {self.repo} {self.branch}; mailbox {self.hub_dir}")
         next_pr = 0.0
@@ -1432,10 +1469,15 @@ class Relay:
                 if not pending and not resets and published:
                     number, state = self.state['pr']['number'], self.state['pr'].get('state')
                     self.retire(number)
-                    self.log("PR is finished; final notices delivered or read; the relay's job is done")
+                    self.log("PR is finished; final notices delivered or read")
                     if state == 'MERGED':
                         self.close_after_merge(number)
-                    return 0
+                        return 0
+                    # A CLOSED PR may be followed by an issue closed without a new PR.
+                    drain_deadline = None
+                    self.draining = False
+                    next_pr = now() + self.pr_interval
+                    continue
                 if now() >= drain_deadline:
                     details = []
                     pending.update((m['to'], m['message_id']) for m in self.state.get('outbox', []))
@@ -1449,32 +1491,14 @@ class Relay:
                     return 0
             elif published and not self.state.get('pr') and now() >= next_no_pr:
                 next_no_pr = now() + self.pr_interval
-                path = self.hub_dir / 'state' / 'loop-done.json'
-                try:
-                    done = json.loads(path.read_text(encoding='utf-8-sig')) if path.exists() else None
-                except (OSError, ValueError):
-                    done = None
-                issue = closer.issue_from_branch(self.branch)
-                try:
-                    done_at = (datetime.fromtimestamp(done['at'], timezone.utc).isoformat()
-                               if isinstance(done, dict) and type(done.get('at')) in (int, float) else None)
-                except (OverflowError, OSError, ValueError):
-                    done_at = None
-                if (isinstance(done, dict) and done.get('noPr') is True and done.get('pr') is None
-                        and issue and str(done.get('issue')) == issue and done_at is not None):
-                    close = self.closer()
-                    closed, detail = close.issue_closed(lambda *args: gh_json(list(args)))
-                    if closed is True:
-                        self.state['close_pending'] = 'no-pr'
-                        self.state['close_merged_at'] = done_at
-                        if not self.dry_run:
-                            self._save()
-                            self.close_after_merge(None)
-                            return 0
-                    elif closed is False:
-                        self.log(f'issue #{issue} is open; no-PR close waits')
-                    else:
-                        self.log(f'cannot check issue #{issue} for no-PR close: {detail}')
+                done_at = self.no_pr_close_due()
+                if done_at is not None:
+                    self.state['close_pending'] = 'no-pr'
+                    self.state['close_merged_at'] = done_at
+                    if not self.dry_run:
+                        self._save()
+                        self.close_after_merge(None)
+                        return 0
             if drain_deadline is None and published and now() >= next_pr:
                 next_pr = now() + self.pr_interval
                 if self.watch_pr():
