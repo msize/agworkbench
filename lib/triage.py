@@ -146,9 +146,9 @@ def kill_tree(process) -> None:
         process.kill()
 
 
-def run(argv, *, timeout, cwd=None) -> subprocess.CompletedProcess:
+def run(argv, *, timeout, cwd=None, env=None) -> subprocess.CompletedProcess:
     """Run with a deadline; on timeout kill the whole tree (gh and claude have children)."""
-    process = subprocess.Popen([str(a) for a in argv], cwd=cwd, stdin=subprocess.DEVNULL,
+    process = subprocess.Popen([str(a) for a in argv], cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
         out, err = process.communicate(timeout=timeout)
