@@ -1390,6 +1390,34 @@ class LaunchBackoff(unittest.TestCase):
         self.assertEqual('timeout', self.member(1)['launchResult'])
         self.assertFalse(record.exists())
 
+    def test_locked_orphan_has_a_hard_timeout_without_deleting_its_record(self):
+        token = str(uuid.uuid4())
+        with self.store.transaction() as data:
+            data['members'][0].update(state='launching', attempt=1, token=token,
+                                      startedAt=self.now - 1801, slotReleased=False)
+        record = Path(self.member(1)['checkout']) / '.workbench/state/queue-launch.json'
+        q.atomic_json(record, dict(attempt=1, token=token, sessions=[str(uuid.uuid4())]))
+        with patch.object(q, 'file_locked', return_value=True), patch.object(self.w, 'cleanup_launch') as cleanup:
+            self.w.tick()
+        cleanup.assert_not_called()
+        self.assertTrue(record.exists())
+        self.assertEqual('pending', self.member(1)['state'])
+        self.assertIn('launchBackoff', self.store.load())
+
+    def test_backoff_admits_one_probe_with_parallel_two(self):
+        with self.store.transaction() as data:
+            data['parallel'] = 2
+            data['launchBackoff'] = dict(member=1, failures=1, until=self.now, reason='pane too narrow')
+        self.w.tick()
+        self.assertEqual([1], [n for n, _, _ in self.launches])
+
+    def test_backoff_uses_next_pending_member_when_original_is_gone(self):
+        with self.store.transaction() as data:
+            data['launchBackoff'] = dict(member=1, failures=1, until=self.now, reason='pane too narrow')
+            data['members'][0].update(state='failed', slotReleased=True)
+        self.w.tick()
+        self.assertEqual([2], [n for n, _, _ in self.launches])
+
 class PriorityOrder(unittest.TestCase):
     """#34: pending members are admitted P0, P1, untriaged, P2, P3, oldest issue first; with -Triage
     an untriaged member is triaged (in the background, one at a time) before it may be admitted."""

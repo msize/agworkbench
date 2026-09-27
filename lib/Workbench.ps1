@@ -449,7 +449,15 @@ function Add-QueueCreatedSession([string] $Checkout, [string] $Id) {
         $sessions = @($record.sessions)
     }
     $sessions += $Id
-    Write-AtomicJson $path @{ attempt = $script:Launch.QueueContext.attempt; token = $script:Launch.QueueContext.token; sessions = $sessions }
+    try {
+        Write-AtomicJson $path @{ attempt = $script:Launch.QueueContext.attempt; token = $script:Launch.QueueContext.token; sessions = $sessions }
+    } catch {
+        $failure = $_
+        # A relay may already be running through --command. Close it even if recording failed.
+        try { Invoke-Ctl session restore none --target $Id | Out-Null } catch { Write-LaunchLog cleanup "restore $Id failed: $_" }
+        try { Invoke-Ctl session close $Id | Out-Null } catch { Write-LaunchLog cleanup "close $Id failed: $_" }
+        throw $failure
+    }
 }
 
 function Close-QueueSessions([string] $Checkout) {
@@ -1430,13 +1438,10 @@ function Start-WorkbenchSessionCore {
         $null = Reserve-ClaudeIdentity $Checkout $script:Launch.IssueRef
         $selection = @()
         if ($script:Launch.QueueContext) { $selection = @('--no-select') }
-        if ($script:Launch.QueueContext) {
-            $id = Invoke-Ctl session new --name "#$Number $Slug" --cwd $Checkout `
-                --workspace-name $RepoName --create-workspace @selection
-        } else {
-            $id = Invoke-Ctl session new --name "#$Number $Slug" --cwd $Checkout `
-                --workspace-name $RepoName --create-workspace --command $ClaudeLaunch @selection
-        }
+        $command = @()
+        if (-not $script:Launch.QueueContext) { $command = @('--command', $ClaudeLaunch) }
+        $id = Invoke-Ctl session new --name "#$Number $Slug" --cwd $Checkout `
+            --workspace-name $RepoName --create-workspace @command @selection
         $script:Launch.SessionId = ($id -split '\s+')[0]
         if (-not (Test-SessionGuid $script:Launch.SessionId)) { throw 'session new returned an invalid pane id' }
         if ($script:Launch.QueueContext) { Add-QueueCreatedSession $Checkout $script:Launch.SessionId }
@@ -1550,7 +1555,7 @@ function Start-WorkbenchSessionCore {
     Write-Done "mailbox ready: $hub"
     $roles = @('Codex')
     # A previous run may have split or registered an empty Claude pane before failing.
-    # Fresh sessions already start Claude through --command; never probe/type that pane.
+    # Interactive fresh sessions start Claude through --command; queue sessions prove and type it below.
     if ($script:Launch.Adopted -and -not $AdoptSession) { $roles = @('Claude', 'Codex') }
     if ($script:Launch.QueueContext -and -not $script:Launch.Adopted) { $roles = @('Codex', 'Claude') }
     foreach ($role in $roles) {

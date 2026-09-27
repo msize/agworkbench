@@ -1323,7 +1323,10 @@ class QueueEntry(LauncherFixtures):
             "function New-IssueCheckout { param($Issue,$Title,$Root,$Directory); "
             "if (-not $Directory) {throw 'queue did not pass saved checkout'}; "
             "Connect-LaunchLog " + ps_quote(self.log_path) + "; return @{Dir=$Directory;Branch='issue-7-fix-x'} }\n"
-            "function Grant-CodexTrust {}\nfunction Grant-ClaudeTrust {}\n")
+            "function Grant-CodexTrust {}\nfunction Grant-ClaudeTrust {}\n"
+            "$script:WindowTiming = @{ Poll = 0.05; Wait = 0.3 }\n"
+            "function Test-AgwintermMinimized { return $false }\n"
+            "function Restore-AgwintermWindow {}\n")
         self.write_helpers()
 
     def write_helpers(self, extra=''):
@@ -1693,6 +1696,66 @@ class QueueEntry(LauncherFixtures):
         self.assertEqual(('incomplete', 'window', True),
                          (launch['result'], launch['stage'], launch['infra']))
         self.assertFalse(any(c[:2] == ['session', 'type'] for c in self.calls()))
+
+    def test_terminal_start_failure_is_infrastructure(self):
+        self.env['AGWINTERM_ENABLED'] = '0'
+        self.write_helpers("\nfunction Test-AgwintermRunning { return $false }\n"
+                           "function Start-AgwintermApp { throw 'control pipe unavailable' }\n")
+        result = self.entry()
+        self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+        launch = self.store.load()['members'][0]['result']
+        self.assertEqual(('terminal', True), (launch['stage'], launch['infra']))
+
+    def test_minimized_window_is_restored_before_agents_start(self):
+        marker = self.temp / 'window-restored.txt'
+        self.write_helpers("\nfunction Test-AgwintermMinimized { return -not (Test-Path -LiteralPath " +
+                           ps_quote(marker) + ") }\n"
+                           "function Restore-AgwintermWindow { Set-Content -LiteralPath " +
+                           ps_quote(marker) + " -Value restored }\n")
+        result = self.entry()
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertTrue(marker.exists())
+
+    def test_unavailable_metrics_are_window_infrastructure(self):
+        self.scenario['responses'] = [{'args': '^session metrics', 'stdout': '{"ok":false,"error":"no session"}'}]
+        self.save_scenario()
+        result = self.entry()
+        self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+        launch = self.store.load()['members'][0]['result']
+        self.assertEqual(('window', True), (launch['stage'], launch['infra']))
+
+    def test_failure_after_relay_creation_closes_both_created_sessions(self):
+        self.scenario['responses'] = [{'args': '^session restore .* --target ' + RELAY_ID,
+                                       'stdout': 'pin failed', 'exit': 1}]
+        self.save_scenario()
+        result = self.entry()
+        self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+        self.assertEqual({MAIN_ID, RELAY_ID},
+                         {c[2] for c in self.calls() if c[:2] == ['session', 'close']})
+        launch = self.store.load()['members'][0]['result']
+        self.assertEqual(('relay', True, None), (launch['stage'], launch['infra'], launch['relaySession']))
+        self.assertFalse((self.checkout / '.workbench/state/queue-launch.json').exists())
+
+    def test_relay_record_write_failure_closes_its_running_session(self):
+        self.write_helpers("\n$script:RealAtomicWrite = ${function:Write-AtomicJson}\n"
+                           "function Write-AtomicJson { param($Path,$Record); "
+                           "if ($Path -like '*queue-launch.json' -and (Test-Path -LiteralPath $Path)) "
+                           "{ throw 'relay record write failed' }; & $script:RealAtomicWrite $Path $Record }\n")
+        result = self.entry()
+        self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+        self.assertEqual({MAIN_ID, RELAY_ID},
+                         {c[2] for c in self.calls() if c[:2] == ['session', 'close']})
+        self.assertFalse((self.checkout / '.workbench/state/queue-launch.json').exists())
+
+    def test_adopted_session_is_never_recorded_or_closed(self):
+        self.resumed(relay=False)
+        membership = self.checkout / '.workbench/state/queue-member.json'
+        membership.parent.mkdir(parents=True, exist_ok=True)
+        membership.write_text(json.dumps(dict(queue=str(self.queue_path), repo='o/repo', number=7)), encoding='utf-8')
+        result = self.entry()
+        self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+        self.assertFalse(any(c[:2] == ['session', 'close'] for c in self.calls()))
+        self.assertFalse((self.checkout / '.workbench/state/queue-launch.json').exists())
 
     def test_non_queue_loop_is_refused_before_pin_or_typing(self):
         self.resumed()

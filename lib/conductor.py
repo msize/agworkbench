@@ -444,6 +444,16 @@ def admission_key(m):
     return triage.RANK.get(m.get('priority'), 2), created is None, created or '', m.get('since') or 0, m['number']
 
 
+def defer_launch(data, member, reason, now):
+    """Persist an infrastructure deferral and its next single-member probe."""
+    failures = data.get('launchBackoff', {}).get('failures', 0) + 1
+    data['launchBackoff'] = dict(member=member['number'], failures=failures,
+                                 until=now + min(60 * 2 ** min(failures - 1, 4), 900), reason=reason)
+    if failures >= 2:
+        data['launchPaused'] = 'launches failing: ' + reason
+    member.update(state='pending', slotReleased=False, reason=reason)
+
+
 def awaits_triage(data, m):
     """With -Triage, an untriaged member waits for its triage run before it may be admitted."""
     return bool(data.get('triage')) and m.get('priority') is None and 'triageResult' not in m
@@ -724,12 +734,12 @@ class Worker:
                 return
             sessions = record.get('sessions', [])
             before = agw.tree()
-            live = {s['id']: s for w in before['workspaces'] for s in w['sessions']}
             for session_id in sessions:
-                session = live.get(session_id)
-                if not session:
+                found = agw.find_session(session_id, before)
+                if not found:
                     continue
-                for pane in session.get('paneIds') or [session_id]:
+                _, session = found
+                for pane in agw.panes_of(session):
                     try:
                         agw.clear_restore(pane)
                     except (agw.CtlError, OSError) as err:
@@ -739,7 +749,7 @@ class Worker:
                 except (agw.CtlError, OSError) as err:
                     self.error(f'cleanup session {session_id}', err)
             after = agw.tree()
-            still = {s['id'] for w in after['workspaces'] for s in w['sessions']}
+            still = {s['id'] for _, s in agw.sessions(after)}
             record['sessions'] = [sid for sid in sessions if sid in still]
             if record['sessions']:
                 atomic_json(path, record)
@@ -1067,11 +1077,7 @@ class Worker:
                         data.pop('launchBackoff', None)
                         data.pop('launchPaused', None)
                     elif infra:
-                        failures = data.get('launchBackoff', {}).get('failures', 0) + 1
-                        data['launchBackoff'] = dict(member=m['number'], failures=failures,
-                                                     until=self.clock() + min(60 * 2 ** min(failures - 1, 4), 900), reason=reason)
-                        if failures >= 2:
-                            data['launchPaused'] = 'launches failing: ' + reason
+                        defer_launch(data, m, reason, self.clock())
                     else:
                         m['slotReleased'] = True
                 if m['state'] in {'active', 'pr-open', 'blocked'}:
@@ -1087,6 +1093,7 @@ class Worker:
         self.step_triage()
         self.close_backstop()
         launches = []
+        orphan_timeouts = []
         disk = self.disk_pause(self.store.load()['config'])
         with self.store.transaction() as data:
             # Announced on pause and on resume, by this worker (a restarted conductor announces a pause it
@@ -1109,7 +1116,7 @@ class Worker:
             for m in pending:
                 launch_in_flight = any(other['state'] == 'launching' for other in data['members'])
                 if disk or (backoff and (self.clock() < backoff['until'] or launch_in_flight or launches)):
-                    break                  # low disk: nothing is admitted, and every member stays pending
+                    break                  # disk/back-off/probe gate: keep other members pending
                 if count >= data['parallel'] or (awaits_triage(data, m) and not paused):
                     break                  # strictly in order: nothing behind a member still being triaged
                 if m['checkoutEstablished'] and not Path(m['checkout']).is_dir():
@@ -1128,20 +1135,23 @@ class Worker:
                         # Low disk never fails a member (#41): no re-spawn, and its window restarts,
                         # so it is re-spawned, not timed out, once space returns.
                         m['startedAt'] = self.clock()
-                    elif (self.clock() - m['startedAt'] >= 600 and
-                          not file_locked(self.store.directory / f'member-{m["number"]}.lock') and
-                          not checkout_locked(Path(m['checkout']))):
-                        self.cleanup_launch(m['checkout'], m.get('token'))
-                        reason = 'launch deferred: timeout: interrupted launcher produced no result'
-                        failures = data.get('launchBackoff', {}).get('failures', 0) + 1
-                        data['launchBackoff'] = dict(member=m['number'], failures=failures,
-                                                     until=self.clock() + min(60 * 2 ** min(failures - 1, 4), 900), reason=reason)
-                        if failures >= 2:
-                            data['launchPaused'] = 'launches failing: ' + reason
-                        m.update(state='pending', slotReleased=False, launchResult='timeout', reason=reason)
+                    elif self.clock() - m['startedAt'] >= 600:
+                        unlocked = (not file_locked(self.store.directory / f'member-{m["number"]}.lock') and
+                                    not checkout_locked(Path(m['checkout'])))
+                        if unlocked or self.clock() - m['startedAt'] >= 1800:
+                            orphan_timeouts.append((m['number'], m['attempt'], m.get('token'), m['checkout'], unlocked))
                     elif not file_locked(self.store.directory / f'member-{m["number"]}.lock') and not checkout_locked(Path(m['checkout'])):
                         launches.append(dict(m))
             settings = dict(data)
+        for number, attempt, token, checkout, cleanup in orphan_timeouts:
+            if cleanup:
+                self.cleanup_launch(checkout, token)
+            with self.store.transaction() as data:
+                m = find_member(data, number)
+                if m and m['state'] == 'launching' and m['attempt'] == attempt and m.get('token') == token and not m.get('result'):
+                    reason = 'launch deferred: timeout: interrupted launcher produced no result'
+                    defer_launch(data, m, reason, self.clock())
+                    m['launchResult'] = 'timeout'
         for m in launches:
             try:
                 self.jobs[m['number']] = self.spawn(settings, m)
