@@ -262,7 +262,8 @@ if (-not $Issue) {
     exit 2
 }
 
-$script:Launch = @{ Stage = 'config'; IssueRef = $Issue; DryRun = [bool]$DryRun; NoRelay = [bool]$NoRelay }
+$script:Launch = @{ Stage = 'config'; IssueRef = $Issue; DryRun = [bool]$DryRun; NoRelay = [bool]$NoRelay;
+    UnrecordedOpenSessions = @() }
 if ($QueueMember) {
     if ($DryRun -or $NoRelay -or $QueueAttempt -lt 1 -or -not (Test-SessionGuid $QueueToken) -or
         $Issue -notmatch '^([^/#]+/[^/#]+)#([1-9][0-9]*)$') {
@@ -296,17 +297,51 @@ if ($QueueMember) {
         $outcome = 'ok'
         if (-not $ok) { $outcome = 'failed' }
         if ($script:Launch.QueueIncomplete) { $outcome = 'incomplete' }
+        $failureStage = $script:Launch.Stage
+        $remaining = @()
+        if ($script:Launch.Checkout) {
+            if ($outcome -ne 'ok') {
+                try { $remaining = @(Close-QueueSessions $script:Launch.Checkout $QueueToken) }
+                catch {
+                    $remaining = @(@($script:Launch.SessionId, $script:Launch.RelaySession) | Where-Object { $_ })
+                    $script:Launch.Failure += "`ncleanup failed: $_"
+                }
+            }
+        }
+        foreach ($id in @($script:Launch.UnrecordedOpenSessions | Where-Object { $_ })) {
+            $stillOpen = $true
+            try { $stillOpen = $null -ne (Get-SessionById $id) } catch { $script:Launch.Failure += "`ncannot verify close of ${id}: $_" }
+            if ($stillOpen) { $remaining += $id }
+        }
         $result = @{ result = $outcome; checkout = $script:Launch.Checkout; sessionId = $script:Launch.SessionId;
             claudePane = $script:Launch.Claude; codexPane = $script:Launch.Codex; relaySession = $script:Launch.RelaySession;
+            stage = $failureStage; infra = ($failureStage -in @('terminal', 'window', 'cleanup', 'session', 'split', 'codex', 'claude', 'relay', 'relay-stop', 'focus'));
             detail = $null }
         if ($outcome -ne 'ok') { $result.detail = "$($script:Launch.Failure)`n$(Format-RepairMessage $script:Launch)" }
+        if ($outcome -ne 'ok' -and $remaining.Count) { $result.detail += "`nSessions still open: $($remaining -join ', ')" }
+        if ($outcome -ne 'ok' -and $script:Launch.SessionId -and $remaining -notcontains $script:Launch.SessionId) {
+            $result.sessionId = $null; $result.claudePane = $null; $result.codexPane = $null
+        }
+        if ($outcome -ne 'ok' -and $script:Launch.RelaySession -and $remaining -notcontains $script:Launch.RelaySession) {
+            $result.relaySession = $null
+        }
         $resultPath = Join-Path (Split-Path -Parent $memberLockPath) ("result-$QueueToken.json")
         try {
             Write-AtomicJson $resultPath $result
             $resultArgs = @((Join-Path $script:Lib 'conductor.py'), 'member-result', '--file', $QueueMember,
                 '--number', "$memberNumber", '--attempt', "$QueueAttempt", '--token', $QueueToken, '--result-file', $resultPath)
             & python @resultArgs
-            if ($LASTEXITCODE -ne 0) { exit 1 }
+            if ($LASTEXITCODE -ne 0) {
+                if ($script:Launch.Checkout) {
+                    try { Close-QueueSessions $script:Launch.Checkout $QueueToken | Out-Null }
+                    catch { Write-LaunchLog cleanup "late result cleanup failed: $_" }
+                }
+                exit 1
+            }
+            if ($ok -and $script:Launch.Checkout) {
+                $recordPath = Get-QueueLaunchPath $script:Launch.Checkout
+                if (Test-Path -LiteralPath $recordPath) { Remove-Item -LiteralPath $recordPath }
+            }
         } finally { if (Test-Path -LiteralPath $resultPath) { Remove-Item -LiteralPath $resultPath } }
         if (-not $ok) { exit 1 }
         exit 0

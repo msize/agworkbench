@@ -391,12 +391,15 @@ class QueueCase(unittest.TestCase):
                         attempt=m['attempt'], token=m['token'])
         worker.spawn = partial
         worker.tick(); worker.tick()
-        self.assertEqual('failed', self.member()['state'])
+        self.assertEqual('failed' if result else 'pending', self.member()['state'])
         self.assertFalse(self.member()['checkoutEstablished'])
         checkout = Path(self.member()['checkout'])
         self.assertTrue(checkout.resolve().is_relative_to(self.root))
         shutil.rmtree(checkout)
-        self.start('o/r#1', retry=True)
+        if result:
+            self.start('o/r#1', retry=True)
+        else:
+            self.now += 60  # missing launcher result automatically retries after infrastructure back-off
         worker.spawn = self.spawn
         worker.tick(); worker.tick()
         self.assertEqual('active', self.member()['state'])
@@ -455,15 +458,22 @@ class QueueCase(unittest.TestCase):
         self.assertEqual([1, 1], [x[0] for x in self.launches])
         self.assertEqual(original, q.read_json(Path(self.member()['checkout']) / '.workbench/state/claude.json')['sessionId'])
 
-    def test_launcher_exit_and_timeout_do_not_hold_the_queue(self):
+    def test_launcher_exit_and_timeout_back_off_the_same_member(self):
         self.start('o/r#1,2')
         worker = self.worker()
         worker.tick()
         with self.store.transaction() as data:
             data['members'][0]['result'] = None
-        worker.tick()  # exit 0 without the required result is failed, next issue starts
-        self.assertEqual('failed', self.member()['state'])
-        self.assertEqual([1, 2], [x[0] for x in self.launches])
+        worker.tick()  # exit 0 without a result is infrastructure; the same member backs off
+        self.assertEqual('pending', self.member()['state'])
+        self.assertEqual([1], [x[0] for x in self.launches])
+        self.assertEqual('launcher', self.member()['reason'].split(':')[1].strip())
+        self.now += 60
+        worker.tick()  # retry starts
+        with self.store.transaction() as data:
+            data['parallel'] = 2
+        worker.tick()  # retry succeeds, then issue 2 may start
+        self.assertEqual([1, 1, 2], [x[0] for x in self.launches])
         with self.store.transaction() as data:
             data['members'][1]['result'] = None
         process = worker.jobs[2]['process']
@@ -473,9 +483,10 @@ class QueueCase(unittest.TestCase):
         self.now += 601
         with patch.object(q.subprocess, 'run') as run, patch.object(q.shutil, 'which', return_value='gh'):
             worker.tick()
-        self.assertEqual('failed', self.member(2)['state'])
+        self.assertEqual('pending', self.member(2)['state'])
         self.assertEqual('timeout', self.member(2)['launchResult'])
-        self.assertTrue(q.finished(self.store.load()))
+        self.assertEqual(1, self.store.load()['launchBackoff']['failures'])
+        self.assertFalse(q.finished(self.store.load()))
         if os.name == 'nt':
             self.assertEqual(['taskkill', '/PID', '123', '/T', '/F'], run.call_args.args[0])
 
@@ -1210,6 +1221,7 @@ class DiskGuard(unittest.TestCase):
         fresh.tick()
         fresh.notify.assert_called_once()
 
+
     def test_the_threshold_comes_from_the_queue_config(self):
         self.free = 5 * q.GIB
         for value, admitted in ((0, True), (4.5, True), (6, False)):
@@ -1242,6 +1254,247 @@ class DiskGuard(unittest.TestCase):
         self.assertEqual(shutil.disk_usage(self.root).free // q.GIB, free // q.GIB)
         self.assertEqual(Path(self.root).anchor, drive)
 
+
+class LaunchBackoff(unittest.TestCase):
+    terminal, start, gh, worker, member = (QueueCase.terminal, QueueCase.start, QueueCase.gh,
+                                          QueueCase.worker, QueueCase.member)
+
+    def setUp(self):
+        QueueCase.setUp(self)
+        self.start('o/r#1,2', parallel=1)
+        self.failures = 3
+        self.w = self.worker()
+        self.w.notify, self.w.status = Mock(), Mock()
+        self.w.spawn = self.spawn
+
+    def spawn(self, data, m):
+        job = QueueCase.spawn(self, data, m)
+        if self.failures:
+            self.failures -= 1
+            with self.store.transaction() as current:
+                current['members'][m['number'] - 1]['result'] = dict(
+                    result='incomplete', infra=True, stage='codex', detail='pane too narrow',
+                    attempt=m['attempt'], token=m['token'])
+        return job
+
+    def test_backoff_same_member_pause_and_resume(self):
+        self.w.tick()
+        for failures, delay in enumerate((60, 120, 240), 1):
+            self.w.tick()
+            self.assertEqual('pending', self.member(1)['state'])
+            self.assertEqual(failures, self.store.load()['launchBackoff']['failures'])
+            self.assertEqual(self.now + delay, self.store.load()['launchBackoff']['until'])
+            self.w.tick()
+            self.assertEqual(failures, len(self.launches))
+            self.now += delay
+            self.w.tick()
+        self.assertEqual([1, 1, 1, 1], [n for n, _, _ in self.launches])
+        self.w.tick()
+        self.assertEqual('active', self.member(1)['state'])
+        self.assertNotIn('launchBackoff', self.store.load())
+        self.assertNotIn('launchPaused', self.store.load())
+        self.assertIn('queue resumed: launches succeeding', [call.args[0] for call in self.w.notify.call_args_list])
+
+    def test_persisted_backoff_blocks_new_worker(self):
+        self.w.tick(); self.w.tick()
+        fresh = self.worker()
+        fresh.spawn = self.spawn
+        fresh.notify, fresh.status = Mock(), Mock()
+        fresh.tick()
+        self.assertEqual([1], [n for n, _, _ in self.launches])
+
+    def test_deferred_member_is_the_probe_even_after_rank_changes(self):
+        self.w.tick(); self.w.tick()
+        with self.store.transaction() as data:
+            data['members'][1]['priority'] = 'P0'
+        self.now += 60
+        self.w.tick()
+        self.assertEqual([1, 1], [n for n, _, _ in self.launches])
+
+    def test_intervals_cap_at_fifteen_minutes_and_pause_announces_once(self):
+        self.failures = 6
+        self.w.tick()
+        for index, delay in enumerate((60, 120, 240, 480, 900, 900)):
+            self.w.tick()
+            self.assertEqual(self.now + delay, self.store.load()['launchBackoff']['until'])
+            if index == 5:
+                fresh = self.worker()
+                fresh.notify, fresh.status = Mock(), Mock()
+                fresh.tick()
+                fresh.notify.assert_called_once()
+                self.assertIn('queue paused: launches failing:', fresh.notify.call_args.args[0])
+            self.now += delay - 1
+            self.w.tick()
+            self.assertEqual('pending', self.member(1)['state'])
+            self.now += 1
+            self.w.tick()
+        self.assertEqual(1, sum('queue paused: launches failing:' in c.args[0]
+                                for c in self.w.notify.call_args_list))
+
+    def test_non_infrastructure_failure_does_not_set_backoff(self):
+        self.failures = 0
+        def fail(data, m):
+            job = QueueCase.spawn(self, data, m)
+            with self.store.transaction() as current:
+                current['members'][m['number'] - 1]['result'] = dict(result='failed', infra=False,
+                    stage='clone', detail='clone failed', attempt=m['attempt'], token=m['token'])
+            return job
+        self.w.spawn = fail
+        self.w.tick(); self.w.tick()
+        self.assertEqual('failed', self.member(1)['state'])
+        self.assertNotIn('launchBackoff', self.store.load())
+
+    def test_timed_out_launcher_closes_its_recorded_session(self):
+        self.failures = 0
+        self.w.tick()
+        member = self.member(1)
+        record = Path(member['checkout']) / '.workbench/state/queue-launch.json'
+        session = str(uuid.uuid4())
+        q.atomic_json(record, dict(attempt=member['attempt'], token=member['token'], sessions=[session]))
+        job = self.w.jobs[1]['process']
+        job.poll = lambda: None
+        job.wait = lambda timeout: 0
+        job.kill = lambda: None
+        with self.store.transaction() as data:
+            data['members'][0]['result'] = None
+        self.now += 601
+        with patch.object(q.agw, 'tree', side_effect=[
+                {'workspaces': [{'sessions': [{'id': session}]}]},
+                {'workspaces': [{'sessions': []}]}]), \
+             patch.object(q.agw, 'clear_restore') as clear, \
+             patch.object(q.agw, 'close_session') as close, \
+             patch.object(q.subprocess, 'run'), patch.object(q.shutil, 'which', return_value='gh'):
+            self.w.tick()
+        clear.assert_called_once_with(session)
+        close.assert_called_once_with(session)
+        self.assertFalse(record.exists())
+        self.assertEqual('pending', self.member(1)['state'])
+
+    def test_disk_recovery_does_not_clear_launch_pause_status(self):
+        self.failures = 2
+        self.w.tick(); self.w.tick()
+        self.now += 60
+        self.w.tick(); self.w.tick()
+        self.assertIn('launchPaused', self.store.load())
+        self.free = 5 * q.GIB
+        self.w.tick()
+        self.free = 500 * q.GIB
+        self.w.tick()
+        self.assertEqual('blocked', self.w.status.call_args.args[0])
+
+    def test_orphan_older_than_ten_minutes_defers_and_closes_session(self):
+        session = str(uuid.uuid4())
+        token = str(uuid.uuid4())
+        with self.store.transaction() as data:
+            data['members'][0].update(state='launching', attempt=1, token=token,
+                                      startedAt=self.now - 700, slotReleased=False)
+        record = Path(self.member(1)['checkout']) / '.workbench/state/queue-launch.json'
+        q.atomic_json(record, dict(attempt=1, token=token, sessions=[session]))
+        with patch.object(q.agw, 'tree', side_effect=[
+                {'workspaces': [{'sessions': [{'id': session}]}]},
+                {'workspaces': [{'sessions': []}]}]), \
+             patch.object(q.agw, 'clear_restore'), patch.object(q.agw, 'close_session') as close:
+            self.w.tick()
+        close.assert_called_once_with(session)
+        self.assertEqual('pending', self.member(1)['state'])
+        self.assertEqual('timeout', self.member(1)['launchResult'])
+        self.assertFalse(record.exists())
+
+    def test_locked_orphan_has_a_hard_timeout_without_deleting_its_record(self):
+        token = str(uuid.uuid4())
+        with self.store.transaction() as data:
+            data['parallel'] = 2
+            data['launchBackoff'] = dict(member=1, failures=1, until=self.now + 1, reason='prior pane failure')
+            data['members'][0].update(state='launching', attempt=1, token=token,
+                                      startedAt=self.now - 1801, slotReleased=False)
+        record = Path(self.member(1)['checkout']) / '.workbench/state/queue-launch.json'
+        q.atomic_json(record, dict(attempt=1, token=token, sessions=[str(uuid.uuid4())]))
+        with patch.object(q, 'file_locked', return_value=True), patch.object(self.w, 'cleanup_launch') as cleanup:
+            self.w.tick()
+        cleanup.assert_not_called()
+        self.assertTrue(record.exists())
+        self.assertEqual('failed', self.member(1)['state'])
+        self.assertTrue(self.member(1)['slotReleased'])
+        self.assertIn('-Retry', self.member(1)['reason'])
+        self.assertIn('launchBackoff', self.store.load())
+        self.now += 1
+        with patch.object(q, 'file_locked', return_value=True):
+            self.w.tick()
+        self.assertEqual([2], [n for n, _, _ in self.launches])
+
+    def test_backoff_admits_one_probe_with_parallel_two(self):
+        with self.store.transaction() as data:
+            data['parallel'] = 2
+            data['launchBackoff'] = dict(member=1, failures=1, until=self.now, reason='pane too narrow')
+        def running(data, m):
+            job = QueueCase.spawn(self, data, m)
+            with self.store.transaction() as current:
+                current['members'][m['number'] - 1]['result'] = None
+            job['process'].poll = lambda: None
+            return job
+        self.w.spawn = running
+        self.w.tick()
+        self.w.tick()
+        self.assertEqual([1], [n for n, _, _ in self.launches])
+
+    def test_sibling_success_does_not_clear_a_newer_backoff(self):
+        with self.store.transaction() as data:
+            data['parallel'] = 2
+        self.failures = 1
+        self.w.tick(); self.w.tick()
+        self.assertEqual('active', self.member(2)['state'])
+        self.assertEqual(1, self.store.load()['launchBackoff']['member'])
+        self.assertEqual('pending', self.member(1)['state'])
+
+    def test_spawn_error_is_infrastructure_and_waits(self):
+        self.w.spawn = Mock(side_effect=OSError('launcher could not start'))
+        self.w.tick(); self.w.tick()
+        self.assertEqual('pending', self.member(1)['state'])
+        self.assertEqual([], self.launches)
+        self.assertEqual('launcher', self.member(1)['reason'].split(':')[1].strip())
+
+    def test_exit_without_result_cleans_up_and_backs_off(self):
+        self.failures = 0
+        self.w.tick()
+        with self.store.transaction() as data:
+            data['members'][0]['result'] = None
+        self.w.jobs[1]['process'].poll = lambda: 7
+        with patch.object(self.w, 'cleanup_launch') as cleanup:
+            self.w.tick()
+        cleanup.assert_called_once_with(self.member(1)['checkout'], self.member(1)['token'])
+        self.assertEqual('pending', self.member(1)['state'])
+        self.assertEqual('launcher', self.member(1)['reason'].split(':')[1].strip())
+
+    def test_backoff_uses_next_pending_member_when_original_is_gone(self):
+        with self.store.transaction() as data:
+            data['launchBackoff'] = dict(member=1, failures=2, until=self.now, reason='pane too narrow')
+            data['launchPaused'] = 'launches failing: pane too narrow'
+            data['members'][0].update(state='failed', slotReleased=True)
+        self.failures = 0
+        self.w.tick()
+        self.assertEqual([2], [n for n, _, _ in self.launches])
+        self.w.tick()
+        self.assertNotIn('launchBackoff', self.store.load())
+        self.assertNotIn('launchPaused', self.store.load())
+        self.assertIn('queue resumed: launches succeeding', [c.args[0] for c in self.w.notify.call_args_list])
+
+    def test_deterministic_spawn_value_error_fails_member(self):
+        self.w.spawn = Mock(side_effect=q.QueueError('PowerShell is not installed'))
+        self.w.tick(); self.w.tick()
+        self.assertEqual('failed', self.member(1)['state'])
+        self.assertNotIn('launchBackoff', self.store.load())
+
+    def test_late_member_result_command_returns_nonzero(self):
+        result_path = self.root / 'late-result.json'
+        q.atomic_json(result_path, dict(result='ok'))
+        self.w.tick()
+        with self.store.transaction() as data:
+            data['members'][0]['result'] = None
+        code = q.main(['member-result', '--file', str(self.store.path), '--number', '1',
+                       '--attempt', '1', '--token', str(uuid.uuid4()), '--result-file', str(result_path)])
+        self.assertEqual(3, code)
+        self.assertEqual('launching', self.member(1)['state'])
+        self.assertIsNone(self.member(1)['result'])
 
 class PriorityOrder(unittest.TestCase):
     """#34: pending members are admitted P0, P1, untriaged, P2, P3, oldest issue first; with -Triage

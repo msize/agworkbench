@@ -381,6 +381,111 @@ function Get-SessionById([string] $Id) {
     return $null
 }
 
+$script:WindowTiming = @{ Poll = 1; Wait = 60 }
+
+function Test-AgwintermMinimized {
+    if (-not ('WorkbenchWindow' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class WorkbenchWindow {
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int command);
+}
+'@
+    }
+    foreach ($process in @(Get-Process agwinterm, Agwinterm.Win32 -ErrorAction SilentlyContinue)) {
+        if ($process.MainWindowHandle -ne [IntPtr]::Zero -and [WorkbenchWindow]::IsIconic($process.MainWindowHandle)) { return $true }
+    }
+    return $false
+}
+
+function Restore-AgwintermWindow {
+    if (-not ('WorkbenchWindow' -as [type])) { $null = Test-AgwintermMinimized }
+    foreach ($process in @(Get-Process agwinterm, Agwinterm.Win32 -ErrorAction SilentlyContinue)) {
+        if ($process.MainWindowHandle -ne [IntPtr]::Zero -and [WorkbenchWindow]::IsIconic($process.MainWindowHandle)) {
+            [void][WorkbenchWindow]::ShowWindow($process.MainWindowHandle, 4)
+        }
+    }
+}
+
+function Confirm-WindowUsable([string] $Pane) {
+    $oldStage = $script:Launch.Stage
+    Set-LaunchStage window
+    try {
+        $deadline = (Get-Date).AddSeconds($script:WindowTiming.Wait)
+        $restored = $false
+        do {
+            $minimized = Test-AgwintermMinimized
+            $reply = (Invoke-Ctl session metrics $Pane --json) | ConvertFrom-Json
+            if ($reply.ok -ne $true -or $null -eq $reply.result -or $null -eq $reply.result.cols) {
+                throw "window metrics unavailable for pane $Pane"
+            }
+            if (-not $minimized -and [int]$reply.result.cols -ge 40) {
+                $script:Launch.Stage = $oldStage
+                return
+            }
+            if (-not $restored) { Restore-AgwintermWindow; $restored = $true }
+            Start-Sleep -Milliseconds ([int]($script:WindowTiming.Poll * 1000))
+        } while ((Get-Date) -lt $deadline)
+        $script:Launch.QueueIncomplete = $true
+        throw "window remains too small for pane $Pane"
+    } catch {
+        $script:Launch.QueueIncomplete = $true
+        throw
+    }
+}
+
+function Get-QueueLaunchPath([string] $Checkout) {
+    return Join-Path $Checkout '.workbench\state\queue-launch.json'
+}
+
+function Add-QueueCreatedSession([string] $Checkout, [string] $Id) {
+    $path = Get-QueueLaunchPath $Checkout
+    $sessions = @()
+    if (Test-Path -LiteralPath $path) {
+        $record = Get-Content -Raw -LiteralPath $path | ConvertFrom-Json
+        if ($record.token -ne $script:Launch.QueueContext.token) { throw 'uncleaned queue launch record' }
+        $sessions = @($record.sessions)
+    }
+    $sessions += $Id
+    try {
+        Write-AtomicJson $path @{ attempt = $script:Launch.QueueContext.attempt; token = $script:Launch.QueueContext.token; sessions = $sessions }
+    } catch {
+        $failure = $_
+        # A relay may already be running through --command. Close it even if recording failed.
+        try { Invoke-Ctl session restore none --target $Id | Out-Null } catch { Write-LaunchLog cleanup "restore $Id failed: $_" }
+        try { Invoke-Ctl session close $Id | Out-Null } catch { Write-LaunchLog cleanup "close $Id failed: $_" }
+        $stillOpen = $true
+        try { $stillOpen = $null -ne (Get-SessionById $Id) } catch { Write-LaunchLog cleanup "cannot verify close of ${Id}: $_" }
+        if ($stillOpen) { $script:Launch.UnrecordedOpenSessions += $Id }
+        throw $failure
+    }
+}
+
+function Close-QueueSessions([string] $Checkout, [string] $Token) {
+    $path = Get-QueueLaunchPath $Checkout
+    if (-not (Test-Path -LiteralPath $path)) { return @() }
+    $record = Get-Content -Raw -LiteralPath $path | ConvertFrom-Json
+    if ($Token -and $record.token -ne $Token) { return @() }
+    $before = Get-Tree
+    foreach ($id in @($record.sessions)) {
+        $session = @($before.workspaces | ForEach-Object { $_.sessions } | Where-Object { $_.id -eq $id }) | Select-Object -First 1
+        if (-not $session) { continue }
+        foreach ($pane in @(Get-PaneIds $session)) {
+            try { Invoke-Ctl session restore none --target $pane | Out-Null } catch { Write-LaunchLog cleanup "restore $pane failed: $_" }
+        }
+        try { Invoke-Ctl session close $id | Out-Null } catch { Write-LaunchLog cleanup "close $id failed: $_" }
+    }
+    $after = Get-Tree
+    $live = @($after.workspaces | ForEach-Object { $_.sessions } | ForEach-Object { $_.id })
+    $remaining = @($record.sessions | Where-Object { $live -contains $_ })
+    if ($remaining.Count) {
+        Write-AtomicJson $path @{ attempt = $record.attempt; token = $record.token; sessions = $remaining }
+    } else { Remove-Item -LiteralPath $path }
+    return $remaining
+}
+
 function Get-PaneIds($Session) {
     # Emit individual strings. Consumers use @() to preserve a single pane as an array.
     $hasIds = $null -ne $Session -and $null -ne $Session.PSObject.Properties['paneIds']
@@ -411,6 +516,14 @@ function Test-ShellReady([string] $Text) {
         return ($rows[-2] -match '(\d+(\.\d+)?(ms|s)|\d\d:\d\d(:\d\d)?)\s*$')
     }
     return $false
+}
+
+function Test-ImplementerRunningFrame([string] $Text, [string] $Tool) {
+    $rows = @($Text -split '\r?\n' | Where-Object { $_.Trim() })
+    if (-not $rows.Count) { return $false }
+    $frame = ($rows | Select-Object -Last 15) -join "`n"
+    if ($Tool -eq 'codex') { return $frame -match 'Ask Codex to do anything|for shortcuts|esc to interrupt' }
+    return $frame -match 'bypass permissions|for shortcuts|esc to interrupt'
 }
 
 function Wait-ShellPrompt {
@@ -751,7 +864,11 @@ function Reserve-ClaudeIdentity([string] $Checkout, [string] $Issue, [string] $P
     $changed = $false
     if (Test-Path -LiteralPath $path) {
         try { $record = Read-ClaudeIdentity $Checkout $Issue $Role } catch { Write-LaunchLog identity "$_" }
-        if (-not $record -or ($record.pane -and $record.pane -ne $Pane)) {
+        $staleQueuePane = $false
+        if ($record -and $record.pane -and $script:Launch.QueueContext) {
+            $staleQueuePane = -not (Find-SessionByPane (Get-Tree) $record.pane)
+        }
+        if (-not $record -or ($record.pane -and $record.pane -ne $Pane -and -not $staleQueuePane)) {
             $prefix = [IO.Path]::GetFileNameWithoutExtension($path)
             $archive = Join-Path (Split-Path -Parent $path) ("$prefix.$([DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffffffZ')).json")
             Write-LaunchLog identity "archiving Claude $Role conversation '$($record.sessionId)' from pane '$($record.pane)' to '$archive'"
@@ -1286,6 +1403,12 @@ function Start-WorkbenchSessionCore {
     $script:Launch.CodexLaunch = $CodexLaunch
     $script:Launch.ImplementerTool = $ImplementerTool
     $script:Launch.NoRelay = [bool]$NoRelay
+    $script:Launch.UnrecordedOpenSessions = @()
+    if ($script:Launch.QueueContext) {
+        Set-LaunchStage cleanup
+        $remaining = @(Close-QueueSessions $Checkout)
+        if ($remaining.Count) { throw "earlier queue launch sessions still open: $($remaining -join ', ')" }
+    }
     $hub = Join-Path $Checkout '.workbench'
     $registryPath = Join-Path $hub 'state\agents.json'
     $registry = $null
@@ -1328,13 +1451,17 @@ function Start-WorkbenchSessionCore {
         $null = Reserve-ClaudeIdentity $Checkout $script:Launch.IssueRef
         $selection = @()
         if ($script:Launch.QueueContext) { $selection = @('--no-select') }
+        $command = @()
+        if (-not $script:Launch.QueueContext) { $command = @('--command', $ClaudeLaunch) }
         $id = Invoke-Ctl session new --name "#$Number $Slug" --cwd $Checkout `
-            --workspace-name $RepoName --create-workspace --command $ClaudeLaunch @selection
+            --workspace-name $RepoName --create-workspace @command @selection
         $script:Launch.SessionId = ($id -split '\s+')[0]
         if (-not (Test-SessionGuid $script:Launch.SessionId)) { throw 'session new returned an invalid pane id' }
+        if ($script:Launch.QueueContext) { Add-QueueCreatedSession $Checkout $script:Launch.SessionId }
         $script:Launch.Claude = $script:Launch.SessionId
         $null = Reserve-ClaudeIdentity $Checkout $script:Launch.IssueRef $script:Launch.Claude
-        Set-PaneRestore $script:Launch.Claude $ClaudeLaunch
+        if (-not $script:Launch.QueueContext) { Set-PaneRestore $script:Launch.Claude $ClaudeLaunch }
+        if ($script:Launch.QueueContext) { Confirm-WindowUsable $script:Launch.Claude }
         Start-Sleep -Milliseconds 600
         $session = Get-SessionById $script:Launch.SessionId
         if (-not $session) { throw "session $($script:Launch.SessionId) did not appear in the tree" }
@@ -1390,10 +1517,12 @@ function Start-WorkbenchSessionCore {
         }
         if ($plan.NewPaneRole -eq 'Claude') {
             $null = Reserve-ClaudeIdentity $Checkout $script:Launch.IssueRef $script:Launch.Claude
-            Set-PaneRestore $script:Launch.Claude $ClaudeLaunch
+            if (-not $script:Launch.QueueContext) { Set-PaneRestore $script:Launch.Claude $ClaudeLaunch }
             $claudeIdentityReady = $true
         } else {
-            $codexIdentityReady = Set-ImplementerRestore $Checkout $script:Launch.Codex $CodexRestore $ImplementerTool
+            if (-not $script:Launch.QueueContext) {
+                $codexIdentityReady = Set-ImplementerRestore $Checkout $script:Launch.Codex $CodexRestore $ImplementerTool
+            }
             $script:Launch.ImplementerIdentityReady = $codexIdentityReady
         }
         $confirmed = $false
@@ -1439,8 +1568,9 @@ function Start-WorkbenchSessionCore {
     Write-Done "mailbox ready: $hub"
     $roles = @('Codex')
     # A previous run may have split or registered an empty Claude pane before failing.
-    # Fresh sessions already start Claude through --command; never probe/type that pane.
+    # Interactive fresh sessions start Claude through --command; queue sessions prove and type it below.
     if ($script:Launch.Adopted -and -not $AdoptSession) { $roles = @('Claude', 'Codex') }
+    if ($script:Launch.QueueContext) { $roles = @('Codex', 'Claude') }
     foreach ($role in $roles) {
         Set-LaunchStage $role.ToLowerInvariant()
         $line = $script:Launch["${role}Launch"]
@@ -1448,12 +1578,14 @@ function Start-WorkbenchSessionCore {
         if ($role -eq 'Claude') { $side = $claudeSide }
         Write-Step "waiting for the $side pane's shell prompt"
         $freshPane = $plan.NeedSplit -and $plan.NewPaneRole -eq $role
+        if ($script:Launch.QueueContext -and -not $script:Launch.Adopted -and $role -eq 'Claude') { $freshPane = $true }
         if ($role -eq 'Codex' -and -not $freshPane) {
             $line = $CodexRestore
             $script:Launch.CodexLaunch = $CodexRestore
         }
         $timeout = 3
         if ($freshPane) { $timeout = 90 }
+        if ($script:Launch.QueueContext) { Confirm-WindowUsable $script:Launch[$role] }
         if (Wait-ShellPrompt -Pane $script:Launch[$role] -TimeoutSeconds $timeout -Adopted:(-not $freshPane)) {
             if ($role -eq 'Claude') {
                 $script:Launch.ClaudeLaunchRequired = $true
@@ -1463,11 +1595,12 @@ function Start-WorkbenchSessionCore {
                     $claudeIdentityReady = $true
                 }
             }
-            if ($role -eq 'Codex' -and -not $codexIdentityReady) {
+            if ($role -eq 'Codex' -and ($script:Launch.QueueContext -and $plan.NeedSplit -or -not $codexIdentityReady)) {
                 # The pane became a shell after the pin was withheld; it is free to start fresh.
                 $codexIdentityReady = Set-ImplementerRestore $Checkout $script:Launch.Codex $CodexRestore $ImplementerTool
                 $script:Launch.ImplementerIdentityReady = $codexIdentityReady
             }
+            if ($script:Launch.QueueContext -and $role -eq 'Claude') { Set-PaneRestore $script:Launch.Claude $ClaudeLaunch }
             $typeSelection = @('--select')
             if ($script:Launch.QueueContext) { $typeSelection = @() }
             Invoke-Ctl session type @typeSelection "$line`n" --target $script:Launch[$role] | Out-Null
@@ -1481,6 +1614,13 @@ function Start-WorkbenchSessionCore {
             if ($script:Launch.QueueContext -and $freshPane) {
                 $script:Launch.QueueIncomplete = $true
                 throw "new $role pane did not reach a proven shell prompt; retry the queue member to finish setup"
+            }
+            if ($script:Launch.QueueContext -and $role -eq 'Codex' -and -not $freshPane) {
+                $frame = Invoke-Ctl session text --target $script:Launch.Codex
+                if (-not (Test-ImplementerRunningFrame $frame $ImplementerTool)) {
+                    $script:Launch.QueueIncomplete = $true
+                    throw 'adopted implementer pane is neither a proven shell nor a running agent'
+                }
             }
             # A pane whose conversation could not be identified was already warned about; offering
             # a launch there would start a second conversation over the running one.
@@ -1519,6 +1659,7 @@ function Start-WorkbenchSessionCore {
             $reply = Invoke-Ctl session new --name "#$Number relay" --cwd $Checkout --workspace-name $RepoName `
                 --no-select --command $relay
             $script:Launch.RelaySession = ($reply -split '\s+')[0]
+            if ($script:Launch.QueueContext) { Add-QueueCreatedSession $Checkout $script:Launch.RelaySession }
             Set-PaneRestore $script:Launch.RelaySession $relay
             $script:Launch.RelayStarted = $true
         }

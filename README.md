@@ -514,6 +514,20 @@ off). Below it the queue admits nothing, no member changes state, the queue file
 `diskPaused: "low disk: ..."`, and its session shows blocked with a notification. The next tick
 checks again and resumes when there is space.
 
+**Queue launch failures.** A transient launcher-start failure, launcher exit without a result,
+launcher timeout, terminal, pane, agent-start or relay failure returns the member to
+`pending` and retries that same member after 1, 2, 4, 8, then 15 minutes (15 minutes thereafter).
+After two consecutive infrastructure failures, the queue announces `launches failing: ...` and
+shows blocked; it keeps probing one member at a time until a launch succeeds. Checkout or issue
+errors still fail the member and require `-Retry`. Each failed launch closes the issue and relay
+sessions it created. A record in the checkout's `.workbench/state/queue-launch.json` lets a
+restarted conductor or retry finish closing sessions left by an interrupted launcher. Queue mode
+starts Claude only after the implementer pane has a proven shell and has been started. If the
+agwinterm window is minimized or a pane is narrower than 40 columns, the launcher restores the
+window without activating it and waits for a usable pane before starting agents.
+If an orphaned launcher still holds its member or checkout lock after 30 minutes, that member
+fails instead; stop the stuck launcher and use `-Retry`.
+
 ### Usage limits: automatic failover
 
 When an agent hits its usage limit, **the loop now fails over by default**. The relay reads both
