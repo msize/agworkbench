@@ -4,7 +4,8 @@ holds the rules, the marker grammar and the semantic matcher, and does no GitHub
 
 - The exact stage: same normalised title among the `follow-up` / `follow-up-nested` issues (any state).
 - The semantic stage: one restricted `claude -p` call for every item the exact stage left, over the
-  open follow-up and bug issues. Only a `high` answer naming a candidate is a duplicate; anything
+  open follow-up and bug issues. Only a `high` answer naming a candidate opened by the repo's owner,
+  a member or a collaborator is a duplicate (an outsider's issue text could steer the model); anything
   else, or any failure, files a new issue (a false duplicate hides a finding).
 - The count lives on the issue: N = distinct (source, pr, key) dup markers in trusted, planner-marked
   comments. It is derived every time, never read back, so a forged comment or two racing loops cannot
@@ -96,8 +97,20 @@ def parse_finding(body: str) -> dict | None:
     return _parse(match[1]) if match else None
 
 
+def trusted_author(association: str | None) -> bool:
+    return (association or "").upper() in TRUSTED
+
+
 def trusted(association: str | None, body: str | None) -> bool:
-    return (association or "").upper() in TRUSTED and PLANNER_MARKER in (body or "")
+    return trusted_author(association) and PLANNER_MARKER in (body or "")
+
+
+def is_own(issue: dict, item: dict, source: int, pr: int | None) -> bool:
+    """The item's own issue: filed for this (source, pr, key) by a run that died before saving its url."""
+    if not trusted(issue.get("author_association"), issue.get("body")):
+        return False
+    fields = parse_finding(issue.get("body")) or {}
+    return (fields.get("source"), fields.get("pr"), fields.get("key")) == (str(source), str(pr), item.get("key"))
 
 
 def report_label(fields: dict) -> str:
@@ -196,8 +209,7 @@ def candidate(issue: dict) -> dict | None:
     return {"number": issue["number"], "title": issue.get("title") or "", "body": issue.get("body") or "",
             "state": issue.get("state") or "", "state_reason": issue.get("state_reason") or "",
             "closed_at": issue.get("closed_at") or "", "url": issue.get("html_url") or issue.get("url") or "",
-            "labels": [(label.get("name") if isinstance(label, dict) else str(label)) or ""
-                       for label in issue.get("labels") or []],
+            "labels": triage.label_names(issue),
             "author_association": issue.get("author_association") or "NONE"}
 
 

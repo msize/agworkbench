@@ -679,13 +679,38 @@ def dup_comment(item: dict, args: argparse.Namespace, count: int, bump: str) -> 
     return "\n".join(lines) + "\n"
 
 
-def record_duplicate(root: Path, repo: str, item: dict, number: int, semantic: bool,
-                     args: argparse.Namespace, bump_at: dict) -> tuple[dict | None, str]:
-    """Comment the duplicate on #number (reopening it when closed as completed) and bump its label.
-    (issue, message) when recorded; (None, related line) when it must be filed new after all."""
+OWN = "own"      # record_duplicate's message when the match is the item's own issue (r1 M1)
+
+
+def read_issue(root: Path, repo: str, number: int) -> dict:
     issue = followup.candidate(json.loads(gh_ok(root, f"reading #{number}", "api", f"repos/{repo}/issues/{number}").stdout))
     if issue is None:
         raise DedupeFailed(f"#{number} is not an issue")
+    return issue
+
+
+def find_own_unlabelled(root: Path, repo: str, item: dict, args: argparse.Namespace) -> dict | None:
+    """Without the follow-up label, an issue an earlier run filed for this item is no candidate; the
+    #27 exact-title search finds it, and its trusted finding marker proves it is this item's (r1 M1)."""
+    phrase = '"' + item["title"].replace('"', " ").strip() + '"'
+    found = gh_ok(root, f"searching for '{item['key']}'", "issue", "list", "--state", "open", "--search",
+                  f"{phrase} in:title", "--json", "number,title", "--limit", "200")
+    for hit in json.loads(found.stdout or "[]"):
+        if hit.get("title") == item["title"] and isinstance(hit.get("number"), int):
+            issue = read_issue(root, repo, hit["number"])
+            if followup.is_own(issue, item, args.source, args.pr):
+                return issue
+    return None
+
+
+def record_duplicate(root: Path, repo: str, item: dict, number: int, semantic: bool,
+                     args: argparse.Namespace, bump_at: dict) -> tuple[dict | None, str]:
+    """Comment the duplicate on #number (reopening it when closed as completed) and bump its label.
+    (issue, message) when recorded; (issue, OWN) when #number is the item's own issue, filed by a run
+    that died before saving its url; (None, related line) when it must be filed new after all."""
+    issue = read_issue(root, repo, number)
+    if followup.is_own(issue, item, args.source, args.pr):
+        return issue, OWN
     comments = followup.parse_pages(gh_ok(root, f"reading #{number}'s comments", "api", "--paginate",
                                           f"repos/{repo}/issues/{number}/comments?per_page=100").stdout)
     state = followup.dup_state(issue, [c for c in comments if isinstance(c, dict)])
@@ -744,7 +769,7 @@ def file_deduped(root: Path, args: argparse.Namespace, items: list[dict], pendin
     pool = list(candidates.values())
     labelled = {FOLLOW_UP_LABEL, NESTED_LABEL}
     rest = [item for item in pending if followup.pick_exact(item, pool, labelled)[0] is None]
-    semantic = {}
+    semantic, semantic_pool = {}, {}
     if rest:
         bugs = []
         bug = triage.bug_label_of(config)
@@ -755,23 +780,36 @@ def file_deduped(root: Path, args: argparse.Namespace, items: list[dict], pendin
                 bugs = fetch_issues(root, repo, bug, "open")
             except DedupeFailed as err:
                 note(f"{err}; bug issues are not semantic candidates")
-        open_ = {c["number"]: c for c in pool + bugs if c["state"] == "open" and c["number"] != args.source}
-        semantic = followup.semantic_matches(rest, list(open_.values()), note)
+        semantic_pool = {c["number"]: c for c in pool + bugs if c["state"] == "open" and c["number"] != args.source}
+        semantic = followup.semantic_matches(rest, list(semantic_pool.values()), note)
     triaged = followup.triage_on(config, repo)
     failed = 0
     for item in pending:
         try:
+            own = next((c for c in pool if followup.is_own(c, item, args.source, args.pr)), None)
+            if own is None and label is None:
+                own = find_own_unlabelled(root, repo, item, args)
+            if own is not None:
+                adopt(item, own)
+                save_follow_ups(root, items)
+                continue
             match, related = followup.pick_exact(item, pool, labelled)   # again: issues filed in this run count
             notes = [f"Possibly related: #{related['number']} (closed as {followup.closed_reason(related)})"] if related else []
             number, is_semantic = (match["number"], False) if match else (None, False)
             if number is None and item["key"] in semantic:
                 guess, confidence = semantic[item["key"]]
-                if guess is not None and confidence == "high":
+                trusted = followup.trusted_author(semantic_pool.get(guess, {}).get("author_association"))
+                if guess is not None and confidence == "high" and trusted:
                     number, is_semantic = guess, True
                 elif guess is not None:
-                    notes.append(f"Possibly related: #{guess} ({confidence} confidence)")
+                    outside = "" if trusted or confidence != "high" else ", opened outside the repo's collaborators"   # r1 m3
+                    notes.append(f"Possibly related: #{guess} ({confidence} confidence{outside})")
             if number is not None:
                 issue, message = record_duplicate(root, repo, item, number, is_semantic, args, settings["bumpAt"])
+                if message == OWN:
+                    adopt(item, issue)
+                    save_follow_ups(root, items)
+                    continue
                 if issue is not None:
                     item.update(url=issue["url"], duplicateOf=number)
                     print(f"{item['key']}: {message}")
@@ -788,6 +826,12 @@ def file_deduped(root: Path, args: argparse.Namespace, items: list[dict], pendin
             continue
         save_follow_ups(root, items)          # after each one, so a failure never loses a filed url
     return 1 if failed else 0
+
+
+def adopt(item: dict, issue: dict) -> None:
+    item["url"] = issue["url"]
+    item.pop("duplicateOf", None)
+    print(f"{item['key']}: already filed as {issue['url']} (by an earlier run)")
 
 
 def file_new(root: Path, item: dict, args: argparse.Namespace, label: str | None, related: list[str],

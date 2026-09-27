@@ -430,7 +430,8 @@ merges, unless you opted in for that checkout.
   (open, or closed as completed, which it reopens), then one restricted `claude -p` call over the
   open follow-up and bug issues, where only a high-confidence answer counts. On a match it comments
   a duplicate report there instead of filing. At 2, 3 and 5 reports in all, the issue's label goes
-  up to `priority:P2`, `P1` and `P0`, never down. A new issue gets its priority from triage when the
+  up to `priority:P2`, `P1` and `P0`, never down; an untriaged issue gets no label below P1
+  (untriaged is already admitted before P2). A new issue gets its priority from triage when the
   repo has a `triage` entry, and from the finding's severity otherwise. Only comments by the repo's
   owner, members and collaborators that carry the planner marker count as reports.
 - **Only Minor findings may be deferred.** A Major or blocker review finding stops the merge and
@@ -641,7 +642,7 @@ the autonomous close can close it. revmux and revdiff rounds that fail also mail
 | `failover` | `true` | when the implementer hits its usage limit, the planner stops it (only when idle at the limit) and switches to the other tool; `false` only reports |
 | `bugLabel` | `"bug"` | the label `-Queue bugs` stands for (non-empty, no comma) |
 | `triage` | none | per product repo: `{"owner/repo": {"specRepos": [...], "model": "..."}}`, the private spec repos `-Triage` judges against (see Issue triage) |
-| `followUp` | `{"dedupe": true, "bumpAt": {"P2": 2, "P1": 3, "P0": 5}}` | `dedupe: false` files every follow-up as a new issue, as before #42; `bumpAt` is the total number of reports that raises a matched issue to each priority |
+| `followUp` | `{"dedupe": true, "bumpAt": {"P2": 2, "P1": 3, "P0": 5}}` | `dedupe: false` keeps #27's filing (a new issue unless an open one has exactly the same title); `bumpAt` is the total number of reports that raises a matched issue to each priority |
 | `autonomous` | `false` | full autonomy: merge, file follow-up issues, close the sessions after the merge; implies `autoMerge` |
 | `cleanup` | `"merged"` | after an autonomous close: `merged` deletes the checkout when it is safe, `build` deletes only its build outputs, `off` keeps it (see Cleaning up checkouts) |
 | `minFreeGB` | `20` | the queue admits no member while the checkout drive has less free space (GiB); `0` turns the guard off |

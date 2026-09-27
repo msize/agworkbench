@@ -57,7 +57,7 @@ all stop you exactly as they do without autonomy.
   (only a high-confidence answer counts). On a match it records a duplicate there instead of filing:
   a comment with this PR, the round, the file and the finding, and the count. The reports then bump
   the issue's priority label: priority:P2 at 2 reports, P1 at 3 and P0 at 5 (`followUp.bumpAt`),
-  never downward. merge-check refuses while any item is unfiled; a duplicate counts as filed.
+  never downward; an untriaged issue gets no label below P1. merge-check refuses while any item is unfiled; a duplicate counts as filed.
 - **What may be deferred.** After at most five rounds, a remaining Minor or Immaterial finding may
   be deferred, but only as a filed follow-up. A Major or blocker **never** may, disputed or not: it
   stops as today. merge-check refuses any Major or blocker review item in follow-ups.json, so record
