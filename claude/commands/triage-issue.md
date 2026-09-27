@@ -15,6 +15,8 @@ It holds:
 - `issue`: the public issue (number, title, body, labels, createdAt, authorAssociation).
 - `floor`: `"P1"` when an open spec issue references this issue, else `null`. Your priority cannot
   go below the floor.
+- `deterministicP0`: true when a spec reference makes this a definite P0. In that case the tool
+  uses your exception classification to decide whether a minor follow-up keeps P0.
 - `referencingSpecIssues`: the open spec issues that name this issue (ref, title, body, labels).
 - `specRepos`: each spec repo's local clone `path` and its open issues (ref, title, labels).
 
@@ -37,15 +39,14 @@ Read the spec clones to judge: `docs/spec/` (capabilities, with ids such as `SCH
 
 `ux` is true when UI/UX is the reason for the priority.
 
-Features and follow-ups are judged by the same scale: how much shipping the spec'd product needs
-them now.
+Judge the uncapped priority honestly. The tool caps minor follow-ups after receiving your answer.
 
 ## Output
 
 Answer with ONE JSON object and nothing else:
 
 ```json
-{"priority": "P1", "ux": true, "rationale": "...", "specRefs": ["owner/spec-repo#12"]}
+{"priority": "P1", "ux": true, "rationale": "...", "specRefs": ["owner/spec-repo#12"], "exception": "none"}
 ```
 
 - `priority`: `"P0"`, `"P1"`, `"P2"` or `"P3"`.
@@ -53,3 +54,7 @@ Answer with ONE JSON object and nothing else:
   spec sections and spec issues freely.
 - `specRefs`: the spec issues your judgment rests on, only refs listed in the facts (`owner/repo#N`);
   may be empty.
+- `exception`: `"none"`, `"data-loss"`, `"crash"`, `"open-save-failure"`, or `"security"`.
+  Classify every issue. Data loss includes corruption on save or load; crash includes hangs;
+  open-save-failure means a document fails to open or save. Choose an exception only when the
+  issue describes that failure, regardless of its stated severity.

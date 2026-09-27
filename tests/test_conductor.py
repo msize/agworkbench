@@ -430,15 +430,59 @@ class QueueCase(unittest.TestCase):
             self.now += 300
         self.assertEqual([8], [x[0] for x in self.launches])
 
-    def test_watched_label_is_stable_but_other_label_snapshots_can_append(self):
+    def test_watched_label_can_change_and_other_snapshots_can_append(self):
         with patch.object(q, 'resolve_spec', return_value=('o/r', [1], 'work')):
             self.start('label:work', watch=True)
         with patch.object(q, 'resolve_spec', return_value=('o/r', [2], 'later')):
             self.start('label:later')
-            with self.assertRaises(q.UsageError):
-                self.start('label:later', watch=True)
-        self.assertEqual('work', self.store.load()['label'])
+            self.start('label:later', watch=True)
+        self.assertEqual('later', self.store.load()['label'])
         self.assertEqual([1, 2], [m['number'] for m in self.store.load()['members']])
+
+    def test_prune_removes_only_nonmatching_pending_and_clears_backoff(self):
+        with patch.object(q, 'resolve_spec', return_value=('o/r', [1, 2, 3], 'old')):
+            self.start('label:old', watch=True)
+        with self.store.transaction() as data:
+            data['members'][2]['state'] = 'blocked'
+            data['launchBackoff'] = dict(member=1, failures=2, until=9999, reason='launcher failed')
+            data['launchPaused'] = 'launches failing: launcher failed'
+        with patch.object(q, 'resolve_spec', return_value=('o/r', [2], 'new')):
+            self.start('label:new', watch=True, prune=True)
+        data = self.store.load()
+        self.assertEqual([2, 3], [m['number'] for m in data['members']])
+        self.assertNotIn('launchBackoff', data)
+        self.assertNotIn('launchPaused', data)
+        self.assertIn('#1 pruned: no longer matches the watched spec', sys.stdout.getvalue())
+        worker = self.worker()
+        worker.next_scan = self.now + 300
+        worker.tick()
+        self.assertEqual([2], [n for n, *_ in self.launches])
+
+    def test_prune_dry_run_reports_changes_without_writing(self):
+        with patch.object(q, 'resolve_spec', return_value=('o/r', [1, 2], 'old')):
+            self.start('label:old', watch=True)
+        before = self.store.path.read_bytes()
+        with patch.object(q, 'resolve_spec', return_value=('o/r', [2], 'new')):
+            self.start('label:new', watch=True, prune=True, dry_run=True)
+        result = json.loads(sys.stdout.getvalue().splitlines()[-1])
+        self.assertEqual([1], result['pruned'])
+        self.assertEqual(['old', 'new'], result['settings']['label'])
+        self.assertEqual(before, self.store.path.read_bytes())
+
+    def test_prune_requires_a_watched_label_or_query(self):
+        with patch.object(q, 'resolve_spec', return_value=('o/r', [1], 'work')):
+            with self.assertRaises(q.UsageError):
+                self.start('label:work', prune=True)
+        with self.assertRaises(q.UsageError):
+            self.start('o/r#1', watch=True, prune=True)
+        self.assertFalse(self.store.path.exists())
+
+    def test_mark_ignores_a_pruned_member(self):
+        self.start('o/r#1')
+        with self.store.transaction() as data:
+            data['members'].clear()
+        self.worker().mark(1, triageResult='failed')
+        self.assertEqual([], self.store.load()['members'])
 
     def test_restart_reconciles_intent_and_completed_result_without_duplicate_launch(self):
         self.start('o/r#1')
@@ -795,8 +839,8 @@ class QueueBugs(unittest.TestCase):
         data = self.store.load()
         self.assertEqual((True, 'bug'), (data['watch'], data['label']))
         self.assertIn('settings: watch false -> true', self.output())
-        with self.assertRaises(q.UsageError):
-            self.start_bugs('label:other', watch=True)
+        self.start_bugs('label:other', watch=True)
+        self.assertEqual('other', self.store.load()['label'])
 
     def test_dry_run_prints_the_plan_and_writes_nothing(self):
         self.start('o/r#1')
@@ -1754,15 +1798,15 @@ class LabelQuery(unittest.TestCase):
             self.query('where: Bug and (PRIORITY in ["p0"])', repo='o/r', watch=True)   # the same query
         self.assertNotIn('settings:', out.getvalue())
         self.assertEqual('(bug AND priority IN [P0])', self.store.load()['query'])     # as first written
-        for other in ('where: bug AND priority IN [P1]', 'label:bug'):
-            with self.subTest(other=other), self.assertRaises(q.UsageError):
-                self.query(other, repo='o/r', watch=True)
+        self.query('where: bug AND priority IN [P1]', repo='o/r', watch=True)
+        self.assertEqual('(bug AND priority IN [P1])', self.store.load()['query'])
 
-    def test_a_label_watch_refuses_a_query(self):
+    def test_a_label_watch_switches_to_a_query(self):
         with patch.object(q, 'resolve_spec', return_value=('o/r', [], 'work')):
             self.start('label:work', watch=True)
-        with self.assertRaises(q.UsageError):
-            self.query('where: work', repo='o/r', watch=True)
+        self.query('where: work', repo='o/r', watch=True)
+        self.assertEqual(None, self.store.load()['label'])
+        self.assertEqual('work', self.store.load()['query'])
 
     def test_the_rescan_uses_the_saved_query(self):
         self.query('where: bug AND priority IN [P0]', repo='o/r', watch=True)
@@ -1775,6 +1819,38 @@ class LabelQuery(unittest.TestCase):
         with patch.dict(os.environ, {'AGWORKBENCH_QUEUE_SPEC': 'where: nonsense ((('}):   # never read by the rescan
             worker.refresh_remote()
         self.assertIn(12, [m['number'] for m in self.store.load()['members']])
+
+    def test_rescan_uses_the_changed_query(self):
+        self.query('where: priority IN [P1]', repo='o/r', watch=True)
+        self.query('where: priority IN [P0]', repo='o/r', watch=True)
+        worker = q.Worker(self.store, self.store.load()['owner']['token'], clock=lambda: self.now,
+                          gh=lambda *args: [] if args[:2] == ('issue', 'list') else self.fake_gh(*args),
+                          spawn=QueueCase.spawn.__get__(self))
+        self.pages[1].extend([listed(12, '2026-02-01', 'priority:P0'),
+                              listed(13, '2026-02-02', 'priority:P1')])
+        self.now += 400
+        worker.refresh_remote()
+        members = [m['number'] for m in self.store.load()['members']]
+        self.assertIn(12, members)
+        self.assertNotIn(13, members)
+
+    def test_stale_rescan_cannot_readd_pruned_members_after_watch_switch(self):
+        with patch.object(q, 'resolve_spec', return_value=('o/r', [1], 'old')):
+            self.start('label:old', watch=True)
+        worker = q.Worker(self.store, self.store.load()['owner']['token'], clock=lambda: self.now,
+                          spawn=QueueCase.spawn.__get__(self))
+
+        def gh(*args):
+            # The saved watch changes while the old label scan is in flight.
+            with self.store.transaction() as data:
+                data['label'] = 'new'
+                data['members'] = [m for m in data['members'] if m['number'] != 1]
+            return [[listed(1, '2026-01-01', 'old'), listed(9, '2026-01-09', 'old')]]
+
+        worker.gh = gh
+        worker.refresh_remote()
+        self.assertEqual([], self.store.load()['members'])
+        self.assertEqual('new', self.store.load()['label'])
 
     def test_queue_files_old_and_invalid(self):
         self.start('o/r#1')

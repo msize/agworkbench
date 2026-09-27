@@ -42,6 +42,7 @@
   github-workbench -Triage -Repo yeroo/docxy            # label every untriaged open issue priority:P0..P3
   github-workbench -Triage -Repo yeroo/docxy -Watch     # and keep doing it for new ones, in its own session
   github-workbench -Retriage -Repo yeroo/docxy -DryRun  # re-judge the labelled ones too; print, write nothing
+  github-workbench -Triage -Retriage -FollowUps -Repo yeroo/docxy -Limit 200
 .EXAMPLE
   github-workbench -Cleanup -DryRun                     # list finished checkouts and their sizes; delete nothing
   github-workbench -Cleanup -Repo yeroo/docxy           # delete docxy's finished checkouts that are safe to delete
@@ -58,6 +59,7 @@ param(
     [string] $Queue,
     [int] $Parallel,
     [switch] $Watch,
+    [switch] $Prune,
     [switch] $Retry,
     [string] $QueueMember,
     [int] $QueueAttempt,
@@ -70,6 +72,7 @@ param(
     [switch] $NoAutonomous,
     [switch] $Triage,
     [switch] $Retriage,
+    [switch] $FollowUps,
     [int] $Limit,
     [switch] $Cleanup,
     [switch] $BuildOnly,
@@ -191,6 +194,10 @@ if ($AutoMerge) { $autoMergeChoice = $true }
 if ($NoAutoMerge) { $autoMergeChoice = $false }
 
 if ($PSBoundParameters.ContainsKey('Queue')) {
+    if ($FollowUps -or ($Prune -and -not $Watch)) {
+        Write-Host '-FollowUps belongs to triage; -Prune requires -Queue with -Watch.' -ForegroundColor Yellow
+        exit 2
+    }
     if (-not $Queue -or $Issue -or $NewSession -or $NoRelay -or $QueueMember -or $QueueAttempt -or $QueueToken -or
         (-not (Test-InsideAgwinterm)) -or ($PSBoundParameters.ContainsKey('Parallel') -and ($Parallel -lt 1 -or $Parallel -gt 8))) {
         Write-Host 'Queue requires agwinterm, a spec and Parallel 1..8; Issue/NewSession/NoRelay/internal member options cannot be combined with it.'
@@ -202,6 +209,7 @@ if ($PSBoundParameters.ContainsKey('Queue')) {
     if ($Repo) { $queueArgs += @('--repo', $Repo) }
     if ($PSBoundParameters.ContainsKey('Parallel')) { $queueArgs += @('--parallel', "$Parallel") }
     if ($Watch) { $queueArgs += '--watch' }
+    if ($Prune) { $queueArgs += '--prune' }
     if ($Retry) { $queueArgs += '--retry' }
     if ($Yes) { $queueArgs += '--yes' }
     if ($DryRun) { $queueArgs += '--dry-run' }
@@ -228,8 +236,9 @@ if ($Triage -or $Retriage) {
     # Issue triage (#34): lib/triage.py labels the repo's open issues priority:P0..P3.
     if (-not $Repo -or $Issue -or $NewSession -or $NoRelay -or $QueueMember -or $Retry -or $Implementer -or
         $PSBoundParameters.ContainsKey('Parallel') -or $AutoMerge -or $NoAutoMerge -or $Autonomous -or $NoAutonomous -or
-        $Failover -or ($PSBoundParameters.ContainsKey('Limit') -and $Limit -lt 1) -or ($Watch -and ($Retriage -or $DryRun))) {
-        Write-Host 'usage: github-workbench -Triage|-Retriage -Repo owner/name [-Limit N] [-DryRun] | -Triage -Repo owner/name -Watch' -ForegroundColor Yellow
+        $Failover -or $Prune -or ($FollowUps -and $Watch) -or
+        ($PSBoundParameters.ContainsKey('Limit') -and $Limit -lt 1) -or ($Watch -and ($Retriage -or $DryRun))) {
+        Write-Host 'usage: github-workbench -Triage|-Retriage -Repo owner/name [-Limit N] [-DryRun] [-FollowUps] | -Triage -Repo owner/name -Watch' -ForegroundColor Yellow
         exit 2
     }
     $triageArgs = @((Join-Path $script:Lib 'triage.py'))
@@ -239,15 +248,16 @@ if ($Triage -or $Retriage) {
     } else {
         $triageArgs += @('run', '--repo', $Repo)
         if ($Retriage) { $triageArgs += '--retriage' }
+        if ($FollowUps) { $triageArgs += '--follow-ups' }
         if ($DryRun) { $triageArgs += '--dry-run' }
     }
     if ($PSBoundParameters.ContainsKey('Limit')) { $triageArgs += @('--limit', "$Limit") }
     & python @triageArgs
     exit $LASTEXITCODE
 }
-if ($PSBoundParameters.ContainsKey('Parallel') -or $Watch -or $Retry -or $PSBoundParameters.ContainsKey('Limit') -or
+if ($PSBoundParameters.ContainsKey('Parallel') -or $Watch -or $Retry -or $Prune -or $FollowUps -or $PSBoundParameters.ContainsKey('Limit') -or
     ((-not $QueueMember) -and ($QueueAttempt -or $QueueToken))) {
-    Write-Host 'Parallel/Watch/Retry require Queue (Watch/Limit also go with Triage); QueueAttempt/QueueToken require QueueMember.'
+    Write-Host 'Parallel/Retry require -Queue; -Prune requires -Queue -Watch; -FollowUps requires -Triage or -Retriage; Watch/Limit also go with Triage; QueueAttempt/QueueToken require QueueMember.'
     exit 2
 }
 
@@ -255,8 +265,8 @@ if (-not $Issue) {
     Write-Host "usage: github-workbench <issue> [-Repo owner/name] [-DryRun] [-Yes] [-NewSession] [-Implementer codex|claude] [-AutoMerge|-NoAutoMerge] [-Autonomous|-NoAutonomous] [-Failover]" -ForegroundColor Yellow
     Write-Host "       github-workbench -Version"
     Write-Host "       (<spec> is a list like 3,4,5, label:<name>, bugs = label:<bugLabel>, or where: <label query>)"
-    Write-Host "       github-workbench -Queue <spec> [-Repo owner/name] [-Parallel 1..8] [-Watch] [-Retry] [-Yes] [-DryRun] [-Implementer codex|claude] [-AutoMerge|-NoAutoMerge] [-Autonomous|-NoAutonomous] [-Triage]"
-    Write-Host "       github-workbench -Triage|-Retriage -Repo owner/name [-Limit N] [-DryRun] [-Watch]"
+    Write-Host "       github-workbench -Queue <spec> [-Repo owner/name] [-Parallel 1..8] [-Watch] [-Prune] [-Retry] [-Yes] [-DryRun] [-Implementer codex|claude] [-AutoMerge|-NoAutoMerge] [-Autonomous|-NoAutonomous] [-Triage]"
+    Write-Host "       github-workbench -Triage|-Retriage -Repo owner/name [-Limit N] [-DryRun] [-FollowUps] [-Watch]"
     Write-Host "       github-workbench -Cleanup [-Repo owner/name] [-DryRun] [-BuildOnly]"
     Write-Host "  <issue> is 123, owner/repo#123, or https://github.com/owner/repo/issues/123"
     exit 2
