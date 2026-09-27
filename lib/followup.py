@@ -32,8 +32,10 @@ DEFAULT_BUMP_AT = {"P2": 2, "P1": 3, "P0": 5}
 SEVERITY_PRIORITY = {"blocker": "P0", "major": "P1", "minor": "P2", "immaterial": "P3", "plan": "P3"}
 BODY_CAP = 2000
 MATCHER_TIMEOUT = triage.MODEL_TIMEOUT
-FINDING_RE = re.compile(r"<!-- agworkbench:finding ([^>]*?) -->")
-DUP_RE = re.compile(r"<!-- agworkbench:dup ([^>]*?) -->")
+# Only the trailer counts (r2 m3): a finding may quote marker text, and it comes first in the body.
+FINDING_RE = re.compile(r"<!-- agworkbench:finding ([^>]*?) -->\r?\n" + re.escape(PLANNER_MARKER) + r"\s*\Z")
+DUP_RE = re.compile(r"<!-- agworkbench:dup ([^>]*?) -->\r?\n<!-- agworkbench:dup-count \d+ -->\r?\n"
+                    + re.escape(PLANNER_MARKER) + r"\s*\Z")
 STRIP = string.punctuation + "‘’“”«»" + string.whitespace
 
 
@@ -125,7 +127,8 @@ def dup_state(issue: dict, comments: list[dict]) -> dict:
         body = comment.get("body") or ""
         if not trusted(comment.get("author_association"), body):
             continue
-        for match in DUP_RE.finditer(body):
+        match = DUP_RE.search(body)
+        if match:
             fields = _parse(match[1])
             ident = (fields.get("source"), fields.get("pr"), fields.get("key"))
             if ident not in seen:
@@ -320,7 +323,9 @@ def semantic_matches(items: list[dict], candidates: list[dict], note) -> dict[st
     out = {}
     matches = answer.get("matches") if isinstance(answer, dict) else None
     for match in matches if isinstance(matches, list) else []:
-        if not isinstance(match, dict) or match.get("key") not in keys or match["key"] in out:
+        # The free-text fallback of parse_model_output is not schema-checked (r2 m2).
+        if not isinstance(match, dict) or not isinstance(match.get("key"), str) \
+                or match["key"] not in keys or match["key"] in out:
             continue
         number, confidence = match.get("duplicateOf"), match.get("confidence")
         if confidence not in ("high", "medium", "low"):

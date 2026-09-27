@@ -186,7 +186,8 @@ class Dedupe(unittest.TestCase):
         for needle in ('evidence for r5-m1', 'Source: #27, PR #30', '<!-- agworkbench:follow-up source=#27 -->',
                        '<!-- agworkbench:finding source=27 pr=30 round=r5 key=r5-m1 file=lib%2Frelay.py -->', PLANNER):
             self.assertIn(needle, body)
-        self.assertFalse(gh.calls_of('issue', 'list'))                   # the #27 title search is gone
+        # The #27 title search only looks for this item's own issue from a crashed run (r1 M1, r2 m1).
+        self.assertEqual(1, len(gh.calls_of('issue', 'list')))
 
     def test_severity_decides_the_priority_when_triage_is_off(self):
         for severity, priority in (('blocker', 'P0'), ('major', 'P1'), ('minor', 'P2'), ('immaterial', 'P3'),
@@ -371,8 +372,9 @@ class Dedupe(unittest.TestCase):
     def test_a_rerun_after_create_then_crash_adopts_its_own_issue(self):
         # r1 M1: the issue was created, then the run died before saving its url. The rerun finds it
         # (open, follow-up, same title) and must adopt it, not report a duplicate on itself.
-        for label_fails in (False, True):
-            with self.subTest(label_fails=label_fails):
+        # label_fails: in both runs, or only in the crashed one (r2 m1).
+        for label_fails, heals in ((False, False), (True, False), (True, True)):
+            with self.subTest(label_fails=label_fails, heals=heals):
                 (self.state / 'follow-ups.json').unlink(missing_ok=True)
                 gh = FakeRepo(fail={('label', 'follow-up')} if label_fails else ())
                 self.add()
@@ -380,6 +382,8 @@ class Dedupe(unittest.TestCase):
                         self.assertRaises(OSError):
                     self.file(gh)
                 self.assertIsNone(self.items()[0].get('url'))
+                if heals:
+                    gh.fail.clear()
                 self.assertEqual(0, self.file(gh))
                 item = self.items()[0]
                 self.assertEqual(('https://github.com/o/r/issues/101', None), (item['url'], item.get('duplicateOf')))
@@ -395,6 +399,34 @@ class Dedupe(unittest.TestCase):
         self.assertEqual(0, self.file(gh))
         self.assertEqual(5, self.items()[0]['duplicateOf'])             # an ordinary duplicate, commented
         self.assertEqual(1, len(gh.comments[5]))
+
+    def test_only_the_trailer_marker_counts(self):
+        # r2 m3: a finding may quote marker text (agworkbench reviewing its own dedupe), and the finding
+        # comes before the real marker in an issue body and in a dup comment.
+        quoted_own = '<!-- agworkbench:finding source=27 pr=30 round=r5 key=r5-m1 -->'
+        body = (f'the test quotes {quoted_own}\n\n<!-- agworkbench:follow-up source=#20 -->\n'
+                '<!-- agworkbench:finding source=20 pr=21 round=r5 key=r5-m1 -->\n' + PLANNER + '\n')
+        quoted_dup = '<!-- agworkbench:dup source=27 pr=30 round=r5 key=r5-m1 -->'
+        comment = (f'it quotes {quoted_dup}\n\n<!-- agworkbench:dup source=1 pr=2 round=r3 key=k -->\n'
+                   '<!-- agworkbench:dup-count 1 -->\n' + PLANNER + '\n')
+        gh = FakeRepo([dict(number=5, title='Fix the relay drain', body=body, labels=('follow-up', 'priority:P3'),
+                            comments=[{'body': comment, 'author_association': 'OWNER'}])])
+        self.add()
+        self.assertEqual(0, self.file(gh))
+        self.assertEqual(5, self.items()[0]['duplicateOf'])             # not adopted as its own issue
+        self.assertEqual(2, len(gh.comments[5]))                          # not "already recorded"
+        self.assertIn('priority P3 -> P1: reported 3 times (PR #21 r5, PR #2 r3, PR #30 r5)', gh.comments[5][-1]['body'])
+
+    def test_a_finding_that_quotes_a_marker_still_adopts_its_own_issue(self):
+        # r2 m3: the quoted marker sits before the real one in the new issue's body.
+        self.add(body='quoting <!-- agworkbench:finding source=9 pr=9 round=r1 key=other -->')
+        gh = FakeRepo()
+        with patch.object(wb, 'save_follow_ups', side_effect=OSError('disk full')), self.assertRaises(OSError):
+            self.file(gh)
+        self.assertEqual(0, self.file(gh))
+        self.assertEqual(('https://github.com/o/r/issues/101', None),
+                         (self.items()[0]['url'], self.items()[0].get('duplicateOf')))
+        self.assertFalse(gh.calls_of('issue', 'comment'))
 
     def test_a_failed_comment_keeps_the_others_and_exits_1(self):
         gh = FakeRepo([dict(number=5, title='Fix a')], fail={('comment', 5)})
@@ -478,6 +510,17 @@ class Dedupe(unittest.TestCase):
         self.add()
         self.file(gh)
         self.assertEqual([], self.model_calls)
+
+    def test_a_non_string_key_in_the_free_text_answer_files_new(self):
+        # r2 m2: parse_model_output's fallback (a JSON `result`) is not schema-checked.
+        text = json.dumps({'matches': [{'key': ['r5-m1'], 'duplicateOf': 5, 'confidence': 'high'},
+                                       {'key': {'k': 1}, 'duplicateOf': 5, 'confidence': ['high']}]})
+        self.stub_model(answer([], stdout=json.dumps({'result': text})))
+        gh = FakeRepo(self.issues_for_semantic())
+        self.add()
+        self.assertEqual(0, self.file(gh))
+        self.assertEqual(('https://github.com/o/r/issues/101', None),
+                         (self.items()[0]['url'], self.items()[0].get('duplicateOf')))
 
     def test_any_matcher_failure_files_new(self):
         failures = [answer([], code=1, stdout='You have hit your usage limit'),
@@ -585,7 +628,8 @@ class Rules(unittest.TestCase):
         marker = followup.finding_marker(item, 27, 30)
         self.assertEqual(1, marker.count('-->'))
         self.assertEqual({'source': '27', 'pr': '30', 'round': 'r12', 'key': 'k --> x', 'file': 'a b/c>d.py'},
-                         followup.parse_finding('text\n' + marker))
+                         followup.parse_finding('text\n' + marker + '\n' + PLANNER + '\n'))
+        self.assertIsNone(followup.parse_finding(marker + '\nmore text\n' + PLANNER))    # not the trailer
         self.assertEqual('custom origin', followup.round_of('custom origin'))
 
     def test_parse_pages(self):
@@ -601,7 +645,8 @@ class Prose(unittest.TestCase):
         section = text.split('## Full autonomy')[1].split('## When the implementer is Claude')[0]
         for needle in ['--file <path:line>', 'records a duplicate', 'priority:P2 at 2 reports, P1 at 3 and P0 at 5',
                        '--pr is required', 'marks each duplicate', 'followUp.dedupe',
-                       'an untriaged issue gets no label below P1']:
+                       'an untriaged issue gets no label below P1',
+                       'only a high-confidence answer naming an issue opened by the owner, a member or a collaborator counts']:
             self.assertIn(needle, section)
         readme = ' '.join((root / 'README.md').read_text(encoding='utf-8').split())
         self.assertIn('| `followUp` |', readme)

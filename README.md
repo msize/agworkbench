@@ -428,7 +428,8 @@ merges, unless you opted in for that checkout.
 - **A problem reported again gets more urgent (#42).** Before filing, `follow-up file` looks for an
   issue that already describes the finding: the same normalised title among the follow-up issues
   (open, or closed as completed, which it reopens), then one restricted `claude -p` call over the
-  open follow-up and bug issues, where only a high-confidence answer counts. On a match it comments
+  open follow-up and bug issues, where only a high-confidence answer naming an issue opened by the
+  owner, a member or a collaborator counts (anything else is linked as possibly related). On a match it comments
   a duplicate report there instead of filing. At 2, 3 and 5 reports in all, the issue's label goes
   up to `priority:P2`, `P1` and `P0`, never down; an untriaged issue gets no label below P1
   (untriaged is already admitted before P2). A new issue gets its priority from triage when the

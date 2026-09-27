@@ -54,7 +54,8 @@ all stop you exactly as they do without autonomy.
   (`follow-up-nested` when this issue is itself a follow-up) and adds the planner marker. With dedupe on
   (#42) it first looks for an existing issue describing the same problem: the same normalised title
   among the follow-up issues, then one restricted model call over the open follow-up and bug issues
-  (only a high-confidence answer counts). On a match it records a duplicate there instead of filing:
+  (only a high-confidence answer naming an issue opened by the owner, a member or a collaborator
+  counts; anything else is linked as possibly related). On a match it records a duplicate there instead of filing:
   a comment with this PR, the round, the file and the finding, and the count. The reports then bump
   the issue's priority label: priority:P2 at 2 reports, P1 at 3 and P0 at 5 (`followUp.bumpAt`),
   never downward; an untriaged issue gets no label below P1. merge-check refuses while any item is unfiled; a duplicate counts as filed.

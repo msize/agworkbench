@@ -787,7 +787,8 @@ def file_deduped(root: Path, args: argparse.Namespace, items: list[dict], pendin
     for item in pending:
         try:
             own = next((c for c in pool if followup.is_own(c, item, args.source, args.pr)), None)
-            if own is None and label is None:
+            if own is None and followup.pick_exact(item, pool, labelled)[0] is None:
+                # The crashed run may have filed without the label even if this run has it (r2 m1).
                 own = find_own_unlabelled(root, repo, item, args)
             if own is not None:
                 adopt(item, own)
