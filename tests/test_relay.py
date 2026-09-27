@@ -2150,6 +2150,71 @@ class AutonomousClose(unittest.TestCase):
         self.assertFalse((self.state / 'helpers' / f'{self.REVMUX}.done').exists())     # its marker is gone
         self.assertGreaterEqual(self.t, closer.CLOSE_SETTLE)                            # panes had to settle
 
+    def test_no_pr_close_uses_the_same_gates_and_cleanup(self):
+        self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 1})
+        with patch.object(relay, 'gh_json', return_value={'state': 'CLOSED'}):
+            self.r.close_after_merge(None)
+        self.assertEqual([self.REVMUX, self.PLANNER, self.RELAY], self.closes())
+        self.assertIn(('cleanup', (self.folder, 'o/repo', '7', None, 'merged')), self.actions)
+
+    def test_run_detects_no_pr_done_and_closes_a_closed_issue(self):
+        self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 1})
+        with patch.object(relay, 'gh_json', return_value={'state': 'CLOSED'}), \
+                patch.object(self.r, 'flush_outbox', return_value=True), \
+                patch.object(self.r, 'deliver_mail'), patch.object(self.r, 'watch_pr', return_value=False), \
+                patch.object(self.r, 'read_panes', return_value={}), \
+                patch.object(self.r, 'check_limits'), patch.object(self.r.stall, 'tick'):
+            self.assertEqual(0, self.r.run())
+        self.assertIn(self.PLANNER, self.closes())
+        self.assertNotIn('close_pending', self.r.state)
+
+    def test_run_does_not_start_no_pr_close_for_an_open_issue(self):
+        self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 1})
+        def stop_after_poll():
+            self.r.stop_file.write_text('stop', encoding='utf-8')
+            return False
+        with patch.object(relay, 'gh_json', return_value={'state': 'OPEN'}), \
+                patch.object(self.r, 'flush_outbox', return_value=True), \
+                patch.object(self.r, 'deliver_mail'), patch.object(self.r, 'watch_pr', side_effect=stop_after_poll), \
+                patch.object(self.r, 'read_panes', return_value={}), \
+                patch.object(self.r, 'check_limits'), patch.object(self.r.stall, 'tick'), \
+                patch.object(self.r, 'close_after_merge') as close:
+            self.assertEqual(0, self.r.run())
+        close.assert_not_called()
+        self.assertEqual([], self.closes())
+
+    def test_reopened_or_unknown_issue_closes_no_helper_or_issue_session(self):
+        self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 1})
+        for result in ({'state': 'OPEN'}, RuntimeError('offline')):
+            with self.subTest(result=result):
+                self.actions.clear()
+                self.t = 0
+                self.r.state['close_pending'] = 'no-pr'
+                self.write('relay.json', self.r.state)
+                with patch.object(relay, 'gh_json', side_effect=result if isinstance(result, Exception) else None,
+                                  return_value=result if isinstance(result, dict) else None):
+                    self.r.close_after_merge(None)
+                self.assertEqual([], self.closes())
+                self.assertEqual([], [a for a in self.actions if a[0] == 'cleanup'])
+
+    def test_restarted_pending_no_pr_close_rechecks_issue(self):
+        self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 1})
+        self.r.state['close_pending'] = 'no-pr'
+        self.write('relay.json', self.r.state)
+        with patch.object(relay, 'gh_json', return_value={'state': 'OPEN'}):
+            self.assertEqual(0, self.r.run())
+        self.assertEqual([], self.closes())
+        self.assertNotIn('close_pending', self.r.state)
+
+    def test_no_pr_done_record_is_required_for_no_pr_gate(self):
+        close = self.r.closer()
+        self.assertIn('loop-state done --no-pr', ' '.join(close.agent_blockers(None)))
+        self.r.close_after_merge(None)
+        self.assertEqual([], self.closes())
+        self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7})
+        self.assertNotIn('loop-state done --no-pr', ' '.join(close.agent_blockers(None)))
+        self.assertIn('loop-state done --pr 7', ' '.join(close.agent_blockers(7)))
+
     def blocked(self):
         self.r.close_after_merge(7)
         # The finished helper may close regardless (#33); the agents' session and the relay may not.
@@ -2196,6 +2261,9 @@ class AutonomousClose(unittest.TestCase):
         self.r.close_after_merge(7)
         self.assertEqual([], self.actions)
         self.assertEqual('', self.log())
+        self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 1})
+        self.r.close_after_merge(None)
+        self.assertEqual([], self.actions)
 
     def test_no_loop_done_record_for_this_pr(self):
         (self.state / 'loop-done.json').unlink()

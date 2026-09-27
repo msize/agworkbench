@@ -115,6 +115,22 @@ class QueueCase(unittest.TestCase):
         self.assertEqual([1, 2, 3], [x[0] for x in self.launches])
         self.assertTrue(q.finished(self.store.load()))
 
+    def test_closed_report_releases_slot_and_is_counted_separately(self):
+        self.start(parallel=1)
+        worker = self.worker()
+        worker.tick(); worker.tick()
+        self.report(1, 'blocked', reason='checking duplicate')
+        worker.tick()
+        self.report(1, 'closed', reason='duplicate of #9')
+        worker.tick()
+        member = self.member(1)
+        self.assertEqual(('closed', 'closed', 'duplicate of #9', True),
+                         (member['state'], member['phase'], member['reason'], member['slotReleased']))
+        self.assertIn('closed 1', q.summary(self.store.load()))
+        self.assertIn('merged 0', q.summary(self.store.load()))
+        self.assertIn(2, [item[0] for item in self.launches])
+        self.assertTrue(q.finished(dict(self.store.load(), members=[member])))
+
     def test_parallel_blocked_resumed_and_failed_members_release_slots(self):
         self.start(parallel=2)
         worker = self.worker()
@@ -930,6 +946,15 @@ class CloseBackstop(unittest.TestCase):
     def relay_gone(self):
         self.tree['workspaces'][0]['sessions'] = self.tree['workspaces'][0]['sessions'][:1]
 
+    def finished_helper(self):
+        pane = 'helper-pane'
+        self.text[pane] = 'revmux exit 0'
+        self.tree['workspaces'][0]['sessions'].append({'id': pane, 'name': '#7 revmux r1', 'paneIds': [pane]})
+        directory = self.state / 'helpers'
+        directory.mkdir(exist_ok=True)
+        (directory / f'{pane}.done').write_text(json.dumps({
+            'kind': 'revmux', 'round': 1, 'exit': 0, 'pane': pane, 'rows': ['revmux exit 0']}), encoding='utf-8')
+
     def test_nothing_happens_for_fifteen_minutes(self):
         self.relay_gone()
         self.run_for(890)
@@ -953,6 +978,51 @@ class CloseBackstop(unittest.TestCase):
         self.assertNotIn('close_pending', q.read_json(self.state / 'relay.json'))
         self.assertNotIn('closePending', self.member(7))
         self.assertIn('the conductor runs the close', (self.state / 'relay-close.log').read_text(encoding='utf-8'))
+
+    def test_closed_no_pr_backstop_checks_issue_before_sessions(self):
+        with self.store.transaction() as data:
+            data['members'][0].update(state='closed', phase='closed', pr=None, reason='duplicate')
+        q.atomic_json(self.state / 'relay.json', {'close_pending': 'no-pr'})
+        q.atomic_json(self.state / 'loop-done.json', {'pr': None, 'noPr': True, 'issue': 7})
+        self.relay_gone()
+        self.finished_helper()
+        self.w.gh = lambda *args: {'state': 'OPEN'} if args[:2] == ('issue', 'view') else self.gh(*args)
+        self.run_for(1000)
+        self.assertEqual([], self.actions)
+        self.assertIn('reopened', self.member(7)['closeStuck'])
+        self.assertNotIn('close_pending', q.read_json(self.state / 'relay.json'))
+
+    def test_closed_no_pr_backstop_closes_and_starts_cleanup(self):
+        with self.store.transaction() as data:
+            data['members'][0].update(state='closed', phase='closed', pr=None, reason='duplicate')
+        q.atomic_json(self.state / 'relay.json', {'close_pending': 'no-pr'})
+        q.atomic_json(self.state / 'loop-done.json', {'pr': None, 'noPr': True, 'issue': 7})
+        self.relay_gone()
+        self.w.gh = lambda *args: {'state': 'CLOSED'} if args[:2] == ('issue', 'view') else self.gh(*args)
+        self.run_for(1000)
+        self.assertIn(('close', self.PLANNER), self.actions)
+        self.assertEqual([None], [a[3] for a in self.cleanups])
+        self.assertNotIn('close_pending', q.read_json(self.state / 'relay.json'))
+
+    def test_closed_no_pr_backstop_keeps_sessions_on_lookup_failure(self):
+        with self.store.transaction() as data:
+            data['members'][0].update(state='closed', phase='closed', pr=None, reason='duplicate')
+        q.atomic_json(self.state / 'relay.json', {'close_pending': 'no-pr'})
+        q.atomic_json(self.state / 'loop-done.json', {'pr': None, 'noPr': True, 'issue': 7})
+        self.relay_gone()
+        self.finished_helper()
+        self.w.gh = Mock(side_effect=OSError('offline'))
+        self.run_for(1000)
+        self.assertEqual([], self.actions)
+        self.assertTrue(self.member(7)['closePending'])
+
+    def test_closed_no_pr_handoff_keeps_the_conductor_running(self):
+        with self.store.transaction() as data:
+            data['members'][0].update(state='closed', phase='closed', pr=None, reason='duplicate')
+        q.atomic_json(self.state / 'relay.json',
+                      {'close_pending': 'no-pr', 'close_handoff': {'pr': 'no-pr', 'reasons': ['mail']}})
+        self.assertTrue(q.handed_off(self.member(7)))
+        self.assertFalse(q.finished(self.store.load()))
 
     def test_the_backstop_cleanup_follows_the_recorded_mode(self):
         for value, expected in (('build', 'build'), ('off', None)):

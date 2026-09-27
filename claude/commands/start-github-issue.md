@@ -14,11 +14,12 @@ it first, and what comes back is a located disagreement or a checked fact.
 |---|---|---|
 | you | intake, the plan, review, GitHub (push, PR, comments), talking to the human | merge (unless auto-merge is on - Phase 6), approve your own PR |
 | Codex | critiques the plan, implements, commits, fixes review findings | reach the network or GitHub, touch the terminal |
-| the relay | rings a pane when mail arrives; watches the PR; ends the loop on merge | decide anything |
+| the relay | rings a pane when mail arrives; watches the PR; closes a merged or no-op loop | decide anything |
 | the human | reviews (revdiff or GitHub), approves, **merges** | - |
 
-The loop ends when the human has approved **and merged** the PR. Not before. With auto-merge on
-for this checkout, you may merge it yourself once every condition in Phase 6 holds.
+For a code change, the loop ends when the human has approved **and merged** the PR. With auto-merge
+on for this checkout, you may merge it yourself once every condition in Phase 6 holds. For a
+no-op issue, use the "Nothing to change" path below once GitHub reports the issue CLOSED.
 
 **Mark everything you post on GitHub.** Every PR body, PR comment and review reply you write ends
 with this line:
@@ -66,9 +67,10 @@ all stop you exactly as they do without autonomy.
 - **The merge comment** lists every follow-up URL, and every disputed or deferred finding with its
   severity. It marks each duplicate (an item with `duplicateOf` in follow-ups.json) as "reported
   again on #M" rather than as a new issue.
-- **Your last act** is `python "$AGWORKBENCH/lib/wb.py" loop-state done --pr <P> --sha <merged sha>`, after the
-  Phase 7 steps. It refuses while any follow-up is unfiled. The relay closes nothing until this
-  record exists and your own inbox is read. Mail the implementer gets after the merge, such as your
+- **Your last act** is `python "$AGWORKBENCH/lib/wb.py" loop-state done --pr <P> --sha <merged sha>` after the
+  Phase 7 merge steps, or `loop-state done --no-pr --reason "<why>"` after the no-op path has closed
+  the issue. It refuses while any follow-up is unfiled. The relay closes nothing until this
+  record exists and your own inbox is read. Mail the implementer gets after the merge or no-PR done record, such as your
   "loop complete" note, does not have to be read; older unread mail holds the close for 10 minutes
   at most (#44). Then it closes:
   - the helper sessions that are back at a shell;
@@ -252,6 +254,18 @@ so this file is the only way it sees the issue.** Then read the code the issue t
 say how you would change it.
 
 ## Phase 2 - the plan, agreed
+
+### Nothing to change
+
+If intake or the plan round shows the issue is a duplicate, already fixed on the default branch,
+or not planned, give Codex the evidence (duplicate issue, fixing commit, or passing check) and
+agree on the no-op verdict as `AGREED: no-op`. Post that evidence as an issue comment with the
+`<!-- agworkbench:planner -->` marker. With `autonomous=true`, close the issue with the matching
+GitHub reason (`gh issue close <N> --reason "not planned"` for a duplicate or declined work;
+`--reason "completed"` when already fixed). Without autonomy, wait for the human to decide and
+close it. Once GitHub reports CLOSED, run
+`python "$AGWORKBENCH/lib/wb.py" loop-state done --no-pr --reason "<why>"` as the last act,
+including in queue mode; do not report `loop-state blocked` for a closed no-op issue.
 
 Write `.workbench/plan.md`:
 

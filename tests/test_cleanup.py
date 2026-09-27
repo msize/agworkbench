@@ -327,6 +327,28 @@ class AfterClose(Clones):
         self.assertEqual([('pr', 'view', '42', '--repo', 'o/repo', '--json', 'state,headRefOid')], self.gh_calls)
         self.assertIn('deleted (merged): freed', self.root_log())
 
+    def test_no_pr_after_close_uses_only_remote_tracking_refs(self):
+        checkout = self.clone()
+        self.trees = [EMPTY_TREE]
+        self.assertEqual(0, cleanup.after_close(checkout, 'o/repo', 7, None, 'merged',
+                                                read_tree=self.tree, gh=self.gh,
+                                                clock=lambda: self.t, pause=self.pause))
+        self.assertFalse(checkout.exists())
+        self.assertEqual([], self.gh_calls)
+        self.assertNotIn('--pr', cleanup.after_close_argv(checkout, 'o/repo', 7, None, 'merged'))
+        self.assertIn('no PR (issue closed)', self.root_log())
+
+    def test_no_pr_after_close_keeps_unpushed_commits(self):
+        checkout = self.clone()
+        self.commit(checkout)
+        self.trees = [EMPTY_TREE]
+        self.assertEqual(1, cleanup.after_close(checkout, 'o/repo', 7, None, 'merged',
+                                                read_tree=self.tree, gh=self.gh,
+                                                clock=lambda: self.t, pause=self.pause))
+        self.assertTrue(checkout.exists())
+        self.assertIn('unpushed: issue-7-fix', self.root_log())
+        self.assertEqual([], self.gh_calls)
+
     def test_dirty_unpushed_or_stashed_is_kept_with_the_reason_logged(self):
         def dirty(checkout):
             (checkout / 'notes.txt').write_text('draft', encoding='utf-8')

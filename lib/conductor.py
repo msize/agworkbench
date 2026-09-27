@@ -22,7 +22,7 @@ import labelquery
 import triage
 
 HERE = Path(__file__).resolve().parent
-STATES = {'pending', 'launching', 'active', 'pr-open', 'blocked', 'failed', 'merged'}
+STATES = {'pending', 'launching', 'active', 'pr-open', 'blocked', 'failed', 'merged', 'closed'}
 
 
 class QueueError(ValueError):
@@ -402,7 +402,7 @@ class Store:
                         type(m['attempt']) is not int or m['attempt'] < 0 or type(m['slotReleased']) is not bool or
                         not isinstance(m['checkout'], str) or not Path(m['checkout']).is_absolute() or
                         type(m['checkoutEstablished']) is not bool or type(m['consumedRev']) is not int or
-                        m['consumedRev'] < 0 or m['phase'] not in {'active', 'pr-open', 'blocked'} or
+                        m['consumedRev'] < 0 or m['phase'] not in {'active', 'pr-open', 'blocked', 'closed'} or
                         (m['attempt'] > 0 and not valid_uuid(m.get('token'))) or
                         m.get('priority') not in (None, *triage.PRIORITIES) or
                         not isinstance(m.get('createdAt') or '', str)):
@@ -640,7 +640,7 @@ def member_result(path, number, attempt, token, result):
 def write_loop_state(root, state, pr=None, reason=None, *, loop_id=None):
     """A loop report from the planner's Claude runtime, or - with `loop_id` - from the relay, which is
     not a Claude runtime and passes the id claude.json holds (#45: a stall it escalates)."""
-    if state not in {'pr-open', 'blocked', 'resumed'}:
+    if state not in {'pr-open', 'blocked', 'resumed', 'closed'}:
         raise QueueError('invalid loop state')
     root = Path(root)
     directory = root / '.workbench/state'
@@ -653,15 +653,16 @@ def write_loop_state(root, state, pr=None, reason=None, *, loop_id=None):
     repo = repo_name(member['repo'])
     if state == 'pr-open':
         pr_url(pr, repo)
-    if state == 'blocked' and not reason:
-        raise QueueError('blocked requires --reason')
+    if state in {'blocked', 'closed'} and (not isinstance(reason, str) or not reason.strip()):
+        raise QueueError(f'{state} requires --reason')
     with Lock(directory / 'loop.lock'):
         path = directory / 'loop.json'
         previous = read_json(path) if path.exists() else {}
         same = previous.get('loopId') == loop_id and previous.get('queue') == member['queue']
         record = dict(queue=member['queue'], repo=repo, number=member['number'], loopId=loop_id,
                       rev=previous.get('rev', 0) + 1 if same else 1, state=state,
-                      pr=pr or (previous.get('pr') if same else None), reason=reason, at=time.time())
+                      pr=None if state == 'closed' else pr or (previous.get('pr') if same else None),
+                      reason=reason, at=time.time())
         atomic_json(path, record)
     return record
 
@@ -675,7 +676,7 @@ def apply_loop(data, member, path):
     loop = identity['sessionId']
     if (report.get('queue') != str(path) or report.get('repo') != data['repo'] or
             report.get('number') != member['number'] or report.get('loopId') != loop or not valid_uuid(loop) or
-            report.get('state') not in {'pr-open', 'blocked', 'resumed'} or
+            report.get('state') not in {'pr-open', 'blocked', 'resumed', 'closed'} or
             type(report.get('rev')) is not int or report['rev'] < 1):
         raise QueueError(f'ignored stale/foreign/malformed loop report for #{member["number"]}')
     revision = member['consumedRev'] if member['consumedLoop'] == loop else 0
@@ -683,15 +684,17 @@ def apply_loop(data, member, path):
         return False
     if report['state'] == 'pr-open':
         pr_url(report.get('pr'), data['repo'])
-    if report['state'] == 'blocked' and (not isinstance(report.get('reason'), str) or not report['reason'].strip()):
-        raise QueueError('blocked loop report requires a reason')
+    if report['state'] in {'blocked', 'closed'} and (not isinstance(report.get('reason'), str) or not report['reason'].strip()):
+        raise QueueError(f"{report['state']} loop report requires a reason")
     if report.get('pr'):
         pr_url(report['pr'], data['repo'])
         if member.get('pr') != report['pr']:
             member.update(pr=report['pr'], prState=None)
     state = 'active' if report['state'] == 'resumed' else report['state']
     member.update(phase=state, state=state, reason=report.get('reason'), consumedLoop=loop, consumedRev=report['rev'])
-    if state in {'pr-open', 'blocked'}:
+    if state == 'closed':
+        member.update(pr=None, prState=None)
+    if state in {'pr-open', 'blocked', 'closed'}:
         member['slotReleased'] = True
     return True
 
@@ -703,6 +706,9 @@ def summary(data):
         state = m['state'] + (' (PR closed)' if m.get('prState') == 'CLOSED' else '')
         values = [str(m['number']), state, m.get('pr') or '', m.get('reason') or '']
         lines.append('| ' + ' | '.join(str(v).replace('|', '\\|').replace('\n', ' ') for v in values) + ' |')
+    counts = {state: sum(m['state'] == state for m in data['members']) for state in STATES}
+    lines.insert(2, 'Counts: ' + ', '.join(f'{state} {counts[state]}' for state in
+                 ('merged', 'closed', 'pr-open', 'blocked', 'failed', 'active', 'launching', 'pending')))
     return '\n'.join(lines) + '\n'
 
 
@@ -986,16 +992,17 @@ class Worker:
     def close_backstop(self):
         data = self.store.load()
         for m in data['members']:
-            if m['state'] != 'merged':
+            if m['state'] not in {'merged', 'closed'}:
                 continue
             number = m['number']
-            pr = pr_number(m.get('pr'))    # relay.json's close_pending holds the PR number, not the issue's
+            key = close_key(m)
+            pr = None if key == 'no-pr' else key
             hub_dir = Path(m['checkout']) / '.workbench'
             try:
                 relay_state = read_json(hub_dir / 'state' / 'relay.json') if (hub_dir / 'state' / 'relay.json').exists() else {}
             except (OSError, ValueError):
                 relay_state = {}
-            if pr is None or relay_state.get('close_pending') != pr:
+            if key is None or relay_state.get('close_pending') != key:
                 # Nothing pending: the relay closed (or refused), or autonomy was off. A "relay alive"
                 # flag is resolved by that; a refused backstop close stays flagged for the human.
                 self.closes.pop(number, None)
@@ -1030,16 +1037,39 @@ class Worker:
                      for box in ('claude', 'codex')]
             watch['attempt'] = closer.Closer(hub_dir, data['repo'], number, peers,
                                              log=lambda text: print(f'#{number} {text}', flush=True), clock=self.clock)
-            watch['attempt'].log(f'PR #{pr} (issue #{number}) merged and its relay is gone; the conductor runs the close')
+            subject = f'PR #{pr} (issue #{number}) merged' if pr is not None else f'issue #{number} closed without a PR'
+            watch['attempt'].log(f'{subject} and its relay is gone; the conductor runs the close')
             if str(m.get('closeStuck', '')).startswith(RELAY_ALIVE):
                 # The relay went (or handed its close over, #44): the flag is resolved, and a flagged
                 # member would let the conductor finish in the middle of this attempt.
                 self.mark(number, closeStuck=None)
         attempt = watch['attempt']
+        if pr is None:
+            if not attempt.no_pr_done():
+                if attempt.timed_out():
+                    self.end_close(m, pr, hub_dir, stuck='the planner has not recorded `wb.py loop-state done --no-pr`')
+                return
+            closed, detail = attempt.issue_closed(self.gh)
+            if closed is False:
+                attempt.log(f'NOT closing: issue #{number} was reopened')
+                self.end_close(m, pr, hub_dir, stuck=f'issue #{number} was reopened')
+                return
+            if closed is None:
+                if attempt.timed_out():
+                    self.end_close(m, pr, hub_dir, stuck=f'issue state unknown: {detail}')
+                return
         attempt.step_helpers()
         reasons = attempt.agent_blockers(pr)
         if not reasons or attempt.overdue_ok():
             if attempt.autonomous():
+                if pr is None:
+                    closed, detail = attempt.issue_closed(self.gh)
+                    if closed is not True:
+                        if closed is False:
+                            self.end_close(m, pr, hub_dir, stuck=f'issue #{number} was reopened')
+                        elif attempt.timed_out():
+                            self.end_close(m, pr, hub_dir, stuck=f'issue state unknown: {detail}')
+                        return
                 attempt.close_issue_session()
                 attempt.start_cleanup(pr)
             else:
@@ -1053,7 +1083,7 @@ class Worker:
     def end_close(self, m, pr, hub_dir, stuck):
         path = hub_dir / 'state' / 'relay.json'
         state = read_json(path)
-        if state.get('close_pending') == pr:
+        if state.get('close_pending') == ('no-pr' if pr is None else pr):
             # Only the close this attempt ran: a relay may have rewritten the file since.
             state.pop('close_pending')
             state.pop('close_merged_at', None)
@@ -1272,11 +1302,15 @@ def file_locked(path):
         return True
 
 
+def close_key(m):
+    return 'no-pr' if m['state'] == 'closed' else pr_number(m.get('pr'))
+
+
 def handed_off(m):
     """A relay handed this member's close to the conductor (#44): its relay.json holds close_handoff
     and close_pending for the member's PR. Read under the queue's state lock by run(), so a relay that
     saw this conductor running before closing its session is never left without one."""
-    pr = pr_number(m.get('pr'))
+    pr = close_key(m)
     if pr is None:
         return False
     try:
@@ -1288,7 +1322,7 @@ def handed_off(m):
 
 
 def finished(data):
-    # A merged member whose close is still pending keeps the conductor up for the backstop (#33),
+    # A merged or no-PR closed member whose close is still pending keeps the conductor up for the backstop (#33),
     # unless it is flagged stuck (then it is the human's, and never keeps the queue alive forever).
     if any(m.get('closePending') and not m.get('closeStuck') for m in data['members']):
         return False

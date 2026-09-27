@@ -11,6 +11,7 @@
   wb.py follow-up add --key r2-m1 --title T --severity minor --origin "review r2"   (#27)
   wb.py follow-up file --source 27 --pr 30                        # file every unfiled follow-up (#27), deduped (#42)
   wb.py loop-state done --pr 30 --sha <sha>                       # the planner's last act (#27)
+  wb.py loop-state done --no-pr --reason "duplicate"               # closed issue needing no change (#53)
   wb.py merge-check --pr 12 --head <sha>                          # read-only auto-merge gate (#23)
   wb.py wait-ci --pr 12 --head <sha>                              # background: until CI on the head is done (#32)
   wb.py update-check --reviewed <sha> --base <sha>                # an UPDATE round is one merge of the base (#32)
@@ -34,6 +35,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 from urllib.parse import quote
 
@@ -43,6 +45,7 @@ sys.path.insert(0, str(HERE))
 import agw  # noqa: E402
 import followup  # noqa: E402
 import hub  # noqa: E402
+import closer  # noqa: E402
 import triage  # noqa: E402
 
 
@@ -168,7 +171,8 @@ def cmd_status(args: argparse.Namespace) -> int:
 def cmd_loop_state(args: argparse.Namespace) -> int:
     # Reports stay in this checkout; the conductor alone owns the global queue.
     if args.state == 'done':
-        code = loop_done(checkout(), args.pr, args.sha)
+        code = (loop_done_no_pr(checkout(), args.reason, args.pr) if getattr(args, 'no_pr', False)
+                else loop_done(checkout(), args.pr, args.sha))
         if code == 0:
             set_waiting(checkout(), False)
         return code
@@ -883,8 +887,78 @@ def loop_done(root: Path, pr: str | None, sha: str | None) -> int:
     return 0
 
 
-def gh_json(*args: str):
-    done = subprocess.run(["gh", *args], capture_output=True, text=True, encoding="utf-8", errors="replace")
+def loop_done_no_pr(root: Path, reason: str | None, pr: str | None = None) -> int:
+    """Complete a closed issue without a PR; publish the queue report before the close latch."""
+    if pr is not None or not isinstance(reason, str) or not reason.strip():
+        print('wb: loop-state done --no-pr requires --reason and cannot use --pr', file=sys.stderr)
+        return 2
+    branch = subprocess.run(['git', '-C', str(root), 'branch', '--show-current'],
+                            capture_output=True, text=True).stdout.strip()
+    number = closer.issue_from_branch(branch)
+    member_path = root / '.workbench/state/queue-member.json'
+    if member_path.exists():
+        try:
+            member = json.loads(member_path.read_text(encoding='utf-8-sig'))
+            number = str(member['number'])
+        except (OSError, ValueError, KeyError, TypeError) as err:
+            print(f'wb: loop-state done --no-pr: invalid queue member: {err}', file=sys.stderr)
+            return 2
+    if not number or not branch:
+        print('wb: loop-state done --no-pr: cannot identify issue or branch', file=sys.stderr)
+        return 2
+    try:
+        issue = gh_json('issue', 'view', number, '--json', 'state,stateReason', cwd=root)
+        if not isinstance(issue, dict) or issue.get('state') not in ('OPEN', 'CLOSED'):
+            raise ValueError('invalid issue state')
+    except (OSError, ValueError, RuntimeError) as err:
+        print(f'wb: loop-state done --no-pr: cannot read issue #{number}: {err}', file=sys.stderr)
+        return 2
+    if issue['state'] != 'CLOSED':
+        print(f'wb: issue #{number} is still open: close it with its reason first', file=sys.stderr)
+        return 1
+    try:
+        prs = gh_json('pr', 'list', '--head', branch, '--state', 'open', '--json', 'number', cwd=root)
+        if not isinstance(prs, list):
+            raise ValueError('invalid PR list')
+    except (OSError, ValueError, RuntimeError) as err:
+        print(f'wb: loop-state done --no-pr: cannot check open PRs: {err}', file=sys.stderr)
+        return 2
+    if prs:
+        print(f'wb: loop-state done --no-pr: an open PR exists for {branch}', file=sys.stderr)
+        return 1
+    items = load_follow_ups(root)
+    unfiled = [item['key'] for item in items if not item.get('url')]
+    if unfiled:
+        print(f"wb: loop-state done: follow-ups not filed yet: {', '.join(unfiled)}", file=sys.stderr)
+        return 1
+    if member_path.exists():
+        from conductor import write_loop_state
+        try:
+            write_loop_state(root, 'closed', reason=reason.strip())
+        except (OSError, ValueError, KeyError, TypeError) as err:
+            print(f'wb: loop-state done --no-pr: queue report failed: {err}', file=sys.stderr)
+            return 2
+    record = dict(pr=None, noPr=True, issue=int(number), issueState='CLOSED',
+                  stateReason=issue.get('stateReason'), reason=reason.strip(),
+                  followUps=[item['url'] for item in items], at=time.time())
+    path = root / '.workbench/state/loop-done.json'
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
+        try:
+            temporary.write_text(json.dumps(record, indent=2), encoding='utf-8')
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    except OSError as err:
+        print(f'wb: loop-state done --no-pr: cannot record completion: {err}', file=sys.stderr)
+        return 2
+    print(f"loop done: issue #{number} closed without a PR; {len(items)} follow-up(s)")
+    return 0
+
+
+def gh_json(*args: str, cwd: Path | None = None):
+    done = subprocess.run(["gh", *args], capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=cwd)
     if done.returncode != 0:
         raise RuntimeError(f"gh {' '.join(args[:3])} failed: {(done.stderr or done.stdout).strip()}")
     return json.loads(done.stdout)
@@ -1233,6 +1307,7 @@ def main() -> int:
     p.add_argument('state', choices=['pr-open', 'blocked', 'resumed', 'done'])
     p.add_argument('--sha', help='done: the merged head SHA')
     p.add_argument('--pr')
+    p.add_argument('--no-pr', action='store_true', help='done: closed issue with no PR')
     p.add_argument('--reason')
     p.set_defaults(func=cmd_loop_state)
     p = subs.add_parser("revmux", help="run a revmux round in its own visible session")

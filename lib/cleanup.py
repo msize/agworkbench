@@ -373,9 +373,12 @@ CREATE_NEW_PROCESS_GROUP = 0x00000200
 CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 
 
-def after_close_argv(checkout: Path, repo: str, issue: int | str, pr: int, mode: str) -> list[str]:
+def after_close_argv(checkout: Path, repo: str, issue: int | str, pr: int | None, mode: str) -> list[str]:
     argv = [sys.executable, str(HERE / 'cleanup.py'), 'after-close', '--checkout', str(checkout), '--repo', repo,
-            '--issue', str(issue), '--pr', str(pr), '--mode', mode]
+            '--issue', str(issue)]
+    if pr is not None:
+        argv += ['--pr', str(pr)]
+    argv += ['--mode', mode]
     if os.environ.get('AGWINTERM_PIPE'):
         # A process started through WMI gets the user's default environment, not ours.
         argv += ['--pipe', os.environ['AGWINTERM_PIPE']]
@@ -398,7 +401,7 @@ def wmi_create(command_line: str, cwd: str) -> int:
     return int(match[1])
 
 
-def start_after_close(checkout: Path, repo: str, issue: int | str, pr: int, mode: str, *, popen=subprocess.Popen,
+def start_after_close(checkout: Path, repo: str, issue: int | str, pr: int | None, mode: str, *, popen=subprocess.Popen,
                       wmi=wmi_create) -> tuple[int | None, str]:
     """Start `after-close` so that closing the caller's session does not end it, with its cwd outside
     the checkout. Returns (pid, how). agwinterm kills a session's job when the session closes and its
@@ -428,7 +431,7 @@ def pr_head_of(repo: str, pr: int, gh=conductor.gh_json) -> str | None:
     return data.get('headRefOid') if isinstance(data, dict) and data.get('state') == 'MERGED' else None
 
 
-def after_close(checkout: Path, repo: str, issue: int, pr: int, mode: str, *, read_tree=None, gh=conductor.gh_json,
+def after_close(checkout: Path, repo: str, issue: int, pr: int | None, mode: str, *, read_tree=None, gh=conductor.gh_json,
                 clock: Callable[[], float] = time.monotonic, pause: Callable[[float], None] = time.sleep) -> int:
     read_tree = read_tree or agw.tree
     checkout = Path(checkout).resolve()
@@ -436,7 +439,8 @@ def after_close(checkout: Path, repo: str, issue: int, pr: int, mode: str, *, re
     if mode not in ('merged', 'build'):
         log(root, checkout, f'nothing to do (cleanup {mode!r})')
         return 0
-    log(root, checkout, f'PR #{pr} merged and the issue session closed; waiting for #{issue} sessions to go')
+    log(root, checkout, (f'PR #{pr} merged' if pr is not None else 'no PR (issue closed)')
+        + f' and the issue session closed; waiting for #{issue} sessions to go')
     deadline = clock() + AFTER_CLOSE_WAIT
     while True:
         try:
@@ -452,12 +456,13 @@ def after_close(checkout: Path, repo: str, issue: int, pr: int, mode: str, *, re
             close_log(checkout, reason)
             return 1
         pause(AFTER_CLOSE_POLL)
-    try:
-        head = pr_head_of(repo, pr, gh)
-    except (OSError, ValueError, subprocess.SubprocessError) as err:
-        # Without the PR head only remote-tracking refs vouch for local commits: the safe direction.
-        log(root, checkout, f'PR head unknown ({err}); checking against remote-tracking refs only')
-        head = None
+    head = None
+    if pr is not None:
+        try:
+            head = pr_head_of(repo, pr, gh)
+        except (OSError, ValueError, subprocess.SubprocessError) as err:
+            # Without the PR head only remote-tracking refs vouch for local commits: the safe direction.
+            log(root, checkout, f'PR head unknown ({err}); checking against remote-tracking refs only')
     deleted, reasons, _ = clean(checkout, repo=repo, issue=issue, root=root, mode=mode, tree=snapshot,
                                 pr_head=head, pause=pause)
     if not deleted:
@@ -577,7 +582,7 @@ def main(argv: list[str] | None = None) -> int:
     after.add_argument('--checkout', required=True)
     after.add_argument('--repo', required=True)
     after.add_argument('--issue', required=True, type=int)
-    after.add_argument('--pr', required=True, type=int)
+    after.add_argument('--pr', type=int)
     after.add_argument('--mode', required=True, choices=MODES)
     after.add_argument('--pipe')
     swept = sub.add_parser('sweep')
