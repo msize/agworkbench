@@ -1166,7 +1166,8 @@ class Worker:
                 self.jobs[m['number']] = self.spawn(settings, m)
             except (OSError, ValueError) as err:
                 member_result(self.store.path, m['number'], m['attempt'], m['token'],
-                              dict(result='failed', infra=True, stage='launcher', detail=str(err)))
+                              dict(result='failed', infra=isinstance(err, OSError),
+                                   stage='launcher', detail=str(err)))
         current = self.store.load()
         if disk_changed:
             self.disk_announced = bool(disk)
@@ -1345,7 +1346,8 @@ def main(argv=None):
         if args.command == 'member-context':
             print(json.dumps(member_context(args.file, args.number, args.attempt, args.token)))
         else:
-            member_result(args.file, args.number, args.attempt, args.token, read_json(args.result_file))
+            if not member_result(args.file, args.number, args.attempt, args.token, read_json(args.result_file)):
+                return 3
         return 0
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, agw.CtlError) as err:
         print(f'queue: {err}', file=sys.stderr)

@@ -458,7 +458,7 @@ class QueueCase(unittest.TestCase):
         self.assertEqual([1, 1], [x[0] for x in self.launches])
         self.assertEqual(original, q.read_json(Path(self.member()['checkout']) / '.workbench/state/claude.json')['sessionId'])
 
-    def test_launcher_exit_and_timeout_do_not_hold_the_queue(self):
+    def test_launcher_exit_and_timeout_back_off_the_same_member(self):
         self.start('o/r#1,2')
         worker = self.worker()
         worker.tick()
@@ -1467,10 +1467,31 @@ class LaunchBackoff(unittest.TestCase):
 
     def test_backoff_uses_next_pending_member_when_original_is_gone(self):
         with self.store.transaction() as data:
-            data['launchBackoff'] = dict(member=1, failures=1, until=self.now, reason='pane too narrow')
+            data['launchBackoff'] = dict(member=1, failures=2, until=self.now, reason='pane too narrow')
+            data['launchPaused'] = 'launches failing: pane too narrow'
             data['members'][0].update(state='failed', slotReleased=True)
+        self.failures = 0
         self.w.tick()
         self.assertEqual([2], [n for n, _, _ in self.launches])
+        self.w.tick()
+        self.assertNotIn('launchBackoff', self.store.load())
+        self.assertNotIn('launchPaused', self.store.load())
+        self.assertIn('queue resumed: launches succeeding', [c.args[0] for c in self.w.notify.call_args_list])
+
+    def test_deterministic_spawn_value_error_fails_member(self):
+        self.w.spawn = Mock(side_effect=q.QueueError('PowerShell is not installed'))
+        self.w.tick(); self.w.tick()
+        self.assertEqual('failed', self.member(1)['state'])
+        self.assertNotIn('launchBackoff', self.store.load())
+
+    def test_late_member_result_command_returns_nonzero(self):
+        result_path = self.root / 'late-result.json'
+        q.atomic_json(result_path, dict(result='ok'))
+        member = self.member(1)
+        code = q.main(['member-result', '--file', str(self.store.path), '--number', '1',
+                       '--attempt', '1', '--token', str(uuid.uuid4()), '--result-file', str(result_path)])
+        self.assertEqual(3, code)
+        self.assertEqual('pending', member['state'])
 
 class PriorityOrder(unittest.TestCase):
     """#34: pending members are admitted P0, P1, untriaged, P2, P3, oldest issue first; with -Triage

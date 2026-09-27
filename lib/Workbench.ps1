@@ -463,10 +463,11 @@ function Add-QueueCreatedSession([string] $Checkout, [string] $Id) {
     }
 }
 
-function Close-QueueSessions([string] $Checkout) {
+function Close-QueueSessions([string] $Checkout, [string] $Token) {
     $path = Get-QueueLaunchPath $Checkout
     if (-not (Test-Path -LiteralPath $path)) { return @() }
     $record = Get-Content -Raw -LiteralPath $path | ConvertFrom-Json
+    if ($Token -and $record.token -ne $Token) { return @() }
     $before = Get-Tree
     foreach ($id in @($record.sessions)) {
         $session = @($before.workspaces | ForEach-Object { $_.sessions } | Where-Object { $_.id -eq $id }) | Select-Object -First 1
@@ -1561,7 +1562,7 @@ function Start-WorkbenchSessionCore {
     # A previous run may have split or registered an empty Claude pane before failing.
     # Interactive fresh sessions start Claude through --command; queue sessions prove and type it below.
     if ($script:Launch.Adopted -and -not $AdoptSession) { $roles = @('Claude', 'Codex') }
-    if ($script:Launch.QueueContext -and -not $script:Launch.Adopted) { $roles = @('Codex', 'Claude') }
+    if ($script:Launch.QueueContext) { $roles = @('Codex', 'Claude') }
     foreach ($role in $roles) {
         Set-LaunchStage $role.ToLowerInvariant()
         $line = $script:Launch["${role}Launch"]

@@ -1705,6 +1705,7 @@ class QueueEntry(LauncherFixtures):
         self.assertEqual(1, result.returncode, result.stdout + result.stderr)
         launch = self.store.load()['members'][0]['result']
         self.assertEqual(('terminal', True), (launch['stage'], launch['infra']))
+        self.assertNotIn('Sessions still open:', launch['detail'])
 
     def test_minimized_window_is_restored_before_agents_start(self):
         marker = self.temp / 'window-restored.txt'
@@ -1770,6 +1771,37 @@ class QueueEntry(LauncherFixtures):
         self.assertEqual(1, result.returncode, result.stdout + result.stderr)
         self.assertFalse(any(c[:2] == ['session', 'close'] for c in self.calls()))
         self.assertFalse((self.checkout / '.workbench/state/queue-launch.json').exists())
+
+    def test_ignored_late_result_closes_this_attempts_sessions(self):
+        self.write_helpers("\n$script:RealAtomicWrite = ${function:Write-AtomicJson}\n"
+                           "function Write-AtomicJson { param($Path,$Record); "
+                           "if ($Path -match 'result-[0-9a-f-]+\\.json$') { "
+                           "$queue = Get-Content -Raw -LiteralPath " + ps_quote(self.queue_path) +
+                           " | ConvertFrom-Json; $queue.members[0].state = 'failed'; "
+                           "$queue | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath " +
+                           ps_quote(self.queue_path) + " -Encoding UTF8 }; "
+                           "& $script:RealAtomicWrite $Path $Record }\n")
+        result = self.entry()
+        self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+        self.assertEqual({MAIN_ID, RELAY_ID},
+                         {c[2] for c in self.calls() if c[:2] == ['session', 'close']})
+        self.assertFalse((self.checkout / '.workbench/state/queue-launch.json').exists())
+        state = json.loads(self.scenario_path.read_text())
+        self.assertFalse(any(w['sessions'] for w in state['tree']['workspaces']))
+
+    def test_adopted_queue_proves_codex_before_typing_claude(self):
+        first = self.entry()
+        self.assertEqual(0, first.returncode, first.stdout + first.stderr)
+        before = len(self.calls())
+        state = json.loads(self.scenario_path.read_text())
+        state['text'][MAIN_ID] = 'PS C:\\checkout> '
+        state['text'][RIGHT_ID] = 'PS C:\\checkout> '
+        self.scenario_path.write_text(json.dumps(state))
+        self.retry()
+        second = self.entry()
+        self.assertEqual(0, second.returncode, second.stdout + second.stderr)
+        typed = [c[-1] for c in self.calls()[before:] if c[:2] == ['session', 'type']]
+        self.assertEqual([RIGHT_ID, MAIN_ID], typed)
 
     def test_non_queue_loop_is_refused_before_pin_or_typing(self):
         self.resumed()
