@@ -307,6 +307,11 @@ if ($QueueMember) {
                 }
             }
         }
+        foreach ($id in @($script:Launch.UnrecordedOpenSessions)) {
+            $stillOpen = $true
+            try { $stillOpen = $null -ne (Get-SessionById $id) } catch { $script:Launch.Failure += "`ncannot verify close of ${id}: $_" }
+            if ($stillOpen) { $remaining += $id }
+        }
         $result = @{ result = $outcome; checkout = $script:Launch.Checkout; sessionId = $script:Launch.SessionId;
             claudePane = $script:Launch.Claude; codexPane = $script:Launch.Codex; relaySession = $script:Launch.RelaySession;
             stage = $failureStage; infra = ($failureStage -in @('terminal', 'window', 'cleanup', 'session', 'split', 'codex', 'claude', 'relay', 'relay-stop', 'focus'));

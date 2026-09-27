@@ -456,6 +456,9 @@ function Add-QueueCreatedSession([string] $Checkout, [string] $Id) {
         # A relay may already be running through --command. Close it even if recording failed.
         try { Invoke-Ctl session restore none --target $Id | Out-Null } catch { Write-LaunchLog cleanup "restore $Id failed: $_" }
         try { Invoke-Ctl session close $Id | Out-Null } catch { Write-LaunchLog cleanup "close $Id failed: $_" }
+        $stillOpen = $true
+        try { $stillOpen = $null -ne (Get-SessionById $Id) } catch { Write-LaunchLog cleanup "cannot verify close of ${Id}: $_" }
+        if ($stillOpen) { $script:Launch.UnrecordedOpenSessions += $Id }
         throw $failure
     }
 }
@@ -1391,6 +1394,7 @@ function Start-WorkbenchSessionCore {
     $script:Launch.CodexLaunch = $CodexLaunch
     $script:Launch.ImplementerTool = $ImplementerTool
     $script:Launch.NoRelay = [bool]$NoRelay
+    $script:Launch.UnrecordedOpenSessions = @()
     if ($script:Launch.QueueContext) {
         Set-LaunchStage cleanup
         $remaining = @(Close-QueueSessions $Checkout)

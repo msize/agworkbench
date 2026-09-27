@@ -1747,6 +1747,20 @@ class QueueEntry(LauncherFixtures):
                          {c[2] for c in self.calls() if c[:2] == ['session', 'close']})
         self.assertFalse((self.checkout / '.workbench/state/queue-launch.json').exists())
 
+    def test_failed_emergency_close_keeps_relay_id_in_result(self):
+        self.scenario['responses'] = [{'args': '^session close ' + RELAY_ID,
+                                       'stdout': 'close failed', 'exit': 1}]
+        self.save_scenario()
+        self.write_helpers("\n$script:RealAtomicWrite = ${function:Write-AtomicJson}\n"
+                           "function Write-AtomicJson { param($Path,$Record); "
+                           "if ($Path -like '*queue-launch.json' -and (Test-Path -LiteralPath $Path)) "
+                           "{ throw 'relay record write failed' }; & $script:RealAtomicWrite $Path $Record }\n")
+        result = self.entry()
+        self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+        launch = self.store.load()['members'][0]['result']
+        self.assertEqual(RELAY_ID, launch['relaySession'])
+        self.assertIn(RELAY_ID, launch['detail'])
+
     def test_adopted_session_is_never_recorded_or_closed(self):
         self.resumed(relay=False)
         membership = self.checkout / '.workbench/state/queue-member.json'

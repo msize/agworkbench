@@ -391,12 +391,15 @@ class QueueCase(unittest.TestCase):
                         attempt=m['attempt'], token=m['token'])
         worker.spawn = partial
         worker.tick(); worker.tick()
-        self.assertEqual('failed', self.member()['state'])
+        self.assertEqual('failed' if result else 'pending', self.member()['state'])
         self.assertFalse(self.member()['checkoutEstablished'])
         checkout = Path(self.member()['checkout'])
         self.assertTrue(checkout.resolve().is_relative_to(self.root))
         shutil.rmtree(checkout)
-        self.start('o/r#1', retry=True)
+        if result:
+            self.start('o/r#1', retry=True)
+        else:
+            self.now += 60  # missing launcher result automatically retries after infrastructure back-off
         worker.spawn = self.spawn
         worker.tick(); worker.tick()
         self.assertEqual('active', self.member()['state'])
@@ -461,9 +464,16 @@ class QueueCase(unittest.TestCase):
         worker.tick()
         with self.store.transaction() as data:
             data['members'][0]['result'] = None
-        worker.tick()  # exit 0 without the required result is failed, next issue starts
-        self.assertEqual('failed', self.member()['state'])
-        self.assertEqual([1, 2], [x[0] for x in self.launches])
+        worker.tick()  # exit 0 without a result is infrastructure; the same member backs off
+        self.assertEqual('pending', self.member()['state'])
+        self.assertEqual([1], [x[0] for x in self.launches])
+        self.assertEqual('launcher', self.member()['reason'].split(':')[1].strip())
+        self.now += 60
+        worker.tick()  # retry starts
+        with self.store.transaction() as data:
+            data['parallel'] = 2
+        worker.tick()  # retry succeeds, then issue 2 may start
+        self.assertEqual([1, 1, 2], [x[0] for x in self.launches])
         with self.store.transaction() as data:
             data['members'][1]['result'] = None
         process = worker.jobs[2]['process']
@@ -1393,6 +1403,8 @@ class LaunchBackoff(unittest.TestCase):
     def test_locked_orphan_has_a_hard_timeout_without_deleting_its_record(self):
         token = str(uuid.uuid4())
         with self.store.transaction() as data:
+            data['parallel'] = 2
+            data['launchBackoff'] = dict(member=1, failures=1, until=self.now + 1, reason='prior pane failure')
             data['members'][0].update(state='launching', attempt=1, token=token,
                                       startedAt=self.now - 1801, slotReleased=False)
         record = Path(self.member(1)['checkout']) / '.workbench/state/queue-launch.json'
@@ -1401,15 +1413,57 @@ class LaunchBackoff(unittest.TestCase):
             self.w.tick()
         cleanup.assert_not_called()
         self.assertTrue(record.exists())
-        self.assertEqual('pending', self.member(1)['state'])
+        self.assertEqual('failed', self.member(1)['state'])
+        self.assertTrue(self.member(1)['slotReleased'])
+        self.assertIn('-Retry', self.member(1)['reason'])
         self.assertIn('launchBackoff', self.store.load())
+        self.now += 1
+        with patch.object(q, 'file_locked', return_value=True):
+            self.w.tick()
+        self.assertEqual([2], [n for n, _, _ in self.launches])
 
     def test_backoff_admits_one_probe_with_parallel_two(self):
         with self.store.transaction() as data:
             data['parallel'] = 2
             data['launchBackoff'] = dict(member=1, failures=1, until=self.now, reason='pane too narrow')
+        def running(data, m):
+            job = QueueCase.spawn(self, data, m)
+            with self.store.transaction() as current:
+                current['members'][m['number'] - 1]['result'] = None
+            job['process'].poll = lambda: None
+            return job
+        self.w.spawn = running
+        self.w.tick()
         self.w.tick()
         self.assertEqual([1], [n for n, _, _ in self.launches])
+
+    def test_sibling_success_does_not_clear_a_newer_backoff(self):
+        with self.store.transaction() as data:
+            data['parallel'] = 2
+        self.failures = 1
+        self.w.tick(); self.w.tick()
+        self.assertEqual('active', self.member(2)['state'])
+        self.assertEqual(1, self.store.load()['launchBackoff']['member'])
+        self.assertEqual('pending', self.member(1)['state'])
+
+    def test_spawn_error_is_infrastructure_and_waits(self):
+        self.w.spawn = Mock(side_effect=OSError('launcher could not start'))
+        self.w.tick(); self.w.tick()
+        self.assertEqual('pending', self.member(1)['state'])
+        self.assertEqual([], self.launches)
+        self.assertEqual('launcher', self.member(1)['reason'].split(':')[1].strip())
+
+    def test_exit_without_result_cleans_up_and_backs_off(self):
+        self.failures = 0
+        self.w.tick()
+        with self.store.transaction() as data:
+            data['members'][0]['result'] = None
+        self.w.jobs[1]['process'].poll = lambda: 7
+        with patch.object(self.w, 'cleanup_launch') as cleanup:
+            self.w.tick()
+        cleanup.assert_called_once_with(self.member(1)['checkout'], self.member(1)['token'])
+        self.assertEqual('pending', self.member(1)['state'])
+        self.assertEqual('launcher', self.member(1)['reason'].split(':')[1].strip())
 
     def test_backoff_uses_next_pending_member_when_original_is_gone(self):
         with self.store.transaction() as data:

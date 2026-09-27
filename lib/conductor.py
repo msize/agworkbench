@@ -800,18 +800,21 @@ class Worker:
             if code is None:
                 triage.kill_tree(process)
                 process.wait(timeout=30)
-                previous = find_member(self.store.load(), number)
-                if previous:
-                    self.cleanup_launch(previous['checkout'], job['token'])
             job['stream'].close()
             tail = '\n'.join(job['path'].read_text(encoding='utf-8', errors='replace').splitlines()[-20:])
             previous = find_member(self.store.load(), number)
+            missing = bool(previous and previous['state'] == 'launching' and
+                           previous.get('token') == job['token'] and previous['attempt'] == job['attempt'] and
+                           not previous.get('result') and code != 75)
+            if missing:
+                self.cleanup_launch(previous['checkout'], job['token'])
             established = bool(previous and (previous['checkoutEstablished'] or usable_checkout(previous['checkout'])))
             with self.store.transaction() as data:
                 m = find_member(data, number)
                 if m and m.get('token') == job['token'] and m['attempt'] == job['attempt'] and m['state'] == 'launching':
                     if not m.get('result') and code != 75:
-                        m['result'] = dict(result='timeout' if timed_out else 'failed', token=job['token'],
+                        m['result'] = dict(result='timeout' if timed_out else 'failed', infra=True,
+                                           stage='launcher', token=job['token'],
                                            attempt=job['attempt'], childPid=process.pid,
                                            detail='launcher timed out' if timed_out else f'launcher exited {code} without a result\n{tail}')
                     m['checkoutEstablished'] = m['checkoutEstablished'] or established
@@ -1074,8 +1077,10 @@ class Worker:
                         if key in result:
                             m[key] = result[key]
                     if ok:
-                        data.pop('launchBackoff', None)
-                        data.pop('launchPaused', None)
+                        backoff = data.get('launchBackoff')
+                        if not backoff or m['number'] == backoff['member'] or m.get('startedAt', 0) >= backoff['until']:
+                            data.pop('launchBackoff', None)
+                            data.pop('launchPaused', None)
                     elif infra:
                         defer_launch(data, m, reason, self.clock())
                     else:
@@ -1115,7 +1120,7 @@ class Worker:
                     pending.insert(0, preferred)
             for m in pending:
                 launch_in_flight = any(other['state'] == 'launching' for other in data['members'])
-                if disk or (backoff and (self.clock() < backoff['until'] or launch_in_flight or launches)):
+                if disk or (backoff and (self.clock() < backoff['until'] or launch_in_flight)):
                     break                  # disk/back-off/probe gate: keep other members pending
                 if count >= data['parallel'] or (awaits_triage(data, m) and not paused):
                     break                  # strictly in order: nothing behind a member still being triaged
@@ -1149,29 +1154,34 @@ class Worker:
             with self.store.transaction() as data:
                 m = find_member(data, number)
                 if m and m['state'] == 'launching' and m['attempt'] == attempt and m.get('token') == token and not m.get('result'):
-                    reason = 'launch deferred: timeout: interrupted launcher produced no result'
-                    defer_launch(data, m, reason, self.clock())
+                    if cleanup:
+                        reason = 'launch deferred: timeout: interrupted launcher produced no result'
+                        defer_launch(data, m, reason, self.clock())
+                    else:
+                        m.update(state='failed', slotReleased=True,
+                                 reason='interrupted launcher still holds the member or checkout lock after 1800 s; stop it and use -Retry')
                     m['launchResult'] = 'timeout'
         for m in launches:
             try:
                 self.jobs[m['number']] = self.spawn(settings, m)
             except (OSError, ValueError) as err:
-                member_result(self.store.path, m['number'], m['attempt'], m['token'], dict(result='failed', detail=str(err)))
+                member_result(self.store.path, m['number'], m['attempt'], m['token'],
+                              dict(result='failed', infra=True, stage='launcher', detail=str(err)))
+        current = self.store.load()
         if disk_changed:
             self.disk_announced = bool(disk)
             message = f'queue paused: {disk}' if disk else 'queue resumed: disk space is back'
             print(message, flush=True)
             self.notify(message)
-            self.status('blocked' if disk or self.store.load().get('launchPaused') else 'active')
-        launch_paused = bool(self.store.load().get('launchPaused'))
+            self.status('blocked' if disk or current.get('launchPaused') else 'active')
+        launch_paused = bool(current.get('launchPaused'))
         if launch_paused != self.launch_announced:
             self.launch_announced = launch_paused
-            message = ('queue paused: ' + self.store.load()['launchPaused'] if launch_paused
+            message = ('queue paused: ' + current['launchPaused'] if launch_paused
                        else 'queue resumed: launches succeeding')
             print(message, flush=True)
             self.notify(message)
             self.status('blocked' if launch_paused or disk else 'active')
-        current = self.store.load()
         for m in current['members']:
             display = (m['state'], m.get('prState'), m.get('reason'))
             if self.last_display.get(m['number']) != display:
