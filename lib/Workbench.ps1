@@ -518,6 +518,14 @@ function Test-ShellReady([string] $Text) {
     return $false
 }
 
+function Test-ImplementerRunningFrame([string] $Text, [string] $Tool) {
+    $rows = @($Text -split '\r?\n' | Where-Object { $_.Trim() })
+    if (-not $rows.Count) { return $false }
+    $frame = ($rows | Select-Object -Last 15) -join "`n"
+    if ($Tool -eq 'codex') { return $frame -match 'Ask Codex to do anything|for shortcuts|esc to interrupt' }
+    return $frame -match 'bypass permissions|for shortcuts|esc to interrupt'
+}
+
 function Wait-ShellPrompt {
     <# Newly created panes use the prompt-glyph rule. Adopted panes require Test-ShellReady's
        recognized empty shell frame; a lone glyph is refused. Empty text never permits typing. #>
@@ -1606,6 +1614,13 @@ function Start-WorkbenchSessionCore {
             if ($script:Launch.QueueContext -and $freshPane) {
                 $script:Launch.QueueIncomplete = $true
                 throw "new $role pane did not reach a proven shell prompt; retry the queue member to finish setup"
+            }
+            if ($script:Launch.QueueContext -and $role -eq 'Codex' -and -not $freshPane) {
+                $frame = Invoke-Ctl session text --target $script:Launch.Codex
+                if (-not (Test-ImplementerRunningFrame $frame $ImplementerTool)) {
+                    $script:Launch.QueueIncomplete = $true
+                    throw 'adopted implementer pane is neither a proven shell nor a running agent'
+                }
             }
             # A pane whose conversation could not be identified was already warned about; offering
             # a launch there would start a second conversation over the running one.

@@ -1803,6 +1803,37 @@ class QueueEntry(LauncherFixtures):
         typed = [c[-1] for c in self.calls()[before:] if c[:2] == ['session', 'type']]
         self.assertEqual([RIGHT_ID, MAIN_ID], typed)
 
+    def test_adopted_trust_prompt_never_starts_claude(self):
+        first = self.entry()
+        self.assertEqual(0, first.returncode, first.stdout + first.stderr)
+        before = len(self.calls())
+        state = json.loads(self.scenario_path.read_text())
+        state['text'][MAIN_ID] = 'PS C:\\checkout> '
+        state['text'][RIGHT_ID] = 'Do you trust this folder? [y/N]'
+        self.scenario_path.write_text(json.dumps(state))
+        self.retry()
+        second = self.entry()
+        self.assertEqual(1, second.returncode, second.stdout + second.stderr)
+        launch = self.store.load()['members'][0]['result']
+        self.assertEqual(('incomplete', 'codex', True),
+                         (launch['result'], launch['stage'], launch['infra']))
+        self.assertFalse(any(c[:2] == ['session', 'type'] and c[-1] == MAIN_ID
+                             for c in self.calls()[before:]))
+
+    def test_adopted_running_codex_allows_shell_claude_to_start(self):
+        first = self.entry()
+        self.assertEqual(0, first.returncode, first.stdout + first.stderr)
+        before = len(self.calls())
+        state = json.loads(self.scenario_path.read_text())
+        state['text'][MAIN_ID] = 'PS C:\\checkout> '
+        state['text'][RIGHT_ID] = 'Ask Codex to do anything\ngpt-test'
+        self.scenario_path.write_text(json.dumps(state))
+        self.retry()
+        second = self.entry()
+        self.assertEqual(0, second.returncode, second.stdout + second.stderr)
+        typed = [c[-1] for c in self.calls()[before:] if c[:2] == ['session', 'type']]
+        self.assertEqual([MAIN_ID], typed)
+
     def test_non_queue_loop_is_refused_before_pin_or_typing(self):
         self.resumed()
         result = self.entry()

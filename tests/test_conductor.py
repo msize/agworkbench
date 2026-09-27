@@ -1487,11 +1487,14 @@ class LaunchBackoff(unittest.TestCase):
     def test_late_member_result_command_returns_nonzero(self):
         result_path = self.root / 'late-result.json'
         q.atomic_json(result_path, dict(result='ok'))
-        member = self.member(1)
+        self.w.tick()
+        with self.store.transaction() as data:
+            data['members'][0]['result'] = None
         code = q.main(['member-result', '--file', str(self.store.path), '--number', '1',
                        '--attempt', '1', '--token', str(uuid.uuid4()), '--result-file', str(result_path)])
         self.assertEqual(3, code)
-        self.assertEqual('pending', member['state'])
+        self.assertEqual('launching', self.member(1)['state'])
+        self.assertIsNone(self.member(1)['result'])
 
 class PriorityOrder(unittest.TestCase):
     """#34: pending members are admitted P0, P1, untriaged, P2, P3, oldest issue first; with -Triage
