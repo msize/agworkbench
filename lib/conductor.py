@@ -857,14 +857,18 @@ class Worker:
                 known = {m['number'] for m in data['members']}
                 fresh = [n for n in numbers if n not in known]
                 skipped = in_hand(data['repo'], fresh, checkout_root(data['config']), self.store.path, self.gh)
-                for n, reason in sorted(skipped.items()):
-                    if self.last_skips.get(n) != reason:
-                        print(f'#{n} skipped: {reason}', flush=True)
-                self.last_skips = skipped
+                accepted = False
                 with self.store.transaction() as current:
-                    known = {m['number'] for m in current['members']}
-                    current['members'].extend(new_member(n, data['repo'], checkout_root(data['config']))
-                                              for n in fresh if n not in known and n not in skipped)
+                    if current['watch'] and watch_key(current) == watch_key(data):
+                        known = {m['number'] for m in current['members']}
+                        current['members'].extend(new_member(n, data['repo'], checkout_root(data['config']))
+                                                  for n in fresh if n not in known and n not in skipped)
+                        accepted = True
+                if accepted:
+                    for n, reason in sorted(skipped.items()):
+                        if self.last_skips.get(n) != reason:
+                            print(f'#{n} skipped: {reason}', flush=True)
+                    self.last_skips = skipped
                 self.errors.pop('label scan', None)
             except (OSError, ValueError, KeyError, subprocess.SubprocessError, QueueError, agw.CtlError) as err:
                 self.error('label scan', err)

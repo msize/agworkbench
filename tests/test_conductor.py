@@ -1834,6 +1834,24 @@ class LabelQuery(unittest.TestCase):
         self.assertIn(12, members)
         self.assertNotIn(13, members)
 
+    def test_stale_rescan_cannot_readd_pruned_members_after_watch_switch(self):
+        with patch.object(q, 'resolve_spec', return_value=('o/r', [1], 'old')):
+            self.start('label:old', watch=True)
+        worker = q.Worker(self.store, self.store.load()['owner']['token'], clock=lambda: self.now,
+                          spawn=QueueCase.spawn.__get__(self))
+
+        def gh(*args):
+            # The saved watch changes while the old label scan is in flight.
+            with self.store.transaction() as data:
+                data['label'] = 'new'
+                data['members'] = [m for m in data['members'] if m['number'] != 1]
+            return [[listed(1, '2026-01-01', 'old'), listed(9, '2026-01-09', 'old')]]
+
+        worker.gh = gh
+        worker.refresh_remote()
+        self.assertEqual([], self.store.load()['members'])
+        self.assertEqual('new', self.store.load()['label'])
+
     def test_queue_files_old_and_invalid(self):
         self.start('o/r#1')
         data = q.read_json(self.store.path)

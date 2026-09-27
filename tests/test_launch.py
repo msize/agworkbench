@@ -1544,6 +1544,9 @@ class QueueEntry(LauncherFixtures):
                 result, seen = self.launcher(*args)
                 self.assertEqual(2, result.returncode, result.stdout + result.stderr)
                 self.assertIsNone(seen)
+        for switch, hint in (('-Prune', '-Queue -Watch'), ('-FollowUps', '-Triage or -Retriage')):
+            result, _ = self.launcher(switch)
+            self.assertIn(hint, result.stdout + result.stderr)
 
     def test_member_autonomous_switch_reaches_its_checkout(self):
         # #27: the conductor passes a queue's saved autonomy as -Autonomous / -NoAutonomous.

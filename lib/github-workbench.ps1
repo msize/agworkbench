@@ -257,7 +257,7 @@ if ($Triage -or $Retriage) {
 }
 if ($PSBoundParameters.ContainsKey('Parallel') -or $Watch -or $Retry -or $Prune -or $FollowUps -or $PSBoundParameters.ContainsKey('Limit') -or
     ((-not $QueueMember) -and ($QueueAttempt -or $QueueToken))) {
-    Write-Host 'Parallel/Watch/Retry require Queue (Watch/Limit also go with Triage); QueueAttempt/QueueToken require QueueMember.'
+    Write-Host 'Parallel/Retry require -Queue; -Prune requires -Queue -Watch; -FollowUps requires -Triage or -Retriage; Watch/Limit also go with Triage; QueueAttempt/QueueToken require QueueMember.'
     exit 2
 }
 

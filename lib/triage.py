@@ -2,7 +2,7 @@
 """triage - give each issue of a product repo one `priority:P0..P3` label, judged against the
 product's private spec repos (#34).
 
-  python lib/triage.py run --repo yeroo/docxy [--retriage] [--limit 20] [--dry-run] [--issue N ...]
+  python lib/triage.py run --repo yeroo/docxy [--retriage] [--follow-ups] [--limit 20] [--dry-run] [--issue N ...]
   python lib/triage.py watch --repo yeroo/docxy          # re-scan every 5 minutes (a visible session)
   python lib/triage.py start-watch --repo yeroo/docxy    # open that session in agwinterm
 
@@ -19,12 +19,16 @@ How a decision is made:
 2. An open spec issue that references the public issue (`<product>#N`, `<owner>/<product>#N`, or
    its URL; a bare `#N` never counts; comments are not scanned) is a deterministic P0 when the public
    issue is a bug or the spec issue is itself a bug mirror (title `bug:` or a `bug` label). For
-   anything else a reference is a P1 floor.
+   anything else a reference is a P1 floor. A minor follow-up on the deterministic P0 path
+   still needs a model exception check before it can keep P0.
 3. Otherwise, or above a floor, the model judges: `claude -p` restricted to Read/Grep/Glob, no MCP,
    no settings but the quiet file, JSON-schema output, 300 s. triage.py enforces the rules, whatever
-   the model says: the floor is never lowered; a model-only P0 for an author outside the repo
-   (not OWNER/MEMBER/COLLABORATOR) is written as P1; the output must match the schema and name only
-   spec issues from the facts. A usage-limit or auth failure stops the run (exit 3).
+   the model says: the floor is never lowered except by the follow-up cap; a model-only P0 for an
+   author outside the repo (not OWNER/MEMBER/COLLABORATOR) is written as P1; the output must match
+   the schema and name only
+   spec issues from the facts. Follow-ups without trusted major or blocker severity are capped at
+   P2 unless the model finds save/load data loss, a crash/hang, open/save failure, or a security
+   problem. A usage-limit or auth failure stops the run (exit 3).
 
 No private content reaches the public repo: it gets labels and one comment from a fixed template.
 The rationale goes to the "Triage log" issue in the first spec repo that exists.
@@ -68,7 +72,7 @@ BACKOFF = 300           # watch: seconds before the first retry, doubling
 STOP_PAUSE = 1800       # watch: after a usage-limit or auth stop
 LOCK_WAIT = 900         # how long a run waits for another run's hold on the spec cache
 
-# The whole public vocabulary: one comment per (priority, ux), nothing else ever reaches the public repo.
+# The whole public vocabulary: one comment per (priority, ux), plus the two capped P2 variants.
 REASONS = {
     ('P0', False): 'blocks current work', ('P0', True): 'severe user-facing impact',
     ('P1', False): 'important', ('P1', True): 'user-facing UI/UX',
