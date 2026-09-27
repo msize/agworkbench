@@ -1256,7 +1256,9 @@ class FakeGh:
 
 
 class FollowUps(unittest.TestCase):
-    """#27: follow-ups are recorded, deduped and filed before the merge; merge-check gates on them."""
+    """#27: follow-ups are recorded, deduped and filed before the merge; merge-check gates on them.
+    These pin #27's filing, which `followUp.dedupe: false` keeps exactly (#42; tests/test_followup.py
+    covers dedupe on)."""
 
     def setUp(self):
         self.folder = Path(__file__).resolve().parent.parent / ('test wb follow ' + uuid.uuid4().hex)
@@ -1264,8 +1266,10 @@ class FollowUps(unittest.TestCase):
         self.state.mkdir(parents=True)
         self.addCleanup(shutil.rmtree, self.folder)
         self.addCleanup(hub.reload_paths)
+        config = self.folder / 'agworkbench.json'
+        config.write_text(json.dumps({'followUp': {'dedupe': False}}), encoding='utf-8')
         self.enterContext(patch.dict(os.environ, {'AI_HUB': str(self.folder / '.workbench'),
-                                                 'AGWORKBENCH_CONFIG': str(self.folder / 'none.json')}))
+                                                 'AGWORKBENCH_CONFIG': str(config)}))
         hub.reload_paths()
         self.out, self.err = io.StringIO(), io.StringIO()
         self.enterContext(contextlib.redirect_stdout(self.out))
@@ -1311,6 +1315,23 @@ class FollowUps(unittest.TestCase):
         self.assertTrue(all(c[c.index('--label') + 1] == 'follow-up' for c in creates))
         self.assertEqual(0, self.run_wb('follow-up', 'file', '--source', '27', gh=FakeGh()))   # nothing left
         self.assertIn('no unfiled follow-ups', self.out.getvalue())
+
+    def test_dedupe_off_makes_exactly_the_27_gh_calls(self):
+        # #42: followUp.dedupe false is today's behaviour, byte for byte: same calls, same body, --pr optional.
+        self.add('r2-m1', title='Fix the relay')
+        gh = FakeGh()
+        self.assertEqual(0, self.run_wb('follow-up', 'file', '--source', '27', gh=gh))
+        body = str(self.state / 'follow-up-r2-m1.md')
+        self.assertEqual([['gh', 'issue', 'view', '27', '--json', 'labels'],
+                          ['gh', 'label', 'create', 'follow-up', '--color', 'BFD4F2',
+                           '--description', 'filed automatically by an agworkbench loop'],
+                          ['gh', 'issue', 'list', '--state', 'open', '--search', '"Fix the relay" in:title',
+                           '--json', 'title,url', '--limit', '200'],
+                          ['gh', 'issue', 'create', '--title', 'Fix the relay', '--body-file', body, '--label', 'follow-up']],
+                         gh.calls)
+        self.assertEqual('evidence for r2-m1: lib/x.py:12 fails\n\nSource: #27\nSeverity: minor; origin: review r2\n\n'
+                         '<!-- agworkbench:follow-up source=#27 -->\n<!-- agworkbench:planner -->\n',
+                         gh.bodies['Fix the relay'])
 
     def test_an_open_issue_with_exactly_the_title_is_reused(self):
         self.add('r2-m1', title='Fix the relay')

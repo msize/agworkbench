@@ -9,7 +9,7 @@
   wb.py settings                                                  # implementer, revmux profile, auto-merge, failover
   wb.py handover                                                  # open request, branch, git status (#24)
   wb.py follow-up add --key r2-m1 --title T --severity minor --origin "review r2"   (#27)
-  wb.py follow-up file --source 27 --pr 30                        # file every unfiled follow-up (#27)
+  wb.py follow-up file --source 27 --pr 30                        # file every unfiled follow-up (#27), deduped (#42)
   wb.py loop-state done --pr 30 --sha <sha>                       # the planner's last act (#27)
   wb.py merge-check --pr 12 --head <sha>                          # read-only auto-merge gate (#23)
   wb.py wait-ci --pr 12 --head <sha>                              # background: until CI on the head is done (#32)
@@ -35,12 +35,15 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import agw  # noqa: E402
+import followup  # noqa: E402
 import hub  # noqa: E402
+import triage  # noqa: E402
 
 
 def checkout() -> Path:
@@ -544,6 +547,8 @@ def cmd_follow_up_add(args: argparse.Namespace) -> int:
         print(f"{args.key}: already filed as {item['url']}; severity/origin/disputed updated")
         return 0
     item.update(title=args.title, body=body, severity=args.severity, origin=args.origin, disputed=bool(args.disputed))
+    if args.file:
+        item["file"] = args.file              # #42: named in a duplicate report, a hint to the matcher
     save_follow_ups(root, items)
     print(f"{args.key}: recorded ({args.severity}{', disputed' if args.disputed else ''})")
     return 0
@@ -554,12 +559,14 @@ def gh_run(root: Path, *args: str) -> subprocess.CompletedProcess:
                           encoding="utf-8", errors="replace")
 
 
-def issue_body(item: dict, source: int, pr: int | None) -> str:
+def issue_body(item: dict, source: int, pr: int | None, related: list[str] = (), marker: str = "") -> str:
     where = f"Source: #{source}" + (f", PR #{pr}" if pr else "")
-    return (f"{item.get('body', '').rstrip()}\n\n{where}\n"
+    notes = "".join(f"{line}\n" for line in related) + ("\n" if related else "")
+    return (f"{item.get('body', '').rstrip()}\n\n{notes}{where}\n"
             f"Severity: {item.get('severity')}; origin: {item.get('origin')}"
             f"{'; disputed' if item.get('disputed') else ''}\n\n"
-            f"<!-- agworkbench:follow-up source=#{source} -->\n{PLANNER_MARKER}\n")
+            f"<!-- agworkbench:follow-up source=#{source} -->\n"
+            + (f"{marker}\n" if marker else "") + f"{PLANNER_MARKER}\n")
 
 
 def cmd_follow_up_file(args: argparse.Namespace) -> int:
@@ -569,6 +576,16 @@ def cmd_follow_up_file(args: argparse.Namespace) -> int:
     if not pending:
         print("no unfiled follow-ups")
         return 0
+    try:
+        config = followup.read_config()
+        settings = followup.load_settings(config)
+    except followup.SettingsError as err:
+        print(f"wb: follow-up: {err}", file=sys.stderr)
+        return 2
+    if settings["dedupe"] and not args.pr:
+        print("wb: follow-up file needs --pr while followUp.dedupe is on (the duplicate reports name the PR)",
+              file=sys.stderr)
+        return 2
     # One level of chaining at most: a follow-up of a follow-up is filed under another label.
     source = gh_run(root, "issue", "view", str(args.source), "--json", "labels")
     if source.returncode != 0:
@@ -581,6 +598,8 @@ def cmd_follow_up_file(args: argparse.Namespace) -> int:
     use_label = created.returncode == 0 or "already exists" in (created.stderr or "")
     if not use_label:
         print(f"wb: follow-up: cannot create label '{label}' ({created.stderr.strip()}); filing without it")
+    if settings["dedupe"]:
+        return file_deduped(root, args, items, pending, label if use_label else None, config, settings)
     failed = 0
     for item in pending:
         # A quoted phrase: `-Flag`, `word:`, `#12` or a quote in a title are not search syntax (r18 m9).
@@ -613,6 +632,191 @@ def cmd_follow_up_file(args: argparse.Namespace) -> int:
             print(f"{item['key']}: filed {url}")
         save_follow_ups(root, items)          # after each one, so a failure never loses a filed url
     return 1 if failed else 0
+
+
+# --- dedupe and bump (#42) -----------------------------------------------------------------------
+# With followUp.dedupe on (the default), a finding that an existing issue already describes becomes a
+# duplicate report on it, and the reports bump its priority. lib/followup.py holds the rules.
+
+PRIORITY_LABEL = re.compile(r"priority:P[0-3]", re.I)
+
+
+class DedupeFailed(Exception):
+    """This item only: nothing more is written for it, the run goes on."""
+
+
+def gh_ok(root: Path, what: str, *args: str) -> subprocess.CompletedProcess:
+    done = gh_run(root, *args)
+    if done.returncode != 0:
+        raise DedupeFailed(f"{what}: {(done.stderr or done.stdout).strip()}")
+    return done
+
+
+def fetch_issues(root: Path, repo: str, label: str, state: str) -> list[dict]:
+    done = gh_ok(root, f"listing '{label}' issues", "api", "--paginate",
+                 f"repos/{repo}/issues?labels={quote(label, safe='')}&state={state}&per_page=100")
+    return [c for c in map(followup.candidate, followup.parse_pages(done.stdout)) if c]
+
+
+def ensure_label(root: Path, name: str) -> bool:
+    created = gh_run(root, "label", "create", name, "--color", "D93F0B",
+                     "--description", "agworkbench priority (#34, #42)")
+    return created.returncode == 0 or "already exists" in (created.stderr or "")
+
+
+def dup_comment(item: dict, args: argparse.Namespace, count: int, bump: str) -> str:
+    round_ = followup.round_of(item.get("origin"))
+    where = f" in `{item['file']}`" if item.get("file") else ""
+    lines = [f"Reported again: PR #{args.pr} ({'plan item' if round_ == 'plan' else 'review ' + round_}) "
+             f"of #{args.source}{where}.", "", f"**{item.get('title', '')}**", ""]
+    if (item.get("body") or "").strip():
+        lines += [item["body"].rstrip(), ""]
+    if bump:
+        lines += [bump, ""]
+    lines += [f"Duplicate reports so far: {count} ({count + 1} reports in all).", "",
+              followup.dup_marker(item, args.source, args.pr), f"<!-- agworkbench:dup-count {count} -->",
+              PLANNER_MARKER]
+    return "\n".join(lines) + "\n"
+
+
+def record_duplicate(root: Path, repo: str, item: dict, number: int, semantic: bool,
+                     args: argparse.Namespace, bump_at: dict) -> tuple[dict | None, str]:
+    """Comment the duplicate on #number (reopening it when closed as completed) and bump its label.
+    (issue, message) when recorded; (None, related line) when it must be filed new after all."""
+    issue = followup.candidate(json.loads(gh_ok(root, f"reading #{number}", "api", f"repos/{repo}/issues/{number}").stdout))
+    if issue is None:
+        raise DedupeFailed(f"#{number} is not an issue")
+    comments = followup.parse_pages(gh_ok(root, f"reading #{number}'s comments", "api", "--paginate",
+                                          f"repos/{repo}/issues/{number}/comments?per_page=100").stdout)
+    state = followup.dup_state(issue, [c for c in comments if isinstance(c, dict)])
+    already = (str(args.source), str(args.pr), item["key"]) in state["idents"]
+    reason = followup.closed_reason(issue)
+    if reason and not already:
+        if semantic or reason != "completed":
+            return None, f"Possibly related: #{number} (closed as {reason})"
+        gh_ok(root, f"reopening #{number}", "issue", "reopen", str(number))
+    count = state["count"] + (0 if already else 1)
+    current = triage.priority_of(issue["labels"])
+    target = followup.target_priority(current, count + 1, bump_at)
+    bump = ""
+    if target != current:
+        this = followup.report_label(dict(pr=args.pr, round=followup.round_of(item.get("origin"))))
+        bump = (f"priority {current or 'untriaged'} -> {target}: reported {count + 1} times "
+                f"({', '.join(state['reports'] + ([] if already else [this]))})")
+    if not already:
+        body_file = root / ".workbench" / "state" / f"follow-up-{item['key']}-dup.md"
+        body_file.write_text(dup_comment(item, args, count, bump), encoding="utf-8")
+        try:
+            gh_ok(root, f"commenting on #{number}", "issue", "comment", str(number), "--body-file", str(body_file))
+        finally:
+            body_file.unlink(missing_ok=True)
+    if target != current:
+        # After the comment: a crash in between heals on the rerun, which finds its own marker.
+        name = f"priority:{target}"
+        if not ensure_label(root, name):
+            raise DedupeFailed(f"cannot create label '{name}'")
+        argv = ["issue", "edit", str(number), "--add-label", name]
+        for old in issue["labels"]:
+            if PRIORITY_LABEL.fullmatch(old.strip()) and old != name:
+                argv += ["--remove-label", old]
+        gh_ok(root, f"labelling #{number}", *argv)
+    shown = f"{current or 'untriaged'} -> {target}" if target != current else (current or "untriaged")
+    return issue, (f"duplicate of #{number} ({'semantic' if semantic else 'exact'}"
+                   f"{', already recorded' if already else ''}); {count} duplicate(s), priority {shown}")
+
+
+def file_deduped(root: Path, args: argparse.Namespace, items: list[dict], pending: list[dict],
+                 label: str | None, config: dict, settings: dict) -> int:
+    note = lambda text: print(f"wb: follow-up: {text}")
+    if label is None:
+        note("an issue filed without the follow-up label cannot be found as a duplicate later")
+    try:
+        repo = json.loads(gh_ok(root, "reading the repository", "repo", "view", "--json", "nameWithOwner")
+                          .stdout)["nameWithOwner"]
+        candidates = {}
+        for name in (FOLLOW_UP_LABEL, NESTED_LABEL):
+            for issue in fetch_issues(root, repo, name, "all"):
+                candidates.setdefault(issue["number"], issue)
+    except (DedupeFailed, ValueError, KeyError, TypeError) as err:
+        print(f"wb: follow-up: {err}", file=sys.stderr)
+        return 1
+    candidates.pop(args.source, None)                     # the issue this PR closes cannot hold its findings
+    pool = list(candidates.values())
+    labelled = {FOLLOW_UP_LABEL, NESTED_LABEL}
+    rest = [item for item in pending if followup.pick_exact(item, pool, labelled)[0] is None]
+    semantic = {}
+    if rest:
+        bugs = []
+        bug = triage.bug_label_of(config)
+        if bug is None:
+            note("bugLabel is invalid; bug issues are not semantic candidates")
+        else:
+            try:
+                bugs = fetch_issues(root, repo, bug, "open")
+            except DedupeFailed as err:
+                note(f"{err}; bug issues are not semantic candidates")
+        open_ = {c["number"]: c for c in pool + bugs if c["state"] == "open" and c["number"] != args.source}
+        semantic = followup.semantic_matches(rest, list(open_.values()), note)
+    triaged = followup.triage_on(config, repo)
+    failed = 0
+    for item in pending:
+        try:
+            match, related = followup.pick_exact(item, pool, labelled)   # again: issues filed in this run count
+            notes = [f"Possibly related: #{related['number']} (closed as {followup.closed_reason(related)})"] if related else []
+            number, is_semantic = (match["number"], False) if match else (None, False)
+            if number is None and item["key"] in semantic:
+                guess, confidence = semantic[item["key"]]
+                if guess is not None and confidence == "high":
+                    number, is_semantic = guess, True
+                elif guess is not None:
+                    notes.append(f"Possibly related: #{guess} ({confidence} confidence)")
+            if number is not None:
+                issue, message = record_duplicate(root, repo, item, number, is_semantic, args, settings["bumpAt"])
+                if issue is not None:
+                    item.update(url=issue["url"], duplicateOf=number)
+                    print(f"{item['key']}: {message}")
+                    save_follow_ups(root, items)
+                    continue
+                notes.append(message)
+            filed = file_new(root, item, args, label, notes, triaged)
+            pool.append(filed)
+            item["url"] = filed["url"]
+            print(f"{item['key']}: filed {filed['url']}")
+        except (DedupeFailed, ValueError, KeyError, TypeError) as err:
+            print(f"wb: follow-up: '{item['key']}': {err}", file=sys.stderr)
+            failed += 1
+            continue
+        save_follow_ups(root, items)          # after each one, so a failure never loses a filed url
+    return 1 if failed else 0
+
+
+def file_new(root: Path, item: dict, args: argparse.Namespace, label: str | None, related: list[str],
+             triaged: bool) -> dict:
+    """File the item as a new issue; its priority comes from triage when the repo has it, else from
+    the severity. Returns it as a candidate, so a later item of this run can match it."""
+    body_file = root / ".workbench" / "state" / f"follow-up-{item['key']}.md"
+    body_file.write_text(issue_body(item, args.source, args.pr, related,
+                                    followup.finding_marker(item, args.source, args.pr)), encoding="utf-8")
+    argv = ["issue", "create", "--title", item["title"], "--body-file", str(body_file)]
+    labels = [label] if label else []
+    if not triaged:
+        priority = f"priority:{followup.severity_priority(item.get('severity'))}"
+        if ensure_label(root, priority):
+            labels.append(priority)
+        else:
+            print(f"wb: follow-up: cannot create label '{priority}'; filing '{item['key']}' untriaged")
+    for name in labels:
+        argv += ["--label", name]
+    try:
+        done = gh_run(root, *argv)
+    finally:
+        body_file.unlink(missing_ok=True)
+    url = next((line.strip() for line in (done.stdout or "").splitlines() if "/issues/" in line), None)
+    if done.returncode != 0 or not url:
+        raise DedupeFailed(f"filing failed: {(done.stderr or done.stdout).strip()}")
+    return {"number": int(url.rstrip("/").rsplit("/", 1)[-1]), "title": item["title"], "body": "",
+            "state": "open", "state_reason": "", "closed_at": "", "url": url, "labels": labels,
+            "author_association": "NONE"}
 
 
 def loop_done(root: Path, pr: str | None, sha: str | None) -> int:
@@ -1004,10 +1208,11 @@ def main() -> int:
     q.add_argument("--severity", required=True, choices=SEVERITIES)
     q.add_argument("--origin", required=True, help='"review r<K>" or "plan"')
     q.add_argument("--disputed", action="store_true")
+    q.add_argument("--file", help="path[:line] the finding is about (#42)")
     q.set_defaults(func=cmd_follow_up_add)
     q = follow.add_parser("file", help="file every recorded follow-up that has no issue yet")
     q.add_argument("--source", required=True, type=int, help="the issue this loop works on")
-    q.add_argument("--pr", type=int)
+    q.add_argument("--pr", type=int, help="the loop's PR; required while followUp.dedupe is on (#42)")
     q.set_defaults(func=cmd_follow_up_file)
     p = subs.add_parser("merge-check", help="read-only: exit 0 and print ok only when the PR may be auto-merged")
     p.add_argument("--pr", required=True, help="PR number or URL")

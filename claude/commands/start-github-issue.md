@@ -48,15 +48,23 @@ all stop you exactly as they do without autonomy.
 
   The severity is revmux's, as you verified it. You may raise it, but never lower it below revmux's
   without saying so in the merge comment.
-  Before merge-check, file them all with `python "$AGWORKBENCH/lib/wb.py" follow-up file --source <N> --pr <P>`.
-  It dedupes on the exact title, labels the issue `follow-up` (`follow-up-nested` when this issue is
-  itself a follow-up), and adds the planner marker. merge-check refuses while any item is unfiled.
+  Add `--file <path:line>` when the finding names a place in the code.
+  Before merge-check, file them all with `python "$AGWORKBENCH/lib/wb.py" follow-up file --source <N> --pr <P>`
+  (`--pr is required` while `followUp.dedupe` is on, the default). It labels a new issue `follow-up`
+  (`follow-up-nested` when this issue is itself a follow-up) and adds the planner marker. With dedupe on
+  (#42) it first looks for an existing issue describing the same problem: the same normalised title
+  among the follow-up issues, then one restricted model call over the open follow-up and bug issues
+  (only a high-confidence answer counts). On a match it records a duplicate there instead of filing:
+  a comment with this PR, the round, the file and the finding, and the count. The reports then bump
+  the issue's priority label: priority:P2 at 2 reports, P1 at 3 and P0 at 5 (`followUp.bumpAt`),
+  never downward. merge-check refuses while any item is unfiled; a duplicate counts as filed.
 - **What may be deferred.** After at most five rounds, a remaining Minor or Immaterial finding may
   be deferred, but only as a filed follow-up. A Major or blocker **never** may, disputed or not: it
   stops as today. merge-check refuses any Major or blocker review item in follow-ups.json, so record
   it honestly (with `--disputed` when it ended disputed) and the human decides.
 - **The merge comment** lists every follow-up URL, and every disputed or deferred finding with its
-  severity.
+  severity. It marks each duplicate (an item with `duplicateOf` in follow-ups.json) as "reported
+  again on #M" rather than as a new issue.
 - **Your last act** is `python "$AGWORKBENCH/lib/wb.py" loop-state done --pr <P> --sha <merged sha>`, after the
   Phase 7 steps. It refuses while any follow-up is unfiled. The relay closes nothing until this
   record exists and your own inbox is read. Mail the implementer gets after the merge, such as your
