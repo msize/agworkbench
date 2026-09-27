@@ -284,10 +284,17 @@ class Decisions(TriageCase):
     def test_minor_follow_ups_are_capped_and_logged(self):
         for number, label in ((31, 'follow-up'), (32, 'follow-up-nested')):
             self.follow_up(number, label=label)
-            self.answers[number] = answer('P1')
+            self.answers[number] = answer('P1', rationale='PRIVATE RATIONALE: SCH-012 must stay private')
             self.assertEqual(0, self.triage().run_once(numbers=[number], retriage=True))
             self.assertIn('priority:P2', self.labels_written()[number])
             self.assertIn('follow-up: capped at P2 (no data loss/crash)', self.public()[-1][1])
+            for args, body in self.public():
+                public_text = ' '.join(args) + (body or '')
+                for secret in SECRET:
+                    self.assertNotIn(secret, public_text)
+                self.assertNotIn('the model said', public_text)
+                if args[:2] == ('issue', 'comment'):
+                    self.assertIn(body, t.PUBLIC_COMMENTS)
             self.assertIn('the model said P1', self.private()[-1][1])
             self.assertIn('capped at P2', self.private()[-1][1])
 
