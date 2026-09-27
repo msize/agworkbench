@@ -296,10 +296,29 @@ if ($QueueMember) {
         $outcome = 'ok'
         if (-not $ok) { $outcome = 'failed' }
         if ($script:Launch.QueueIncomplete) { $outcome = 'incomplete' }
+        $failureStage = $script:Launch.Stage
+        $remaining = @()
+        if ($script:Launch.Checkout) {
+            if ($outcome -ne 'ok') {
+                try { $remaining = @(Close-QueueSessions $script:Launch.Checkout) }
+                catch {
+                    $remaining = @(@($script:Launch.SessionId, $script:Launch.RelaySession) | Where-Object { $_ })
+                    $script:Launch.Failure += "`ncleanup failed: $_"
+                }
+            }
+        }
         $result = @{ result = $outcome; checkout = $script:Launch.Checkout; sessionId = $script:Launch.SessionId;
             claudePane = $script:Launch.Claude; codexPane = $script:Launch.Codex; relaySession = $script:Launch.RelaySession;
+            stage = $failureStage; infra = ($failureStage -in @('window', 'cleanup', 'session', 'split', 'codex', 'claude', 'relay', 'relay-stop', 'focus'));
             detail = $null }
         if ($outcome -ne 'ok') { $result.detail = "$($script:Launch.Failure)`n$(Format-RepairMessage $script:Launch)" }
+        if ($outcome -ne 'ok' -and $remaining.Count) { $result.detail += "`nSessions still open: $($remaining -join ', ')" }
+        if ($outcome -ne 'ok' -and $script:Launch.SessionId -and $remaining -notcontains $script:Launch.SessionId) {
+            $result.sessionId = $null; $result.claudePane = $null; $result.codexPane = $null
+        }
+        if ($outcome -ne 'ok' -and $script:Launch.RelaySession -and $remaining -notcontains $script:Launch.RelaySession) {
+            $result.relaySession = $null
+        }
         $resultPath = Join-Path (Split-Path -Parent $memberLockPath) ("result-$QueueToken.json")
         try {
             Write-AtomicJson $resultPath $result
@@ -307,6 +326,10 @@ if ($QueueMember) {
                 '--number', "$memberNumber", '--attempt', "$QueueAttempt", '--token', $QueueToken, '--result-file', $resultPath)
             & python @resultArgs
             if ($LASTEXITCODE -ne 0) { exit 1 }
+            if ($ok -and $script:Launch.Checkout) {
+                $recordPath = Get-QueueLaunchPath $script:Launch.Checkout
+                if (Test-Path -LiteralPath $recordPath) { Remove-Item -LiteralPath $recordPath }
+            }
         } finally { if (Test-Path -LiteralPath $resultPath) { Remove-Item -LiteralPath $resultPath } }
         if (-not $ok) { exit 1 }
         exit 0

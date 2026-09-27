@@ -1577,6 +1577,8 @@ class QueueEntry(LauncherFixtures):
         first = self.entry()
         self.assertEqual(1, first.returncode, first.stdout + first.stderr)
         self.assertEqual('incomplete', self.store.load()['members'][0]['result']['result'])
+        self.assertEqual([], [c for c in self.calls() if c[:2] == ['session', 'type']])
+        self.assertEqual(1, sum(c[:2] == ['session', 'close'] for c in self.calls()))
         original = (self.checkout / '.workbench/state/claude.json').read_bytes()
         self.write_helpers()
         self.retry()
@@ -1585,8 +1587,8 @@ class QueueEntry(LauncherFixtures):
         self.assertEqual('ok', self.store.load()['members'][0]['result']['result'])
         self.assertEqual(original, (self.checkout / '.workbench/state/claude.json').read_bytes())
         typed = [c for c in self.calls() if c[:2] == ['session', 'type']]
-        self.assertEqual([RIGHT_ID], [c[-1] for c in typed])
-        self.assertIn('-Resume', typed[0][2])
+        self.assertEqual([RIGHT_ID, MAIN_ID], [c[-1] for c in typed])
+        self.assertEqual(2, sum(c[:2] == ['session', 'new'] and '--name' in c and not c[c.index('--name') + 1].endswith('relay') for c in self.calls()))
 
     def test_failed_relay_retry_restores_it_with_same_conversation(self):
         self.scenario['responses'] = [{'args': '^session new --name #7 relay', 'exit': 1, 'once': True}]
@@ -1594,13 +1596,103 @@ class QueueEntry(LauncherFixtures):
         first = self.entry()
         self.assertEqual(1, first.returncode, first.stdout + first.stderr)
         self.assertEqual('failed', self.store.load()['members'][0]['result']['result'])
+        failed = self.store.load()['members'][0]['result']
+        self.assertEqual(('relay', True, None), (failed['stage'], failed['infra'], failed['sessionId']))
+        self.assertEqual([RIGHT_ID, MAIN_ID], [c[-1] for c in self.calls() if c[:2] == ['session', 'type']])
         original = (self.checkout / '.workbench/state/claude.json').read_bytes()
         self.retry()
         second = self.entry()
         self.assertEqual(0, second.returncode, second.stdout + second.stderr)
         self.assertEqual(original, (self.checkout / '.workbench/state/claude.json').read_bytes())
-        self.assertEqual(1, sum(c[:2] == ['session', 'type'] for c in self.calls()))
+        self.assertEqual([RIGHT_ID, MAIN_ID, RIGHT_ID, MAIN_ID],
+                         [c[-1] for c in self.calls() if c[:2] == ['session', 'type']])
+        self.assertEqual(1, sum(c[:2] == ['session', 'close'] for c in self.calls()))
         self.assertEqual(RELAY_ID, self.store.load()['members'][0]['result']['relaySession'])
+
+    def test_failed_codex_prompt_closes_created_session_without_starting_claude(self):
+        self.write_helpers("\nfunction Wait-ShellPrompt { return $false }\n")
+        first = self.entry()
+        self.assertEqual(1, first.returncode, first.stdout + first.stderr)
+        result = self.store.load()['members'][0]['result']
+        self.assertEqual(('codex', True, None), (result['stage'], result['infra'], result['sessionId']))
+        self.assertFalse((self.checkout / '.workbench/state/queue-launch.json').exists())
+        self.assertFalse(any(c[:2] == ['session', 'type'] for c in self.calls()))
+        self.assertIn(['session', 'close', MAIN_ID], self.calls())
+        self.assertFalse(any(c[:2] == ['session', 'restore'] and c[2] != 'none' and c[-1] == MAIN_ID
+                             for c in self.calls()))
+
+    def test_fresh_queue_pins_and_types_claude_after_codex(self):
+        result = self.entry()
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        calls = self.calls()
+        main_new = next(c for c in calls if c[:2] == ['session', 'new'] and
+                        c[c.index('--name') + 1] == '#7 fix-x')
+        self.assertNotIn('--command', main_new)
+        codex_pin = next(i for i, c in enumerate(calls) if c[:2] == ['session', 'restore'] and c[-1] == RIGHT_ID)
+        codex_type = next(i for i, c in enumerate(calls) if c[:2] == ['session', 'type'] and c[-1] == RIGHT_ID)
+        claude_pin = next(i for i, c in enumerate(calls) if c[:2] == ['session', 'restore'] and c[-1] == MAIN_ID)
+        claude_type = next(i for i, c in enumerate(calls) if c[:2] == ['session', 'type'] and c[-1] == MAIN_ID)
+        self.assertLess(codex_pin, codex_type)
+        self.assertLess(codex_type, claude_pin)
+        self.assertLess(claude_pin, claude_type)
+
+    def test_close_failure_blocks_next_attempt_until_session_is_gone(self):
+        self.scenario['fail_close'] = True
+        self.save_scenario()
+        self.write_helpers("\nfunction Wait-ShellPrompt { return $false }\n")
+        first = self.entry()
+        self.assertEqual(1, first.returncode, first.stdout + first.stderr)
+        record = self.checkout / '.workbench/state/queue-launch.json'
+        self.assertEqual([MAIN_ID], json.loads(record.read_text(encoding='utf-8-sig'))['sessions'])
+        self.retry()
+        before = sum(c[:2] == ['session', 'new'] for c in self.calls())
+        second = self.entry()
+        self.assertEqual(1, second.returncode, second.stdout + second.stderr)
+        self.assertEqual('cleanup', self.store.load()['members'][0]['result']['stage'])
+        self.assertEqual(before, sum(c[:2] == ['session', 'new'] for c in self.calls()))
+        state = json.loads(self.scenario_path.read_text())
+        state['fail_close'] = False
+        self.scenario_path.write_text(json.dumps(state))
+        self.write_helpers()
+        self.retry()
+        third = self.entry()
+        self.assertEqual(0, third.returncode, third.stdout + third.stderr)
+        self.assertFalse(record.exists())
+
+    def test_close_error_after_session_disappears_does_not_block_retry(self):
+        self.scenario['close_error_after'] = True
+        self.save_scenario()
+        self.write_helpers("\nfunction Wait-ShellPrompt { return $false }\n")
+        first = self.entry()
+        self.assertEqual(1, first.returncode, first.stdout + first.stderr)
+        self.assertFalse((self.checkout / '.workbench/state/queue-launch.json').exists())
+        self.retry()
+        self.write_helpers()
+        second = self.entry()
+        self.assertEqual(0, second.returncode, second.stdout + second.stderr)
+
+    def test_narrow_pane_restores_window_then_launches(self):
+        self.scenario['metric_cols'] = [1, 87]
+        self.save_scenario()
+        marker = self.temp / 'restored.txt'
+        self.write_helpers("\nfunction Restore-AgwintermWindow { Set-Content -LiteralPath " +
+                           ps_quote(marker) + " -Value restored }\n")
+        result = self.entry()
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertTrue(marker.exists())
+        self.assertEqual('ok', self.store.load()['members'][0]['result']['result'])
+
+    def test_window_that_stays_narrow_is_deferred(self):
+        self.scenario['metric_cols'] = 1
+        self.save_scenario()
+        self.write_helpers("\n$script:WindowTiming = @{ Poll = 0.05; Wait = 0.2 }\n"
+                           "function Restore-AgwintermWindow {}\n")
+        result = self.entry()
+        self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+        launch = self.store.load()['members'][0]['result']
+        self.assertEqual(('incomplete', 'window', True),
+                         (launch['result'], launch['stage'], launch['infra']))
+        self.assertFalse(any(c[:2] == ['session', 'type'] for c in self.calls()))
 
     def test_non_queue_loop_is_refused_before_pin_or_typing(self):
         self.resumed()

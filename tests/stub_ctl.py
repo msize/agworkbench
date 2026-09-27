@@ -38,6 +38,25 @@ if args[:2] == ['session', 'restore']:
     session = next(s for s in sessions if pane in s.get('paneIds', [s['id']]))
     session.setdefault('restoreCommands', {})[pane] = args[2]
     finish(json.dumps({'action': 'pinned', 'pane': pane, 'session': session['id'], 'command': args[2]}))
+elif args[:2] == ['session', 'metrics']:
+    pane = args[2]
+    if not any(pane in s.get('paneIds', [s['id']]) for s in sessions):
+        finish(json.dumps({'ok': False, 'error': 'no session'}))
+    values = scenario.get('metric_cols', [87])
+    if isinstance(values, list):
+        cols = values.pop(0) if len(values) > 1 else values[0]
+    else:
+        cols = values
+    finish(json.dumps({'ok': True, 'result': {'cols': cols, 'rows': 49}}))
+elif args[:2] == ['session', 'close']:
+    session_id = args[2]
+    if scenario.get('fail_close'):
+        finish('close failed', 1, True)
+    for workspace in tree['workspaces']:
+        workspace['sessions'] = [s for s in workspace['sessions'] if s['id'] != session_id]
+    if scenario.get('close_error_after'):
+        finish('close reported an error after removing session', 1, True)
+    finish()
 elif args == ["tree", "--json"]:
     if scenario.pop('fail_next_tree', False):
         finish('tree failed after split reply', 1)
@@ -64,7 +83,8 @@ elif args[:2] == ["session", "new"]:
         workspace = {"name": option("--workspace-name"), "sessions": []}
         tree["workspaces"].append(workspace)
     workspace["sessions"].append({"id": session_id, "name": name})
-    scenario.setdefault("text", {})[session_id] = "relay up:" if name.endswith(" relay") else "Claude running"
+    scenario.setdefault("text", {})[session_id] = ("relay up:" if name.endswith(" relay") else
+        "PS C:\\checkout> " if '--command' not in args else "Claude running")
     finish(session_id)
 elif args[:2] == ["workspace", "new"]:
     workspace_id = scenario['workspace_id']
