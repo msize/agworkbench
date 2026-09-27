@@ -25,24 +25,48 @@ $reviewDir = Join-Path $hubDir 'review'
 New-Item -ItemType Directory -Force -Path $reviewDir | Out-Null
 $out = Join-Path $reviewDir ("human-" + (Get-Date -Format 'yyyyMMdd-HHmmss') + ".md")
 
+$posted = $false
+$why = $null
+try {
 if (-not (Get-Command revdiff -ErrorAction SilentlyContinue)) {
     throw "revdiff is not installed - run install.ps1 from the agworkbench checkout"
 }
 Write-Host "Your review of $Base..HEAD. Annotate, then press q; the notes go to Claude." -ForegroundColor Cyan
-try {
 & revdiff $Base --output $out
+$code = $LASTEXITCODE
 $annotated = (Test-Path -LiteralPath $out) -and ((Get-Content -Raw -LiteralPath $out).Trim().Length -gt 0)
 
 if ($annotated) {
+    # Annotations are posted whatever revdiff's exit code: its code on a normal quit is not ours to judge.
     & python (Join-Path $script:Lib 'post.py') --hub $hubDir --to claude --sender human --kind review `
         --subject "human review (revdiff): annotations to address" --body-file $out | Out-Host
+} elseif ($code -ne 0) {
+    # Nothing written and a failed exit is not "no annotations": the finally tells the planner (#45).
+    $why = "revdiff exit $code"
 } else {
     & python (Join-Path $script:Lib 'post.py') --hub $hubDir --to claude --sender human --kind note `
         --subject "human review (revdiff): no annotations" `
         --text "The human reviewed $Base..HEAD in revdiff and left no annotations." | Out-Host
 }
-Write-Host "Posted to Claude. You can close this session." -ForegroundColor Yellow
+if ($null -eq $why) {
+    if ($LASTEXITCODE -eq 0) {
+        $posted = $true
+        Write-Host "Posted to Claude. You can close this session." -ForegroundColor Yellow
+    } else {
+        $why = "post.py exit $LASTEXITCODE"
+    }
+}
+} catch {
+    Write-Host "your review failed: $_" -ForegroundColor Red
 } finally {
+    # Never end silently (#45): the planner waits on this mail, not on a watcher of its own.
+    if (-not $posted) {
+        if ($null -eq $why) { $why = 'it did not finish' }
+        & python (Join-Path $script:Lib 'post.py') --hub $hubDir --to claude --sender helper --kind note `
+            --subject "human review (revdiff): ended without a result ($why)" `
+            --text "human-review.ps1 ended without posting the human's review ($why). Ask the human, or look at the '#N your review' session." | Out-Host
+    }
     # The last act (#33): mark this helper done for the autonomous close (see run-revmux.ps1).
     & python (Join-Path $script:Lib 'helper_done.py') --hub $hubDir --kind review
 }
+if (-not $posted) { exit 1 }
