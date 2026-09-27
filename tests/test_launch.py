@@ -1497,6 +1497,9 @@ class QueueEntry(LauncherFixtures):
                                    (('-Retriage', '-Repo', 'o/repo', '-Limit', '5', '-DryRun'),
                                     f'{triage} run --repo o/repo --retriage --dry-run --limit 5'),
                                    (('-Triage', '-Repo', 'o/repo', '-Watch'), f'{triage} start-watch --repo o/repo'),
+                                   (('-Triage', '-Retriage', '-FollowUps', '-Repo', 'o/repo'),
+                                    f'{triage} run --repo o/repo --retriage --follow-ups'),
+                                   (('-Queue', 'bugs', '-Repo', 'o/repo', '-Watch', '-Prune'), '--watch --prune'),
                                    (('-Queue', 'bugs', '-Repo', 'o/repo', '-Triage'), '--triage')):
                 with self.subTest(shell=shell, args=args):
                     result, seen = self.launcher(*args, shell=shell)
@@ -1532,6 +1535,10 @@ class QueueEntry(LauncherFixtures):
         for args in (('-Triage',), ('-Triage', '-Repo', 'o/repo', '7'), ('-Triage', '-Repo', 'o/repo', '-Autonomous'),
                      ('-Triage', '-Repo', 'o/repo', '-Limit', '0'), ('-Retriage', '-Repo', 'o/repo', '-Watch'),
                      ('-Queue', 'bugs', '-Repo', 'o/repo', '-Retriage'), ('-Queue', 'bugs', '-Repo', 'o/repo', '-Limit', '3'),
+                     ('-Queue', 'bugs', '-Repo', 'o/repo', '-Prune'),
+                     ('-Queue', 'bugs', '-Repo', 'o/repo', '-FollowUps'),
+                     ('-Triage', '-Repo', 'o/repo', '-Watch', '-FollowUps'),
+                     ('-Triage', '-Repo', 'o/repo', '-Prune'), ('-Prune',), ('-FollowUps',),
                      ('7', '-Limit', '3')):
             with self.subTest(args=args):
                 result, seen = self.launcher(*args)

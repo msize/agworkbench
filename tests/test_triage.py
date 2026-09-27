@@ -28,8 +28,8 @@ def issue(number, title='an issue', body='', labels=(), created='2026-01-01', as
                 author_association=association, state=state)
 
 
-def answer(priority='P2', ux=False, rationale='PRIVATE RATIONALE: SCH-012 is fine', refs=()):
-    return dict(priority=priority, ux=ux, rationale=rationale, specRefs=list(refs))
+def answer(priority='P2', ux=False, rationale='PRIVATE RATIONALE: SCH-012 is fine', refs=(), exception='none'):
+    return dict(priority=priority, ux=ux, rationale=rationale, specRefs=list(refs), exception=exception)
 
 
 def envelope(value, **extra):
@@ -272,6 +272,84 @@ class References(unittest.TestCase):
 
 
 class Decisions(TriageCase):
+    def follow_up(self, number, severity='minor', label='follow-up', association='OWNER', marker=True):
+        body = f'Severity: {severity}; origin: review r2\n'
+        if marker:
+            body += t.PLANNER_MARKER
+        item = issue(number, 'deferred finding', body, [label], association=association)
+        self.product = [old for old in self.product if old['number'] != number]
+        self.product.append(item)
+        return item
+
+    def test_minor_follow_ups_are_capped_and_logged(self):
+        for number, label in ((31, 'follow-up'), (32, 'follow-up-nested')):
+            self.follow_up(number, label=label)
+            self.answers[number] = answer('P1')
+            self.assertEqual(0, self.triage().run_once(numbers=[number], retriage=True))
+            self.assertIn('priority:P2', self.labels_written()[number])
+            self.assertIn('follow-up: capped at P2 (no data loss/crash)', self.public()[-1][1])
+            self.assertIn('the model said P1', self.private()[-1][1])
+            self.assertIn('capped at P2', self.private()[-1][1])
+
+    def test_exception_or_major_severity_keeps_the_grade(self):
+        for number, severity, exception, grade in ((33, 'minor', 'data-loss', 'P0'),
+                                                   (34, 'major', 'none', 'P1'),
+                                                   (35, 'blocker', 'none', 'P1')):
+            self.follow_up(number, severity)
+            self.answers[number] = answer(grade, exception=exception)
+            self.triage().run_once(numbers=[number])
+            self.assertIn('priority:' + grade, self.labels_written()[number])
+            self.assertNotIn('capped at P2', self.public()[-1][1])
+
+    def test_unknown_or_untrusted_severity_is_capped(self):
+        for number, severity, association, marker in ((36, 'nonsense', 'OWNER', True),
+                                                      (37, 'major', 'NONE', True),
+                                                      (38, 'major', 'OWNER', False)):
+            self.follow_up(number, severity, association=association, marker=marker)
+            self.answers[number] = answer('P1')
+            self.triage().run_once(numbers=[number])
+            self.assertIn('priority:P2', self.labels_written()[number])
+
+    def test_low_grade_has_no_cap_note(self):
+        self.follow_up(39)
+        self.answers[39] = answer('P3')
+        self.triage().run_once(numbers=[39])
+        self.assertNotIn('capped at P2', self.public()[-1][1])
+        self.assertNotIn('capped at P2', self.private()[-1][1])
+
+    def test_deterministic_p0_requires_an_exception_for_minor_follow_up(self):
+        self.follow_up(100)
+        self.answers[100] = answer('P0')
+        self.triage().run_once(numbers=[100])
+        self.assertEqual(True, self.model_calls[-1][3]['deterministicP0'])
+        self.assertIn('priority:P2', self.labels_written()[100])
+        self.assertIn('deterministic uncapped grade P0', self.private()[-1][1])
+        self.answers[100] = answer('P0', exception='crash')
+        self.triage().run_once(numbers=[100], retriage=True)
+        self.assertIn('priority:P0', self.labels_written()[100])
+
+    def test_floor_and_cap_log_both_uncapped_grades(self):
+        self.follow_up(12)
+        self.answers[12] = answer('P3')
+        self.triage().run_once(numbers=[12])
+        self.assertIn('priority:P2', self.labels_written()[12])
+        self.assertIn('the model said P3, uncapped grade P1', self.private()[-1][1])
+
+    def test_dry_run_shows_the_cap_without_writing(self):
+        self.follow_up(42)
+        self.answers[42] = answer('P1')
+        self.assertEqual(0, self.triage(dry_run=True).run_once(numbers=[42]))
+        self.assertTrue(any('#42: would label priority:P2' in line and 'capped at P2' in line
+                            for line in self.out))
+        self.assertEqual([], self.writes())
+
+    def test_follow_up_selector_retriages_labelled_issues(self):
+        self.follow_up(41)
+        self.product[-1]['labels'].append({'name': 'priority:P1'})
+        self.answers[41] = answer('P1')
+        self.triage().run_once(retriage=True, follow_ups=True)
+        self.assertEqual([41], [int(a[2]) for a, _ in self.public() if a[:2] == ('issue', 'edit')])
+
     def test_a_bug_mirrored_in_a_spec_repo_is_p0_without_the_model(self):
         self.triage().run_once(numbers=[100])
         self.assertEqual([], self.model_calls)
@@ -322,6 +400,8 @@ class ModelContract(TriageCase):
         'two objects': done(0, json.dumps({'is_error': False, 'result': '{"priority": "P1"} {"x": 1}'})),
         'extra key': envelope(dict(answer(), confidence=0.9)),
         'missing key': envelope({'priority': 'P1', 'ux': False, 'rationale': 'x'}),
+        'missing exception': envelope({k: v for k, v in answer().items() if k != 'exception'}),
+        'unknown exception': envelope(answer(exception='other')),
         'bad priority': envelope(answer('P5')),
         'ux as string': envelope(dict(answer(), ux='yes')),
         'empty rationale': envelope(answer(rationale=' ')),
@@ -554,7 +634,8 @@ class HeadlessCall(TriageCase):
         stub.write_text('import json, sys\n'
                         f'json.dump(sys.argv[1:], open(r"{dump}", "w", encoding="utf-8"))\n'
                         'print(json.dumps({"is_error": False, "structured_output": '
-                        '{"priority": "P2", "ux": False, "rationale": "r", "specRefs": []}}))\n', encoding='utf-8')
+                        '{"priority": "P2", "ux": False, "rationale": "r", "specRefs": [], '
+                        '"exception": "none"}}))\n', encoding='utf-8')
         triage = t.Triage(PRODUCT, self.config, gh=self.gh, git=self.git, model=t.real_model,
                           claude=[sys.executable, str(stub)], cache=self.folder / 'cache',
                           state=self.folder / 'state', out=self.out.append)

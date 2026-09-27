@@ -124,10 +124,11 @@ github-workbench -Queue "where: label IN [bug, regression] AND NOT 'needs design
   matches.
 - **Errors:** a malformed query prints the column and what was expected, and exits 2 before
   anything is read or written.
-- **`-Watch`:** the query is the watched spec and is re-evaluated on each rescan. The queue keeps
-  one watched spec. The same query spelled differently (case, spaces, quotes, redundant
-  parentheses) counts as the same, but other logic does not, even if it is equivalent (`a AND b`
-  vs `b AND a`, `label IN [a]` vs `a`), and neither does a `label:` spec.
+- **`-Watch`:** the query is the watched spec and is re-evaluated on each rescan. Rerun
+  `-Queue 'where: <new query>' -Watch` to change the saved query or switch between a label and a
+  query. `-Prune` removes pending members that no longer match the new spec; members already in
+  another state stay in the queue. `-DryRun` shows the settings change and the members that would
+  be pruned without writing the queue file. `-Prune` requires `-Watch` and a label or query spec.
 - **Quotes and your shell:** a `.cmd` (and Windows PowerShell 5.1 calling any program) splits an
   argument at its inner double quotes. So `install.ps1` puts `github-workbench.ps1` next to
   `github-workbench.cmd` and PowerShell (pwsh and 5.1) runs it instead: it hands your arguments over
@@ -239,6 +240,7 @@ repos. The labels must already exist on the repo.
 github-workbench -Triage -Repo yeroo/docxy              # every open issue without a priority: label
 github-workbench -Triage -Repo yeroo/docxy -Watch       # keep doing it for new ones, every 5 minutes
 github-workbench -Retriage -Repo yeroo/docxy -DryRun    # re-judge labelled ones too; print, write nothing
+github-workbench -Triage -Retriage -FollowUps -Repo yeroo/docxy -Limit 200
 github-workbench -Queue bugs -Repo yeroo/docxy -Autonomous -Triage
 ```
 
@@ -271,12 +273,18 @@ Configure it locally in `~/.agworkbench.json`, never in the repo:
    `docxy#12`, `yeroo/docxy#12`, or the issue's URL. `docxy#120`, `docxy-word#12` and a bare `#12`
    do not, and spec comments are not scanned. A referenced **bug**, or an issue referenced by a
    spec bug mirror (title `bug:` or a `bug` label), is **P0 without asking the model**. Any other
-   referenced issue gets a P1 floor.
+   referenced issue gets a P1 floor. Minor follow-ups on the deterministic P0 path still ask the
+   model whether an exception applies.
 3. **The model,** everywhere else. It runs as `claude -p` with the text of
    `claude/commands/triage-issue.md` (also installed as `/triage-issue`). It runs `--restricted`,
    with only Read, Grep and Glob, no MCP servers, no settings but the quiet file, and a JSON schema
    for its answer, within 300 s. triage.py enforces the rules, whatever the answer says:
-   - the floor is never lowered;
+   - the floor is never lowered except when the follow-up cap applies;
+   - `follow-up` and `follow-up-nested` issues with trusted `Severity: minor` (or no trusted
+     major severity) are capped at P2 unless they involve save/load data loss or corruption, a
+     crash or hang, a document failing to open or save, or a security problem. Trusted major and
+     blocker follow-ups keep normal triage. The public comment states the cap; the private log
+     retains the uncapped grade;
    - a P0 from the model alone, for an author outside the repo (not OWNER, MEMBER or
      COLLABORATOR), is written as P1. Anyone can file a public issue, and its text is untrusted
      input to the model, so it must not be able to put itself at the front of the queue;
@@ -296,7 +304,10 @@ spec issue; one log is less noise there.
 **What gets triaged.** Open issues without a `priority:` label, oldest first, at most `-Limit`
 (default 20) per run. A label already there counts as triaged, including one you applied by hand.
 The labels are read again just before writing, so a label you add meanwhile wins. `-Retriage`
-also re-judges the labelled ones and replaces their label. `-Watch` opens a visible
+also re-judges the labelled ones and replaces their label.
+`-FollowUps` limits a manual triage or retriage run to the two follow-up labels, useful for
+applying the new cap to existing issues without repeatedly taking the oldest 20 open issues.
+`-Watch` opens a visible
 `#triage owner/repo` session that re-scans every 5 minutes; nothing that goes wrong in one scan
 ends it. An issue that keeps failing there is retried with a growing delay, then left alone after
 3 failures, with one notification. Only the watch counts failures: a manual or queue run always

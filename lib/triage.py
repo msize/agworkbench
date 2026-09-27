@@ -77,19 +77,26 @@ REASONS = {
 }
 
 
-def public_comment(priority: str, ux: bool) -> str:
-    return f'Triaged priority:{priority} ({REASONS[(priority, ux)]}).\n{TRIAGE_MARKER}\n{PLANNER_MARKER}\n'
+def public_comment(priority: str, ux: bool, capped: bool = False) -> str:
+    cap = 'follow-up: capped at P2 (no data loss/crash)\n' if capped else ''
+    return f'Triaged priority:{priority} ({REASONS[(priority, ux)]}).\n{cap}{TRIAGE_MARKER}\n{PLANNER_MARKER}\n'
 
 
-PUBLIC_COMMENTS = frozenset(public_comment(p, u) for p, u in REASONS)
+PUBLIC_COMMENTS = frozenset([public_comment(p, u) for p, u in REASONS] +
+                            [public_comment('P2', u, True) for u in (False, True)])
+
+EXCEPTIONS = ('none', 'data-loss', 'crash', 'open-save-failure', 'security')
+FOLLOW_UP_LABELS = {'follow-up', 'follow-up-nested'}
 
 SCHEMA = {
-    'type': 'object', 'additionalProperties': False, 'required': ['priority', 'ux', 'rationale', 'specRefs'],
+    'type': 'object', 'additionalProperties': False,
+    'required': ['priority', 'ux', 'rationale', 'specRefs', 'exception'],
     'properties': {
         'priority': {'type': 'string', 'enum': list(PRIORITIES)},
         'ux': {'type': 'boolean'},
         'rationale': {'type': 'string', 'maxLength': 2000},
         'specRefs': {'type': 'array', 'items': {'type': 'string'}},
+        'exception': {'type': 'string', 'enum': list(EXCEPTIONS)},
     },
 }
 
@@ -252,6 +259,16 @@ class Decision:
     rationale: str
     specRefs: list = field(default_factory=list)
     notes: list = field(default_factory=list)
+    capped: bool = False
+    exception: str = 'none'
+
+
+def follow_up_severity(issue: dict) -> str | None:
+    import followup
+    if not followup.trusted(issue.get('author_association'), issue.get('body')):
+        return None
+    lines = re.findall(r'^Severity:\s*(\w+)\b', issue.get('body') or '', re.I | re.M)
+    return lines[-1].casefold() if lines else None
 
 
 def reference_patterns(product: str):
@@ -303,11 +320,14 @@ def validate(result, known_refs: dict[str, str]) -> dict:
     """The model's answer, checked against the contract. `known_refs` maps casefolded refs to refs."""
     if not isinstance(result, dict) or set(result) != set(SCHEMA['required']):
         raise IssueFailed(f'the model output does not match the contract: {str(result)[:200]}')
-    priority, ux, rationale, refs = (result[key] for key in ('priority', 'ux', 'rationale', 'specRefs'))
+    priority, ux, rationale, refs, exception = (result[key] for key in
+                                                ('priority', 'ux', 'rationale', 'specRefs', 'exception'))
     if priority not in PRIORITIES:
         raise IssueFailed(f'invalid priority {priority!r}')
     if type(ux) is not bool:
         raise IssueFailed(f'invalid ux {ux!r}')
+    if exception not in EXCEPTIONS:
+        raise IssueFailed(f'invalid exception {exception!r}')
     if not isinstance(rationale, str) or not rationale.strip() or len(rationale) > 2000:
         raise IssueFailed('the rationale must be 1..2000 characters')
     if not isinstance(refs, list) or not all(isinstance(r, str) and REF_RE.fullmatch(r) for r in refs):
@@ -315,7 +335,8 @@ def validate(result, known_refs: dict[str, str]) -> dict:
     unknown = [r for r in refs if r.casefold() not in known_refs]
     if unknown:
         raise IssueFailed(f'specRefs not among the open spec issues: {unknown}')
-    return dict(priority=priority, ux=ux, rationale=rationale.strip(), specRefs=[known_refs[r.casefold()] for r in refs])
+    return dict(priority=priority, ux=ux, rationale=rationale.strip(),
+                specRefs=[known_refs[r.casefold()] for r in refs], exception=exception)
 
 
 # --- a run -----------------------------------------------------------------------------------------
@@ -465,26 +486,45 @@ class Triage:
     # the decision ---------------------------------------------------------------------------------
     def decide(self, issue: dict) -> Decision:
         refs = self.referencing(issue['number'])
+        is_follow_up = any(name.casefold() in FOLLOW_UP_LABELS for name in label_names(issue))
+        severity = follow_up_severity(issue) if is_follow_up else None
+        cap_class = is_follow_up and severity not in ('major', 'blocker')
         is_bug = any(name.casefold() == self.config['bugLabel'].casefold() for name in label_names(issue))
         if refs and (is_bug or any(r['bugMirror'] for r in refs)):
             why = 'a bug' if is_bug else 'mirrored as a spec bug'
-            return Decision('P0', False, 'deterministic',
-                            f'Referenced by open spec issue(s) {", ".join(r["ref"] for r in refs)} and {why}: blocks spec work.',
-                            [r['ref'] for r in refs])
+            decision = Decision('P0', False, 'deterministic',
+                                f'Referenced by open spec issue(s) {", ".join(r["ref"] for r in refs)} and {why}: blocks spec work.',
+                                [r['ref'] for r in refs])
+            if cap_class:
+                answer = self.ask_model(issue, refs, 'P1', deterministic_p0=True)
+                decision.exception = answer['exception']
+                if decision.exception == 'none':
+                    decision.notes.append(f'follow-up cap: deterministic uncapped grade P0 '
+                                          f'(severity {severity or "unknown"}, no data loss/crash/open-save/security); capped at P2')
+                    decision.priority, decision.capped = 'P2', True
+            return decision
         floor = 'P1' if refs else None
         answer = self.ask_model(issue, refs, floor)
-        decision = Decision(answer['priority'], answer['ux'], 'model', answer['rationale'], answer['specRefs'])
+        raw = answer['priority']
+        decision = Decision(raw, answer['ux'], 'model', answer['rationale'], answer['specRefs'],
+                            exception=answer['exception'])
         if floor and RANK[decision.priority] > RANK[floor]:
             decision.notes.append(f'the model said {decision.priority}; raised to the floor {floor} '
                                   f'(referenced by {", ".join(r["ref"] for r in refs)})')
             decision.priority = floor
+        if cap_class and decision.exception == 'none' and RANK[decision.priority] < RANK['P2']:
+            decision.notes.append(f'follow-up cap: the model said {raw}, uncapped grade {decision.priority} '
+                                  f'(after the floor; severity {severity or "unknown"}, '
+                                  'no data loss/crash/open-save/security); capped at P2')
+            decision.priority, decision.capped = 'P2', True
         association = issue.get('author_association') or 'NONE'
         if decision.priority == 'P0' and not refs and association not in TRUSTED:
             decision.notes.append(f'the model said P0 for an author outside the repo ({association}); written as P1')
             decision.priority = 'P1'
         return decision
 
-    def ask_model(self, issue: dict, refs: list[dict], floor: str | None) -> dict:
+    def ask_model(self, issue: dict, refs: list[dict], floor: str | None,
+                  deterministic_p0: bool = False) -> dict:
         if self.claude is None:
             self.claude = find_claude()
         try:
@@ -502,6 +542,7 @@ class Triage:
                            labels=label_names(issue), createdAt=issue.get('created_at'),
                            authorAssociation=issue.get('author_association') or 'NONE'),
                 floor=floor,
+                deterministicP0=deterministic_p0,
                 referencingSpecIssues=[{k: r[k] for k in ('ref', 'title', 'body', 'labels')} for r in refs],
                 specRepos=[dict(repo=s['repo'], path=str(s['path']),
                                 openIssues=[dict(ref=f"{s['repo']}#{i['number']}", title=i.get('title') or '',
@@ -577,7 +618,7 @@ class Triage:
         self.gh_ok(*args, what=f'labelling #{number}', error=IssueFailed)
         try:
             self.post(['issue', 'comment', str(number), '--repo', self.product],
-                      public_comment(decision.priority, decision.ux), what=f'commenting on #{number}')
+                      public_comment(decision.priority, decision.ux, decision.capped), what=f'commenting on #{number}')
         except IssueFailed as err:
             raise PartialWrite(str(err)) from None
         return True
@@ -613,6 +654,8 @@ class Triage:
                  f'source: {decision.source}']
         if decision.specRefs:
             lines.append('spec refs: ' + ', '.join(decision.specRefs))
+        if decision.exception != 'none':
+            lines.append('exception: ' + decision.exception)
         lines += [f'note: {note}' for note in decision.notes]
         lines += ['', decision.rationale, '', LOG_MARKER]
         self.post(['issue', 'comment', str(self.log_number), '--repo', repo], '\n'.join(lines) + '\n',
@@ -640,11 +683,13 @@ class Triage:
         except OSError as err:
             self.out(f'cannot save the failure counts: {err}')
 
-    def select(self, issues, numbers, retriage, limit, watch):
+    def select(self, issues, numbers, retriage, limit, watch, follow_ups=False):
         if numbers:
             chosen = [i for i in issues if i['number'] in set(numbers)]
         else:
             chosen = [i for i in issues if retriage or priority_of(i.get('labels')) is None]
+        if follow_ups:
+            chosen = [i for i in chosen if any(name.casefold() in FOLLOW_UP_LABELS for name in label_names(i))]
         chosen.sort(key=lambda i: (i.get('created_at') or '', i['number']))
         if watch:
             failures, now = self.failures(), self.clock()
@@ -652,7 +697,8 @@ class Triage:
                       or (f['count'] < GIVE_UP and now >= f['next'])]
         return chosen[:limit] if limit else chosen
 
-    def run_once(self, numbers=None, retriage=False, limit=20, watch=False, results=None) -> int:
+    def run_once(self, numbers=None, retriage=False, limit=20, watch=False, results=None,
+                 follow_ups=False) -> int:
         """0 all decided, 1 an issue failed, 3 stopped (limit/auth), 4 facts incomplete (nothing written)."""
         try:
             self.gather()
@@ -672,7 +718,7 @@ class Triage:
         failed = False
         # Failure counts and backoff belong to -Watch only: a manual or queue run always tries again.
         failures = self.failures() if watch else {}
-        for issue in self.select(issues, numbers, retriage, limit, watch):
+        for issue in self.select(issues, numbers, retriage, limit, watch, follow_ups):
             number = issue['number']
             try:
                 decision = self.decide(issue)
@@ -763,6 +809,7 @@ def main(argv=None) -> int:
         child.add_argument('--limit', type=int, default=20)
         if verb == 'run':
             child.add_argument('--retriage', action='store_true')
+            child.add_argument('--follow-ups', action='store_true')
             child.add_argument('--dry-run', action='store_true')
             child.add_argument('--issue', type=int, action='append')
             child.add_argument('--result-file')
@@ -791,7 +838,8 @@ def main(argv=None) -> int:
             triage.watch(args.interval, args.limit)
             return 0
         results = {}
-        code = triage.run_once(args.issue, args.retriage, args.limit, results=results)
+        code = triage.run_once(args.issue, args.retriage, args.limit, results=results,
+                               follow_ups=args.follow_ups)
         if args.result_file:
             Path(args.result_file).write_text(json.dumps(results), encoding='utf-8')
         return code

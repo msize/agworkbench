@@ -498,11 +498,15 @@ def settings_changes(data, parallel, yes, implementer, auto_merge, autonomous, w
 
 
 def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=False, dry_run=False, root=None,
-                implementer=None, auto_merge=None, autonomous=None, gh=gh_json, triage_on=False):
+                implementer=None, auto_merge=None, autonomous=None, gh=gh_json, triage_on=False,
+                prune=False):
     repo, numbers, label = resolve_spec(expand_spec(spec, config_path()), repo, gh)
+    matched = set(numbers)
     matches = len(numbers)
     if watch and not label:
         raise UsageError('-Watch requires a label:, bugs or where: spec')
+    if prune and (not watch or not label):
+        raise UsageError('-Prune requires -Queue with a watched label:, bugs or where: spec')
     root = Path(root or os.environ.get('AGWORKBENCH_QUEUE_ROOT', Path.home() / '.agworkbench/queues')).resolve()
     store = Store(root / (repo + '.json'))
     if parallel is not None and not 1 <= parallel <= 8:
@@ -510,8 +514,9 @@ def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=Fa
     if implementer not in (None, 'codex', 'claude'):
         raise UsageError('-Implementer must be codex or claude')
     existing = store.load() if store.path.exists() else None      # under the state lock, like every other read
-    validate_append(existing, watch, label)
     known = {m['number']: m['state'] for m in existing['members']} if existing else {}
+    pruned = [m['number'] for m in existing['members']
+              if m['state'] == 'pending' and m['number'] not in matched] if existing and prune else []
     skipped = {n: f'queued ({known[n]})' for n in numbers if n in known}
     fresh = [n for n in numbers if n not in known]
     if label:
@@ -526,7 +531,7 @@ def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=Fa
         query = dict(query=label.text, matches=matches) if isinstance(label, labelquery.Query) else {}
         print(json.dumps(dict(repo=repo, **query, members=numbers, running=live, mode=mode,
                               skipped=[dict(number=n, reason=r) for n, r in sorted(skipped.items())],
-                              settings=changes, owner=existing.get('owner') if existing else None)))
+                              settings=changes, pruned=pruned, owner=existing.get('owner') if existing else None)))
         return 0
     token = None
     with Lock(store.state_lock):
@@ -538,13 +543,21 @@ def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=Fa
             data = dict(version=1, repo=repo, parallel=parallel or 1, watch=watch,
                         **(watch_fields(label) if watch else {'label': None}),
                         yes=yes, config=str(config_path()), members=[], owner=None)
-        validate_append(data, watch, label)
         # One mapping decides and applies every switch, and is what gets reported (#28). All apply to
         # members launched from now on; autonomous/autoMerge are saved explicitly, false included,
         # and -Watch onto a queue started from a list turns watching on.
         changes = settings_changes(data, parallel, yes, implementer, auto_merge, autonomous, watch, label, triage_on)
         for key, (_, new) in changes.items():
             data[key] = new
+        pruned = [m['number'] for m in data['members']
+                  if m['state'] == 'pending' and m['number'] not in matched] if prune else []
+        if pruned:
+            removed = set(pruned)
+            data['members'] = [m for m in data['members'] if m['number'] not in removed]
+            if data.get('launchBackoff', {}).get('member') in removed:
+                data.pop('launchBackoff', None)
+                if (data.get('launchPaused') or '').startswith('launches failing: '):
+                    data.pop('launchPaused', None)
         known = {m['number'] for m in data['members']}
         added = [n for n in numbers if n not in known]
         data['members'].extend(new_member(n, repo, checkout_root(data['config'])) for n in added)
@@ -564,8 +577,11 @@ def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=Fa
     # Reported only once written: a refused or failed write never shows changes that did not happen.
     for n, reason in sorted(skipped.items()):
         print(f'#{n} skipped: {reason}')
+    for n in pruned:
+        print(f'#{n} pruned: no longer matches the watched spec')
     for key, (old, new) in changes.items():
-        print(f'settings: {key} {json.dumps(old)} -> {json.dumps(new)} (for every member launched from now on)')
+        suffix = '' if key in ('label', 'query') else ' (for every member launched from now on)'
+        print(f'settings: {key} {json.dumps(old)} -> {json.dumps(new)}{suffix}')
     if token is None:
         if owner.get('session') and not owner.get('pinned'):
             pin_conductor(store, owner)
@@ -581,13 +597,6 @@ def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=Fa
     pin_conductor(store, dict(session=session, token=token))
     print(f'queue running in session {session}: {store.path}')
     return 0
-
-
-def validate_append(data, watch, label):
-    # One watched spec per queue. An unwatched queue may start watching (#28); a watched one keeps its
-    # label or query (#38: compared in normalised form, so another spelling of the same query passes).
-    if data and watch and data['watch'] and watch_key(data) != spec_key(label):
-        raise UsageError('one watched label or query per queue; cannot change saved watch semantics')
 
 
 def member_context(path, number, attempt, token):
@@ -962,6 +971,8 @@ class Worker:
     def mark(self, number, **fields):
         with self.store.transaction() as data:
             member = find_member(data, number)
+            if member is None:
+                return
             for key, value in fields.items():
                 if value is None:
                     member.pop(key, None)
@@ -1299,7 +1310,7 @@ def main(argv=None):
     source.add_argument('--spec-env', action='store_true')
     start.add_argument('--repo')
     start.add_argument('--parallel', type=int)
-    for flag in ('watch', 'retry', 'yes', 'dry-run', 'triage'):
+    for flag in ('watch', 'retry', 'yes', 'dry-run', 'triage', 'prune'):
         start.add_argument('--' + flag, action='store_true')
     start.add_argument('--implementer', choices=('codex', 'claude'))
     merge = start.add_mutually_exclusive_group()
@@ -1340,7 +1351,7 @@ def main(argv=None):
                     raise UsageError('--spec-env: AGWORKBENCH_QUEUE_SPEC is empty')
             return start_queue(spec, args.repo, args.parallel, args.watch, args.retry, args.yes, args.dry_run,
                                implementer=args.implementer, auto_merge=args.auto_merge,
-                               autonomous=args.autonomous, triage_on=args.triage)
+                               autonomous=args.autonomous, triage_on=args.triage, prune=args.prune)
         if args.command == 'run':
             return Worker(Store(args.file), args.token).run()
         if args.command == 'member-context':
