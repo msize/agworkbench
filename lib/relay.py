@@ -988,17 +988,24 @@ class Relay:
             self.finish_close()
 
     def resume_no_pr_loop(self, close: "closer.Closer", reason: str, expected_at) -> bool:
-        """Disarm the refused done record before returning to the live doorbell loop."""
+        """Disarm a refused done record, or persist its timestamp until retirement can retry."""
         import conductor
         try:
             retired = conductor.retire_no_pr_done(
                 self.hub_dir / 'state' / 'loop-done.json', expected_at=expected_at, issue=close.issue)
         except (OSError, ValueError) as err:
             close.log(f'could not retire refused no-PR completion: {err}')
+            self.state['refused_no_pr_at'] = expected_at
+            if not self.dry_run:
+                self._save()
             self.refuse_close(close, None, reason, handoff=False)
             return False
         if retired:
             close.log('preserved refused no-PR completion as loop-done-refused.json')
+            if 'refused_no_pr_at' in self.state:
+                self.state.pop('refused_no_pr_at')
+                if not self.dry_run:
+                    self._save()
         self.refuse_close(close, None, reason, handoff=False)
         return False
 
@@ -1456,7 +1463,7 @@ class Relay:
         return {(box, mid) for box, mid in targets & unread if mid not in announced}
 
     def no_pr_close_due(self) -> str | None:
-        """Return the no-PR done time only while the issue is closed and the branch has no open PR."""
+        """Return a safe done time. An open PR or issue retires the stale record as a live loop."""
         import conductor
         close = self.closer()
         if not close.no_pr_done():
@@ -1466,6 +1473,20 @@ class Relay:
             at = datetime.fromtimestamp(done['at'], timezone.utc).isoformat()
         except (OSError, ValueError, OverflowError, KeyError, TypeError):
             return None
+        if 'refused_no_pr_at' in self.state:
+            if done['at'] == self.state['refused_no_pr_at']:
+                try:
+                    if conductor.retire_no_pr_done(self.hub_dir / 'state' / 'loop-done.json',
+                                                   expected_at=done['at'], issue=close.issue):
+                        self.state.pop('refused_no_pr_at', None)
+                        if not self.dry_run:
+                            self._save()
+                except (OSError, ValueError) as err:
+                    self.log(f'could not retry refused no-PR completion retirement: {err}')
+                return None
+            self.state.pop('refused_no_pr_at', None)
+            if not self.dry_run:
+                self._save()
         def retire_live_record():
             try:
                 if conductor.retire_no_pr_done(self.hub_dir / 'state' / 'loop-done.json',
@@ -1473,6 +1494,9 @@ class Relay:
                     self.log('preserved live-loop no-PR completion as loop-done-refused.json')
             except (OSError, ValueError) as err:
                 self.log(f'could not retire live-loop no-PR completion: {err}')
+                self.state['refused_no_pr_at'] = done['at']
+                if not self.dry_run:
+                    self._save()
         open_pr, detail = close.open_prs(gh_call, self.branch)
         if open_pr is not False:
             self.log(f'{detail}; no-PR close waits')

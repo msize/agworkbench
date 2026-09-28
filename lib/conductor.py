@@ -13,6 +13,7 @@ import sys
 import time
 import types
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote, urlparse
 
@@ -712,6 +713,10 @@ def apply_loop(data, member, path):
         # This is a live loop again; no prior close attempt or stuck reason applies.
         member.pop('closePending', None)
         member.pop('closeStuck', None)
+    if member['state'] == 'closed' and state == 'closed':
+        # A newer closed report starts a new no-PR completion, even after a refused close.
+        member.pop('closePending', None)
+        member.pop('closeStuck', None)
     member.update(phase=state, state=state, reason=report.get('reason'), consumedLoop=loop, consumedRev=report['rev'])
     if state == 'closed':
         member.update(pr=None, prState=None)
@@ -1024,6 +1029,21 @@ class Worker:
                 relay_state = read_json(hub_dir / 'state' / 'relay.json') if (hub_dir / 'state' / 'relay.json').exists() else {}
             except (OSError, ValueError):
                 relay_state = {}
+            if m['state'] == 'closed' and relay_state.get('close_pending') != closer.NO_PR:
+                try:
+                    done = read_json(hub_dir / 'state' / 'loop-done.json')
+                    at = done.get('at') if isinstance(done, dict) else None
+                    last = m.get('closedAt')
+                    last = last if type(last) in (int, float) else float('-inf')
+                    if (isinstance(done, dict) and done.get('noPr') is True and done.get('pr') is None
+                            and str(done.get('issue')) == str(number) and type(at) in (int, float)
+                            and at > last and not closer.relay_alive(data['repo'], str(number), agw.tree())):
+                        relay_state['close_pending'] = closer.NO_PR
+                        relay_state['close_merged_at'] = datetime.fromtimestamp(at, timezone.utc).isoformat()
+                        atomic_json(hub_dir / 'state' / 'relay.json', relay_state)
+                        self.mark(number, closePending=True, closeStuck=None)
+                except (OSError, ValueError, OverflowError, agw.CtlError):
+                    pass  # An unreadable record or relay state is never a reason to re-arm.
             if key is None or relay_state.get('close_pending') != key:
                 # Nothing pending: the relay closed (or refused), or autonomy was off. A "relay alive"
                 # flag is resolved by that; a refused backstop close stays flagged for the human.
@@ -1082,29 +1102,29 @@ class Worker:
             self.end_close(m, pr, hub_dir, stuck=stuck or reason)
 
         def no_pr_preclose():
-            """A fresh issue and branch-PR gate: (reason, wait for an unknown result)."""
+            """Fresh gates: (verdict, reason); None means ready, adopted re-gates next tick."""
             closed, detail = attempt.issue_closed(self.gh)
             watch['issue_result'] = (closed, detail)
             watch['next_issue_check'] = self.clock() + CLOSE_ISSUE_CHECK_INTERVAL
             if closed is False:
-                return f'issue #{number} was reopened', False
+                return 'refuse', f'issue #{number} was reopened'
             if closed is None:
-                return f'issue state unknown: {detail}', True
+                return 'wait', f'issue state unknown: {detail}'
             relay_state = read_json(hub_dir / 'state' / 'relay.json')
             branch = relay_state.get('branch')
             open_pr, detail = attempt.open_prs(self.gh, branch)
             if open_pr is True:
-                return detail, False
+                return 'refuse', detail
             if open_pr is None:
                 watch['issue_result'] = (None, detail)
-                return detail, True
+                return 'wait', detail
             current_done = attempt.no_pr_done_record()
             if current_done is None:
-                return 'no-PR completion changed during the close', False
+                return 'refuse', 'no-PR completion changed during the close'
             if current_done.get('at') != watch.get('no_pr_at'):
                 watch['no_pr_at'] = current_done.get('at')
-                return 'no-PR completion changed during the close', True
-            return None, False
+                return 'adopted', 'new no-PR completion needs a fresh close check'
+            return None, None
 
         if pr is None:
             done_record = attempt.no_pr_done_record()
@@ -1129,10 +1149,12 @@ class Worker:
         if not reasons or attempt.overdue_ok():
             if attempt.autonomous():
                 if pr is None:
-                    reason, wait = no_pr_preclose()
-                    if reason:
-                        if not wait or (attempt.timed_out() and reason != 'no-PR completion changed during the close'):
-                            refuse(reason, live_loop=not wait)
+                    verdict, reason = no_pr_preclose()
+                    if verdict == 'adopted':
+                        return
+                    if verdict == 'refuse' or (verdict == 'wait' and attempt.timed_out()):
+                        refuse(reason, live_loop=verdict == 'refuse')
+                    if verdict is not None:
                         return
                 attempt.close_issue_session()
                 attempt.start_cleanup(pr)
@@ -1153,8 +1175,11 @@ class Worker:
             state.pop('close_merged_at', None)
             state.pop('close_handoff', None)
             atomic_json(path, state)
-        self.closes.pop(m['number'], None)
-        self.mark(m['number'], closePending=None, closeStuck=stuck)
+        watch = self.closes.pop(m['number'], None) or {}
+        fields = {'closePending': None, 'closeStuck': stuck}
+        if pr is None and type(watch.get('no_pr_at')) in (int, float):
+            fields['closedAt'] = watch['no_pr_at']
+        self.mark(m['number'], **fields)
 
     def disk_pause(self, config):
         """Why admissions are paused for disk space (#41), or None. Low disk must never fail members:

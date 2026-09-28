@@ -2211,7 +2211,22 @@ class AutonomousClose(unittest.TestCase):
         with patch.object(conductor.Lock, 'acquire', side_effect=conductor.QueueError('lock busy')):
             self.assertFalse(self.r.resume_no_pr_loop(self.r.closer(), 'issue #7 was reopened', 1))
         self.assertNotIn('close_pending', self.r.state)
+        self.assertEqual(1, self.r.state['refused_no_pr_at'])
+        self.assertEqual(1, json.loads((self.state / 'relay.json').read_text())['refused_no_pr_at'])
         self.assertIn('could not retire refused no-PR completion', self.log())
+        self.r.state['completed_prs'] = [8]  # an unmerged PR was retired; the issue is CLOSED again
+        with patch.object(conductor, 'retire_no_pr_done', side_effect=conductor.QueueError('lock busy')), \
+                patch.object(relay, 'gh_json') as gh:
+            self.assertIsNone(self.r.no_pr_close_due())
+            gh.assert_not_called()
+        self.assertTrue((self.state / 'loop-done.json').exists())
+        self.assertIsNone(self.r.no_pr_close_due())  # the retry retires the stale record
+        self.assertFalse((self.state / 'loop-done.json').exists())
+        self.assertNotIn('refused_no_pr_at', self.r.state)
+        self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 2})
+        with patch.object(relay, 'gh_json', side_effect=lambda args: [] if args[:2] == ['pr', 'list']
+                          else {'state': 'CLOSED'}):
+            self.assertIsNotNone(self.r.no_pr_close_due())
 
     def test_final_issue_lookup_retries_a_transient_failure(self):
         self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 1})
