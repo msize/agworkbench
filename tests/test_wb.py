@@ -1344,7 +1344,7 @@ class UsageLimitProse(unittest.TestCase):
 
 
 class FakeGh:
-    """gh at the subprocess boundary: issue view (labels), label create, issue list, issue create."""
+    """gh at the subprocess boundary for follow-up filing."""
 
     def __init__(self, source_labels=(), open_issues=(), label_fails=False, create_fails=()):
         self.source_labels = list(source_labels)
@@ -1360,7 +1360,10 @@ class FakeGh:
         args = argv[1:]
         done = lambda out='', code=0, err='': subprocess.CompletedProcess(argv, code, out, err)
         if args[:2] == ['issue', 'view']:
-            return done(json.dumps({'labels': [{'name': n} for n in self.source_labels]}))
+            return done(json.dumps({'title': 'Source issue',
+                                    'labels': [{'name': n} for n in self.source_labels]}))
+        if args[:2] == ['repo', 'view']:
+            return done(json.dumps({'nameWithOwner': 'o/r'}))
         if args[:2] == ['label', 'create']:
             return done(code=1, err='HTTP 403: Resource not accessible') if self.label_fails else done()
         if args[:2] == ['issue', 'list']:
@@ -1377,8 +1380,8 @@ class FakeGh:
 
 class FollowUps(unittest.TestCase):
     """#27: follow-ups are recorded, deduped and filed before the merge; merge-check gates on them.
-    These pin #27's filing, which `followUp.dedupe: false` keeps exactly (#42; tests/test_followup.py
-    covers dedupe on)."""
+    These pin #27's per-item filing where it still applies and #58's shared leftovers path.
+    tests/test_followup.py covers dedupe on."""
 
     def setUp(self):
         self.folder = Path(__file__).resolve().parent.parent / ('test wb follow ' + uuid.uuid4().hex)
@@ -1400,12 +1403,13 @@ class FollowUps(unittest.TestCase):
                 patch.object(wb.subprocess, 'run', side_effect=gh or AssertionError('gh called')):
             return wb.main()
 
-    def add(self, key, severity='minor', disputed=False, title=None):
+    def add(self, key, severity='minor', disputed=False, title=None, own_issue=False):
         body = self.folder / f'{key}.md'
         body.write_text(f'evidence for {key}: lib/x.py:12 fails', encoding='utf-8')
         argv = ['follow-up', 'add', '--key', key, '--title', title or f'Fix {key}', '--body-file', str(body),
                 '--severity', severity, '--origin', 'review r2']
-        self.assertEqual(0, self.run_wb(*argv + (['--disputed'] if disputed else [])))
+        self.assertEqual(0, self.run_wb(*argv + (['--disputed'] if disputed else [])
+                                        + (['--own-issue'] if own_issue else [])))
 
     def items(self):
         return json.loads((self.state / 'follow-ups.json').read_text(encoding='utf-8'))
@@ -1421,8 +1425,8 @@ class FollowUps(unittest.TestCase):
                          [(i['key'], i['severity'], i['origin'], i['disputed']) for i in self.items()])
 
     def test_file_creates_issues_with_markers_label_and_writes_urls_back(self):
-        self.add('r2-m1')
-        self.add('plan-queue', severity='plan')
+        self.add('r2-m1', own_issue=True)
+        self.add('plan-queue', severity='plan', own_issue=True)
         gh = FakeGh()
         self.assertEqual(0, self.run_wb('follow-up', 'file', '--source', '27', '--pr', '30', gh=gh))
         urls = [i['url'] for i in self.items()]
@@ -1437,12 +1441,12 @@ class FollowUps(unittest.TestCase):
         self.assertIn('no unfiled follow-ups', self.out.getvalue())
 
     def test_dedupe_off_makes_exactly_the_27_gh_calls(self):
-        # #42: followUp.dedupe false is today's behaviour, byte for byte: same calls, same body, --pr optional.
+        # Without a PR, dedupe off preserves #27's per-item calls and body.
         self.add('r2-m1', title='Fix the relay')
         gh = FakeGh()
         self.assertEqual(0, self.run_wb('follow-up', 'file', '--source', '27', gh=gh))
         body = str(self.state / 'follow-up-r2-m1.md')
-        self.assertEqual([['gh', 'issue', 'view', '27', '--json', 'labels'],
+        self.assertEqual([['gh', 'issue', 'view', '27', '--json', 'title,labels'],
                           ['gh', 'label', 'create', 'follow-up', '--color', 'BFD4F2',
                            '--description', 'filed automatically by an agworkbench loop'],
                           ['gh', 'issue', 'list', '--state', 'open', '--search', '"Fix the relay" in:title',
@@ -1452,6 +1456,27 @@ class FollowUps(unittest.TestCase):
         self.assertEqual('evidence for r2-m1: lib/x.py:12 fails\n\nSource: #27\nSeverity: minor; origin: review r2\n\n'
                          '<!-- agworkbench:follow-up source=#27 -->\n<!-- agworkbench:planner -->\n',
                          gh.bodies['Fix the relay'])
+
+    def test_dedupe_off_with_pr_creates_one_leftovers_issue(self):
+        self.add('r2-m1')
+        self.add('plan-queue', severity='plan')
+        gh = FakeGh()
+        self.assertEqual(0, self.run_wb('follow-up', 'file', '--source', '27', '--pr', '30', gh=gh))
+        self.assertEqual([['gh', 'issue', 'view', '27', '--json', 'title,labels'],
+                          ['gh', 'label', 'create', 'follow-up', '--color', 'BFD4F2',
+                           '--description', 'filed automatically by an agworkbench loop'],
+                          ['gh', 'repo', 'view', '--json', 'nameWithOwner'],
+                          ['gh', 'issue', 'list', '--state', 'open', '--search',
+                           '"Leftovers from #27: Source issue" in:title', '--json', 'number,title', '--limit', '200'],
+                          ['gh', 'label', 'create', 'priority:P2', '--color', 'D93F0B',
+                           '--description', 'agworkbench priority (#34, #42)'],
+                          ['gh', 'issue', 'create', '--title', 'Leftovers from #27: Source issue',
+                           '--body-file', str(self.state / 'follow-up-leftovers.md'),
+                           '--label', 'follow-up', '--label', 'priority:P2']], gh.calls)
+        body = gh.bodies['Leftovers from #27: Source issue']
+        self.assertIn('- [ ] **r2-m1**', body)
+        self.assertIn('- [ ] **plan-queue**', body)
+        self.assertEqual(self.items()[0]['url'], self.items()[1]['url'])
 
     def test_an_open_issue_with_exactly_the_title_is_reused(self):
         self.add('r2-m1', title='Fix the relay')
@@ -1579,7 +1604,8 @@ class AutonomyProse(unittest.TestCase):
         section = text.split('## Full autonomy')[1].split('## When the implementer is Claude')[0]
         for needle in ['autonomous=true', 'wb.py" follow-up add --key', '--disputed', 'follow-up file --source <N> --pr <P>',
                        'filed before the merge', 'never lower it below revmux', 'A Major or blocker **never** may, disputed or not',
-                       'merge comment** lists every follow-up URL', 'loop-state done --pr <P> --sha <merged sha>',
+                       'merge comment** lists the leftovers issue once with its checklist items, every separate',
+                       'follow-up URL', 'loop-state done --pr <P> --sha <merged sha>',
                        'never closes on a timeout', 'brakes are unchanged']:
             self.assertIn(needle, section)
         self.assertIn('deferred **with a filed follow-up issue**; a Major or blocker never may, disputed or not',
