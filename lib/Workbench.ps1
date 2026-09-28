@@ -1122,8 +1122,8 @@ function Find-AgentRoot([string] $Checkout, [string] $Tool) {
 
 function Confirm-PaneStable([string] $Checkout, [string] $Pane, [string] $Tool, $Seen) {
     <# A limited agent is idle, so its pane does not change. Use the relay's record when it has one
-       (the same tail for at least Stable seconds) plus one confirming read; otherwise sample the
-       pane for Sample seconds. Any change or any non-limit frame refuses. #>
+       (the same kind and tail for at least Stable seconds) plus one confirming read; otherwise sample
+       the pane for Sample seconds. Any change, or a frame of another kind, refuses. #>
     $timing = $script:FailoverTiming
     $relay = $null
     $relayPath = Join-Path $Checkout '.workbench\state\relay.json'
@@ -1132,7 +1132,7 @@ function Confirm-PaneStable([string] $Checkout, [string] $Pane, [string] $Tool, 
     }
     $nowSeconds = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0
     $reads = @()
-    if ($relay -and $relay.kind -eq 'limited' -and $relay.tail -eq $Seen.tail -and $relay.since -and
+    if ($relay -and $relay.kind -eq $Seen.kind -and $relay.tail -eq $Seen.tail -and $relay.since -and
         ($nowSeconds - [double]$relay.since) -ge $timing.Stable) {
         Write-LaunchLog failover "relay saw this frame unchanged for $([math]::Round($nowSeconds - [double]$relay.since))s; confirming once"
         Start-Sleep -Milliseconds ([int]($timing.Confirm * 1000))
@@ -1144,7 +1144,7 @@ function Confirm-PaneStable([string] $Checkout, [string] $Pane, [string] $Tool, 
     foreach ($read in $reads) {
         if ($reads.Count -gt 1) { Start-Sleep -Milliseconds ([int]($timing.Step * 1000)) }
         $again = Get-PaneLimit (Invoke-Ctl session text --target $Pane) $Tool
-        if ($again.kind -ne 'limited' -or $again.tail -ne $Seen.tail) {
+        if ($again.kind -ne $Seen.kind -or $again.tail -ne $Seen.tail) {
             throw [ImplementerConflict]::new("failover refused: the $Tool pane changed while it was being checked; it is not idle at its limit")
         }
     }
@@ -1177,8 +1177,9 @@ function Invoke-Failover {
     $seen = Get-PaneLimit $text $saved
     $lock = Join-Path $Checkout '.git\index.lock'
     if (-not (Test-ShellReady $text)) {
-        if ($seen.kind -ne 'limited') {
-            throw [ImplementerConflict]::new("failover refused: the $saved pane is neither showing its own usage-limit message nor at a shell prompt")
+        # Codex's warning chooser (#61) is as final as its limit: the chooser waits, nobody answers it.
+        if ($seen.kind -notin @('limited', 'warning')) {
+            throw [ImplementerConflict]::new("failover refused: the $saved pane is neither showing its own usage-limit message or warning chooser nor at a shell prompt")
         }
         Confirm-PaneStable $Checkout $pane $saved $seen
         if (Test-Path -LiteralPath $lock) {
@@ -1210,7 +1211,9 @@ function Invoke-Failover {
     } else { $incomplete = 'failover could not switch' }
     $line = $seen.line
     if (-not $line) { $line = '(the pane was already at a shell prompt)' }
-    Set-ImplementerLimit $Checkout $saved ([pscustomobject]@{ at = [DateTime]::UtcNow.ToString('o'); line = $line })
+    $kind = $seen.kind
+    if (-not $kind) { $kind = 'limited' }
+    Set-ImplementerLimit $Checkout $saved ([pscustomobject]@{ at = [DateTime]::UtcNow.ToString('o'); line = $line; kind = $kind })
     # The old tool's limit text must not greet the new agent: its relay would read it as its own.
     Invoke-Ctl session type "Clear-Host`n" --target $pane | Out-Null
     if (-not (Wait-ShellPrompt -Pane $pane -TimeoutSeconds $script:FailoverTiming.ShellWait -Adopted)) {
