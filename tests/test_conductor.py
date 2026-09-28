@@ -1107,6 +1107,18 @@ class CloseBackstop(unittest.TestCase):
         self.assertIn(('close', self.PLANNER), self.actions)
         self.assertEqual(2, self.member(7)['closedAt'])
 
+    def test_relay_completed_no_pr_close_is_not_rearmed_without_backstop_history(self):
+        with self.store.transaction() as data:
+            data['members'][0].update(state='closed', phase='closed', pr=None, reason='already fixed')
+        q.atomic_json(self.state / 'relay.json', {'branch': 'issue-7'})
+        q.atomic_json(self.state / 'loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 1})
+        self.relay_gone()
+        self.run_for(1000)
+        self.assertNotIn('close_pending', q.read_json(self.state / 'relay.json'))
+        self.assertNotIn('closePending', self.member(7))
+        self.assertNotIn(7, self.w.closes)
+        self.assertEqual([], self.actions)
+
     def test_closed_no_pr_backstop_closes_and_starts_cleanup(self):
         with self.store.transaction() as data:
             data['members'][0].update(state='closed', phase='closed', pr=None, reason='duplicate')

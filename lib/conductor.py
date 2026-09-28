@@ -1034,9 +1034,9 @@ class Worker:
                     done = read_json(hub_dir / 'state' / 'loop-done.json')
                     at = done.get('at') if isinstance(done, dict) else None
                     last = m.get('closedAt')
-                    last = last if type(last) in (int, float) else float('-inf')
                     if (isinstance(done, dict) and done.get('noPr') is True and done.get('pr') is None
-                            and str(done.get('issue')) == str(number) and type(at) in (int, float)
+                            and str(done.get('issue')) == str(number) and type(last) in (int, float)
+                            and type(at) in (int, float)
                             and at > last and not closer.relay_alive(data['repo'], str(number), agw.tree())):
                         relay_state['close_pending'] = closer.NO_PR
                         relay_state['close_merged_at'] = datetime.fromtimestamp(at, timezone.utc).isoformat()
