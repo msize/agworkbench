@@ -123,6 +123,12 @@ class QueueReports(unittest.TestCase):
         self.assertIn('loop-state done --no-pr --reason', text)
         self.assertIn('loop-state blocked --reason "no-op: <evidence>; close the issue to finish"', text)
         self.assertIn('wb.py status blocked --sound', text)
+        # #61: the warning chooser fails over like the hard limit; blocks the human cannot answer keep the slot.
+        limits = text.split('## Usage limits')[1].split('## Stall pointers')[0]
+        self.assertIn('`limited` or `warning`', limits)
+        self.assertNotIn('never answer it. Tell the human', limits)
+        self.assertIn('loop-state blocked --environmental', limits)
+        self.assertIn('loop-state blocked --environmental', text.split('## Queue mode')[1].split('## The channel')[0])
 
     def test_no_pr_requires_a_closed_issue_and_publishes_queue_completion(self):
         (self.state / 'waiting.json').write_text('{}', encoding='utf-8')
@@ -1344,7 +1350,7 @@ class UsageLimitProse(unittest.TestCase):
                        'Exit 2 means nothing was stopped', 'wb.py" handover',
                        'subject `HANDOVER`', 'uncommitted changes are the previous implementer',
                        'refused** (exit 2, ', 'status blocked --sound', '-Implementer <tool>',
-                       'never answer it', 'failover=false', 'only a record', 'never types into the limited agent']:
+                       'Never answer the chooser: fail over', 'failover=false', 'only a record', 'never types into the limited agent']:
             self.assertIn(needle, section)
 
     def test_both_implementers_know_handover(self):

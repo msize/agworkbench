@@ -110,9 +110,12 @@ consecutive reads, it mails you from `relay` with the subject `usage limit: <box
 The mail carries the matched line and the pane's last rows. It also sets that pane blocked, with a
 desktop notification. It stops ringing a limited implementer: mail to it waits.
 
-- **The implementer is `limited`, and `wb.py settings` says `failover=true`** (the default):
+- **The implementer is `limited` or `warning`, and `wb.py settings` says `failover=true`** (the
+  default). A `warning` is Codex's "Approaching rate limits" chooser, which Codex shows when it has
+  less than 10% of its limit left. Never answer the chooser: fail over exactly as for the hard limit.
   1. Check the frame in the mail. The matched line must be the agent's own limit message at the end
-     of its pane, not text it printed from a file, a diff or a test.
+     of its pane, or the chooser at the bottom of its pane where its composer would be. It must not
+     be text the agent printed from a file, a diff or a test.
   2. Fail over. The command may take up to two minutes while it checks that the pane is idle, so
      run it through Bash with `timeout: 600000`. Your shell is Git Bash, which only finds the
      launcher by its full name, `github-workbench.cmd`:
@@ -134,15 +137,16 @@ desktop notification. It stops ringing a limited implementer: mail to it waits.
        and commit them".
   4. Tell the human in one line which tool was stopped and which took over.
 - **`-Failover` refused** (exit 2, `Implementer switch refused: failover refused: ...`): tell the
-  human the refusal line and set `wb.py status blocked --sound`. Exit 2 means nothing was stopped
+  human the refusal line and set `wb.py status blocked --sound` (in queue mode, first
+  `wb.py loop-state blocked --environmental --reason "<the refusal line>"`). Exit 2 means nothing was stopped
   and nothing changed. A tool with a recorded limit is never switched back to automatically: the
   human clears it with `github-workbench <issue> -Implementer <tool>` once its limit has reset.
 - **`-Failover` stopped the agent but did not switch** (exit 3, `Failover incomplete: ...`): the
-  limited agent may be gone, and its limit is recorded. Tell the human the line and set blocked. They
+  limited agent may be gone, and its limit is recorded. Tell the human the line and set blocked
+  (in queue mode, with `--environmental`). They
   relaunch with `github-workbench <issue> -Implementer <other tool>` once the pane is a clean shell.
-- **`warning`** (Codex's "Approaching rate limits" chooser): never answer it. Tell the human in one
-  line and set blocked.
-- **`failover=false`**: tell the human and set blocked.
+- **`failover=false`**: tell the human and set blocked. In queue mode, first report
+  `wb.py loop-state blocked --environmental --reason "<tool> limited; failover is off"`.
 - **Box `claude`** (you): this mail is only a record; the human was already notified. Carry on
   when you can act again.
 
@@ -194,6 +198,11 @@ durable report for the conductor. Never edit the global queue file or start anot
 When a human answers a blocked issue, run `wb.py loop-state resumed` before continuing. Keep the
 same conversation and the one-background-waiter rule. A PR is the queue's handoff, not permission
 to merge. The conductor admits the next issue while this session continues handling its own review.
+
+A block the human cannot answer - a usage limit you could not fail over, low disk or low memory -
+is **environmental**: report it with `wb.py loop-state blocked --environmental --reason "..."`. The
+member keeps its queue slot, so the conductor does not start another issue on the same broken
+tool. A question for the human is a plain `loop-state blocked` and frees the slot.
 
 ## The channel
 
