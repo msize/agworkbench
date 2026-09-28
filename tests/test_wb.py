@@ -50,6 +50,27 @@ class QueueReports(unittest.TestCase):
         self.assertIsNone(report['reason'])
         self.assertEqual([], list(self.state.glob('*.tmp')))
 
+    def test_live_reports_disarm_only_a_no_pr_completion(self):
+        path = self.state / 'loop-done.json'
+        for state, pr in (('resumed', None), ('pr-open', 'https://github.com/o/r/pull/2')):
+            self.q.atomic_json(path, {'noPr': True, 'pr': None, 'issue': 1, 'at': 1})
+            self.assertEqual(0, self.report(state, pr=pr))
+            self.assertFalse(path.exists())
+            self.assertTrue((self.state / 'loop-done-refused.json').exists())
+            self.q.atomic_json(path, {'pr': 2, 'sha': 'abc'})
+            self.assertEqual(0, self.report(state, pr=pr))
+            self.assertEqual(2, self.q.read_json(path)['pr'])
+            path.unlink()
+
+    def test_refused_no_pr_record_is_replaced_only_when_timestamp_matches(self):
+        path = self.state / 'loop-done.json'
+        self.q.atomic_json(path, {'noPr': True, 'pr': None, 'issue': 1, 'at': 2})
+        self.assertFalse(self.q.retire_no_pr_done(path, expected_at=1, issue=1))
+        self.assertEqual(2, self.q.read_json(path)['at'])
+        self.assertTrue(self.q.retire_no_pr_done(path, expected_at=2, issue=1))
+        self.assertFalse(path.exists())
+        self.assertEqual(2, self.q.read_json(self.state / 'loop-done-refused.json')['at'])
+
     def test_invalid_state_url_reason_or_identity_does_not_publish(self):
         for state, pr, reason in [('bad', None, None), ('pr-open', None, None),
                                   ('pr-open', 'https://github.com/other/repo/pull/1', None),

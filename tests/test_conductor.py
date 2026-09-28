@@ -140,9 +140,16 @@ class QueueCase(unittest.TestCase):
         self.report(1, 'closed', reason='duplicate')
         worker.tick()
         self.assertEqual('closed', self.member(1)['state'])
+        with self.store.transaction() as data:
+            data['members'][0].update(closePending=True, closeStuck=q.RELAY_ALIVE)
+        worker.closes[1] = {'since': self.now, 'attempt': None}
         self.report(1, 'resumed')
         worker.tick()
         self.assertEqual('active', self.member(1)['state'])
+        self.assertNotIn('closePending', self.member(1))
+        self.assertNotIn('closeStuck', self.member(1))
+        self.assertNotIn(1, worker.closes)
+        self.assertTrue(q.finished(self.store.load()))
 
     def test_parallel_blocked_resumed_and_failed_members_release_slots(self):
         self.start(parallel=2)
@@ -1007,6 +1014,8 @@ class CloseBackstop(unittest.TestCase):
         self.assertIn('NOT closing: issue #7 was reopened',
                       (self.state / 'relay-close.log').read_text(encoding='utf-8'))
         self.assertNotIn('close_pending', q.read_json(self.state / 'relay.json'))
+        self.assertFalse((self.state / 'loop-done.json').exists())
+        self.assertTrue((self.state / 'loop-done-refused.json').exists())
 
     def test_closed_no_pr_backstop_closes_and_starts_cleanup(self):
         with self.store.transaction() as data:
@@ -1068,6 +1077,8 @@ class CloseBackstop(unittest.TestCase):
         self.run_for(950)
         self.assertEqual([], self.actions)
         self.assertIn('an open PR exists', self.member(7)['closeStuck'])
+        self.assertFalse((self.state / 'loop-done.json').exists())
+        self.assertTrue((self.state / 'loop-done-refused.json').exists())
 
     def test_unreadable_final_open_pr_list_blocks_no_pr_backstop(self):
         with self.store.transaction() as data:

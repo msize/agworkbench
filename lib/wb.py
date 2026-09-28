@@ -178,9 +178,11 @@ def cmd_loop_state(args: argparse.Namespace) -> int:
         if code == 0:
             set_waiting(checkout(), False)
         return code
-    from conductor import write_loop_state
+    from conductor import retire_no_pr_done, write_loop_state
     try:
         write_loop_state(checkout(), args.state, args.pr, args.reason)
+        if args.state in ('resumed', 'pr-open'):
+            retire_no_pr_done(checkout() / '.workbench/state/loop-done.json')
         if args.state == 'resumed':
             set_waiting(checkout(), False)
         return 0
@@ -883,8 +885,9 @@ def loop_done(root: Path, pr: str | None, sha: str | None) -> int:
     record = {"pr": int(str(pr).rsplit("/", 1)[-1]), "sha": sha,
               "followUps": [item["url"] for item in items], "at": time.time()}
     path = root / ".workbench" / "state" / "loop-done.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+    from conductor import Lock, atomic_json
+    with Lock(path.with_name('loop-done.lock')):
+        atomic_json(path, record)
     print(f"loop done: PR #{record['pr']}; {len(items)} follow-up(s)")
     return 0
 
@@ -944,8 +947,9 @@ def loop_done_no_pr(root: Path, reason: str | None, pr: str | None = None) -> in
                   followUps=[item['url'] for item in items], at=time.time())
     path = root / '.workbench/state/loop-done.json'
     try:
-        from conductor import atomic_json
-        atomic_json(path, record)
+        from conductor import Lock, atomic_json
+        with Lock(path.with_name('loop-done.lock')):
+            atomic_json(path, record)
     except OSError as err:
         print(f'wb: loop-state done --no-pr: cannot record completion: {err}', file=sys.stderr)
         return 2

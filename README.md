@@ -405,15 +405,18 @@ The boundary survives same-branch restarts, resets on a branch change, and is in
 same way when upgrading state that has no boundary.
 
 OPEN observation also survives restarts: if that PR finishes while the relay is offline, its
-merge or closure still ends the loop after the final notices drain. Once those notices and
-status resets are resolved, the PR is retired. Each run exits after its current watched PR
-finishes; if several eligible PRs finished between polls, the newest by creation time (then PR number) is handled
-first and the others remain available on restart. Pending final notices from older relay
-versions are also drained once for compatibility.
+merge or closure still gets final notices and a drain. Once those notices and status resets are
+resolved, the PR is retired. A MERGED PR ends the relay run and starts the autonomous close. A
+CLOSED unmerged PR leaves the same relay watching for another PR or a later no-PR completion. If
+several eligible PRs finished between polls, the newest by creation time (then PR number) is
+handled first; the remaining PRs can be found on subsequent polls after a CLOSED PR, or on restart
+after a MERGED PR. Pending final notices from older relay versions are also drained once for
+compatibility.
 
 When a newer open PR appears, the relay checks the previous PR before switching. If the watched
-PR has finished, the relay drains its terminal notices and exits; the newer PR waits for the next
-run. Otherwise, it logs that the unresolved watch was superseded. PR events are saved in an outbox
+PR has finished, the relay drains its terminal notices. After a MERGED PR it exits and the newer
+PR waits for the next run. After a CLOSED unmerged PR it keeps running and can watch the newer PR.
+Otherwise, it logs that the unresolved watch was superseded. PR events are saved in an outbox
 with IDs derived from GitHub event identities before publication. A restart
 replays that outbox without overwriting existing mail or resurrecting mail already read or
 archived, then resumes normal delivery and final-notice draining. Publication errors are logged

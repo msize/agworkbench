@@ -97,6 +97,22 @@ def read_json(path):
     return json.loads(Path(path).read_text(encoding='utf-8-sig'))
 
 
+def retire_no_pr_done(path, *, expected_at=..., issue=None):
+    """Preserve a refused no-PR latch only if it is still the record this close saw."""
+    path = Path(path)
+    with Lock(path.with_name('loop-done.lock')):
+        try:
+            done = read_json(path)
+        except (OSError, ValueError):
+            return False
+        if (not isinstance(done, dict) or done.get('noPr') is not True or done.get('pr') is not None
+                or (issue is not None and str(done.get('issue')) != str(issue))
+                or (expected_at is not ... and done.get('at') != expected_at)):
+            return False
+        os.replace(path, path.with_name('loop-done-refused.json'))
+        return True
+
+
 def repo_name(value):
     if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*', value):
         raise UsageError(f'invalid repository: {value!r}')
@@ -692,6 +708,10 @@ def apply_loop(data, member, path):
         if member.get('pr') != report['pr']:
             member.update(pr=report['pr'], prState=None)
     state = 'active' if report['state'] == 'resumed' else report['state']
+    if member['state'] in {'closed', 'merged'} and state not in {'closed', 'merged'}:
+        # This is a live loop again; no prior close attempt or stuck reason applies.
+        member.pop('closePending', None)
+        member.pop('closeStuck', None)
     member.update(phase=state, state=state, reason=report.get('reason'), consumedLoop=loop, consumedRev=report['rev'])
     if state == 'closed':
         member.update(pr=None, prState=None)
@@ -994,6 +1014,7 @@ class Worker:
         data = self.store.load()
         for m in data['members']:
             if m['state'] not in {'merged', 'closed'}:
+                self.closes.pop(m['number'], None)
                 continue
             number = m['number']
             key = close_key(m)
@@ -1035,6 +1056,7 @@ class Worker:
         if watch['attempt'] is None:
             watch.pop('issue_result', None)
             watch.pop('next_issue_check', None)
+            watch.pop('no_pr_at', None)
             registry = read_json(hub_dir / 'state' / 'agents.json')['agents']
             peers = [types.SimpleNamespace(box=box, tool=registry[box].get('tool', box), pane=registry[box]['pane'])
                      for box in ('claude', 'codex')]
@@ -1047,22 +1069,50 @@ class Worker:
                 # member would let the conductor finish in the middle of this attempt.
                 self.mark(number, closeStuck=None)
         attempt = watch['attempt']
-        def refuse(reason, *, stuck=None):
+        def refuse(reason, *, stuck=None, live_loop=False):
             attempt.log(f'NOT closing: {reason}')
             self.notify(f'#{number}: autonomous close stopped: {reason}')
+            if live_loop:
+                if retire_no_pr_done(hub_dir / 'state' / 'loop-done.json',
+                                     expected_at=watch.get('no_pr_at'), issue=number):
+                    attempt.log('preserved refused no-PR completion as loop-done-refused.json')
             self.end_close(m, pr, hub_dir, stuck=stuck or reason)
 
+        def no_pr_preclose():
+            """A fresh issue and branch-PR gate: (reason, wait for an unknown result)."""
+            closed, detail = attempt.issue_closed(self.gh)
+            watch['issue_result'] = (closed, detail)
+            watch['next_issue_check'] = self.clock() + CLOSE_ISSUE_CHECK_INTERVAL
+            if closed is False:
+                return f'issue #{number} was reopened', False
+            if closed is None:
+                return f'issue state unknown: {detail}', True
+            relay_state = read_json(hub_dir / 'state' / 'relay.json')
+            branch = relay_state.get('branch')
+            open_pr, detail = attempt.open_prs(self.gh, branch)
+            if open_pr is True:
+                return detail, False
+            if open_pr is None:
+                watch['issue_result'] = (None, detail)
+                return detail, True
+            current_done = attempt.no_pr_done_record()
+            if current_done is None or current_done.get('at') != watch.get('no_pr_at'):
+                return 'no-PR completion changed during the close', False
+            return None, False
+
         if pr is None:
-            if not attempt.no_pr_done():
+            done_record = attempt.no_pr_done_record()
+            if done_record is None:
                 if attempt.timed_out():
                     refuse('the planner has not recorded `wb.py loop-state done --no-pr`')
                 return
+            watch.setdefault('no_pr_at', done_record.get('at'))
             if self.clock() >= watch.get('next_issue_check', 0):
                 watch['issue_result'] = attempt.issue_closed(self.gh)
                 watch['next_issue_check'] = self.clock() + CLOSE_ISSUE_CHECK_INTERVAL
             closed, detail = watch['issue_result']
             if closed is False:
-                refuse(f'issue #{number} was reopened')
+                refuse(f'issue #{number} was reopened', live_loop=True)
                 return
             if closed is None:
                 if attempt.timed_out():
@@ -1073,34 +1123,10 @@ class Worker:
         if not reasons or attempt.overdue_ok():
             if attempt.autonomous():
                 if pr is None:
-                    closed, detail = attempt.issue_closed(self.gh)
-                    watch['issue_result'] = (closed, detail)
-                    watch['next_issue_check'] = self.clock() + CLOSE_ISSUE_CHECK_INTERVAL
-                    if closed is not True:
-                        if closed is False:
-                            refuse(f'issue #{number} was reopened')
-                        elif attempt.timed_out():
-                            refuse(f'issue state unknown: {detail}')
-                        return
-                    relay_state = read_json(hub_dir / 'state' / 'relay.json')
-                    branch = relay_state.get('branch')
-                    if not isinstance(branch, str) or closer.issue_from_branch(branch) != str(number):
-                        detail = 'issue branch unavailable'
-                        prs = None
-                    else:
-                        try:
-                            prs = self.gh('pr', 'list', '--repo', data['repo'], '--head', branch,
-                                          '--state', 'open', '--json', 'number')
-                            detail = 'open PR list unavailable'
-                        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as err:
-                            prs, detail = None, f'open PR list unavailable: {err}'
-                    if isinstance(prs, list) and prs:
-                        refuse(f'an open PR exists for {branch}')
-                        return
-                    if not isinstance(prs, list):
-                        watch['issue_result'] = (None, detail)
-                        if attempt.timed_out():
-                            refuse(detail)
+                    reason, wait = no_pr_preclose()
+                    if reason:
+                        if not wait or attempt.timed_out():
+                            refuse(reason, live_loop=not wait)
                         return
                 attempt.close_issue_session()
                 attempt.start_cleanup(pr)

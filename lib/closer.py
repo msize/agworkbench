@@ -187,6 +187,19 @@ class Closer:
         except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as err:
             return None, str(err)
 
+    def open_prs(self, gh, branch: str) -> tuple[bool | None, str]:
+        """Whether this branch has an open PR; an unreadable list is unknown, never empty."""
+        if not branch or issue_from_branch(branch) != self.issue:
+            return None, 'issue branch unavailable'
+        try:
+            prs = gh('pr', 'list', '--repo', self.repo, '--head', branch,
+                     '--state', 'open', '--json', 'number')
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as err:
+            return None, f'open PR list unavailable: {err}'
+        if not isinstance(prs, list) or not all(isinstance(pr, dict) and type(pr.get('number')) is int for pr in prs):
+            return None, 'open PR list unavailable'
+        return bool(prs), f'an open PR exists for {branch}' if prs else 'no open PR'
+
     def settle(self, pane: str, text: str) -> str | None:
         """None once the pane's tail has been unchanged for CLOSE_SETTLE seconds, else the reason."""
         tail = limits.tail_hash(text)
@@ -265,13 +278,16 @@ class Closer:
         return f'pane {state}' if state else None
 
     # --- the agents and the issue session -----------------------------------------------------
-    def no_pr_done(self) -> bool:
+    def no_pr_done_record(self) -> dict | None:
         try:
             done = json.loads((self.hub_dir / 'state' / 'loop-done.json').read_text(encoding='utf-8-sig'))
         except (OSError, ValueError):
-            return False
-        return (isinstance(done, dict) and done.get('noPr') is True and done.get('pr') is None
-                and str(done.get('issue')) == str(self.issue))
+            return None
+        return done if (isinstance(done, dict) and done.get('noPr') is True and done.get('pr') is None
+                        and str(done.get('issue')) == str(self.issue)) else None
+
+    def no_pr_done(self) -> bool:
+        return self.no_pr_done_record() is not None
 
     def agent_blockers(self, number: int | None) -> list[str]:
         """What still stops the issue-session close. Empty only when the loop is provably over. Keeps

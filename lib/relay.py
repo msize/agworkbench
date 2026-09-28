@@ -987,6 +987,21 @@ class Relay:
         if not handed:
             self.finish_close()
 
+    def resume_no_pr_loop(self, close: "closer.Closer", reason: str, expected_at) -> bool:
+        """Disarm the refused done record before returning to the live doorbell loop."""
+        import conductor
+        try:
+            retired = conductor.retire_no_pr_done(
+                self.hub_dir / 'state' / 'loop-done.json', expected_at=expected_at, issue=close.issue)
+        except OSError as err:
+            close.log(f'could not retire refused no-PR completion: {err}')
+            self.refuse_close(close, None, reason, handoff=False)
+            return True
+        if retired:
+            close.log('preserved refused no-PR completion as loop-done-refused.json')
+        self.refuse_close(close, None, reason, handoff=False)
+        return False
+
     def close_after_merge(self, number: int | None) -> bool:
         """After a merged PR drain, or a no-PR done record on a CLOSED issue: close the issue's
         helpers as soon as each is proven done and untouched (#33), the issue session only when both
@@ -1010,6 +1025,8 @@ class Relay:
         next_issue_check = 0.0
         issue_verified = False
         issue_detail = ''
+        no_pr_at = None
+        saw_no_pr_done = False
         while True:
             if self.stop_file.exists():
                 # The launcher is restarting this relay; the pending close resumes after it.
@@ -1019,21 +1036,32 @@ class Relay:
             self.flush_outbox()
             self.deliver_mail()
             if number is None:
-                if not close.no_pr_done():
+                done_record = close.no_pr_done_record()
+                if done_record is None:
+                    try:
+                        loop = json.loads((self.hub_dir / 'state' / 'loop.json').read_text(encoding='utf-8-sig'))
+                    except (OSError, ValueError):
+                        loop = {}
+                    if saw_no_pr_done or (isinstance(loop, dict) and loop.get('state') in ('resumed', 'pr-open')):
+                        close.log('no-PR completion was withdrawn; the relay resumes watching')
+                        self.finish_close()
+                        return False
                     reason = 'the planner has not recorded `wb.py loop-state done --no-pr`'
                     if close.timed_out():
                         self.refuse_close(close, number, reason)
                         return True
                     pause(self.mail_interval)
                     continue
+                saw_no_pr_done = True
+                if no_pr_at is None:
+                    no_pr_at = done_record.get('at')
                 if now() >= next_issue_check:
                     closed, detail = close.issue_closed(gh_call)
                     next_issue_check = now() + self.pr_interval
                     issue_verified = closed is True
                     issue_detail = detail
                     if closed is False:
-                        self.refuse_close(close, number, f'issue #{close.issue} was reopened', handoff=False)
-                        return False
+                        return self.resume_no_pr_loop(close, f'issue #{close.issue} was reopened', no_pr_at)
                 if not issue_verified:
                     if close.timed_out():
                         self.refuse_close(close, number, f'issue state unknown: {issue_detail}')
@@ -1051,8 +1079,7 @@ class Relay:
                 if number is None:
                     closed, detail = close.issue_closed(gh_call)
                     if closed is False:
-                        self.refuse_close(close, number, f'issue #{close.issue} was reopened', handoff=False)
-                        return False
+                        return self.resume_no_pr_loop(close, f'issue #{close.issue} was reopened', no_pr_at)
                     if closed is None:
                         issue_verified = False
                         issue_detail = detail
@@ -1062,20 +1089,23 @@ class Relay:
                             return True
                         pause(self.mail_interval)
                         continue
-                    prs = gh_json(['pr', 'list', '--repo', self.repo, '--head', self.branch,
-                                   '--state', 'open', '--json', 'number'])
-                    if isinstance(prs, list) and prs:
-                        self.refuse_close(close, number, f'an open PR exists for {self.branch}', handoff=False)
-                        return False
-                    if not isinstance(prs, list):
+                    open_pr, detail = close.open_prs(gh_call, self.branch)
+                    if open_pr is True:
+                        return self.resume_no_pr_loop(close, detail, no_pr_at)
+                    if open_pr is None:
                         issue_verified = False
-                        issue_detail = 'open PR list unavailable'
+                        issue_detail = detail
                         next_issue_check = now() + self.pr_interval
                         if close.timed_out():
-                            self.refuse_close(close, number, issue_detail)
+                            self.refuse_close(close, number, detail)
                             return True
                         pause(self.mail_interval)
                         continue
+                    current_done = close.no_pr_done_record()
+                    if current_done is None or current_done.get('at') != no_pr_at:
+                        close.log('no-PR completion changed during the close; the relay resumes watching')
+                        self.finish_close()
+                        return False
                 break
             if close.timed_out():
                 self.refuse_close(close, number, f"still waiting after {closer.CLOSE_WAIT:.0f}s: " + '; '.join(reasons))
@@ -1435,12 +1465,9 @@ class Relay:
             at = datetime.fromtimestamp(done['at'], timezone.utc).isoformat()
         except (OSError, ValueError, OverflowError, KeyError, TypeError):
             return None
-        prs = gh_json(['pr', 'list', '--repo', self.repo, '--head', self.branch, '--state', 'open', '--json', 'number'])
-        if not isinstance(prs, list):
-            self.log(f'cannot check open PRs for {self.branch}; no-PR close waits')
-            return None
-        if prs:
-            self.log(f'an open PR exists for {self.branch}; no-PR close waits')
+        open_pr, detail = close.open_prs(gh_call, self.branch)
+        if open_pr is not False:
+            self.log(f'{detail}; no-PR close waits')
             return None
         closed, detail = close.issue_closed(gh_call)
         if closed is False:

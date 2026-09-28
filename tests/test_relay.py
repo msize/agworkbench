@@ -2239,6 +2239,8 @@ class AutonomousClose(unittest.TestCase):
         watch.assert_called()
         self.assertNotIn(self.PLANNER, self.closes())
         self.assertNotIn('close_pending', self.r.state)
+        self.assertFalse((self.state / 'loop-done.json').exists())
+        self.assertTrue((self.state / 'loop-done-refused.json').exists())
 
     def test_unreadable_final_open_pr_list_blocks_issue_close(self):
         self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 1})
@@ -2299,6 +2301,41 @@ class AutonomousClose(unittest.TestCase):
             self.assertEqual(0, self.r.run())
         watch.assert_called()
         self.assertEqual([], self.closes())
+        self.assertNotIn('close_pending', self.r.state)
+        self.assertFalse(self.r.closer().no_pr_done())
+        self.assertFalse((self.state / 'loop-done.json').exists())
+        self.assertTrue((self.state / 'loop-done-refused.json').exists())
+        self.assertNotIn('the loop is done', self.r.stall.exemptions([]))
+        with patch.object(relay, 'gh_json', return_value={'state': 'CLOSED'}) as gh:
+            self.assertIsNone(self.r.no_pr_close_due())
+            gh.assert_not_called()
+        self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 2})
+        with patch.object(relay, 'gh_json', side_effect=lambda args: [] if args[:2] == ['pr', 'list']
+                          else {'state': 'CLOSED'}):
+            self.assertIsNotNone(self.r.no_pr_close_due())
+
+    def test_withdrawn_no_pr_done_during_wait_returns_to_pr_watching(self):
+        self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 1})
+        def withdraw(seconds):
+            self.advance(seconds)
+            (self.state / 'loop-done.json').unlink(missing_ok=True)
+        with patch.object(relay, 'pause', side_effect=withdraw), \
+                patch.object(relay, 'gh_json', side_effect=lambda args: [] if args[:2] == ['pr', 'list']
+                             else {'state': 'CLOSED'}):
+            self.assertFalse(self.r.close_after_merge(None))
+        self.assertEqual(5, self.t)
+        self.assertNotIn(self.PLANNER, self.closes())
+
+    def test_restarted_pending_no_pr_close_with_resumed_report_watches_prs(self):
+        self.write('loop.json', {'state': 'resumed'})
+        self.r.state['close_pending'] = 'no-pr'
+        self.write('relay.json', self.r.state)
+        self.r.stop_file = SimpleNamespace(exists=lambda: self.t >= 5)
+        with patch.object(self.r, 'watch_pr', return_value=False) as watch, \
+                patch.object(relay, 'gh_json') as gh:
+            self.assertEqual(0, self.r.run())
+        watch.assert_called()
+        gh.assert_not_called()
         self.assertNotIn('close_pending', self.r.state)
 
     def test_no_pr_done_record_is_required_for_no_pr_gate(self):
