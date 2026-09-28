@@ -20,7 +20,7 @@ A limit row starts with the phrase right after the ONE glyph that tool draws its
 with: `⎿` for Claude (a result row, whose parent is checked), `■` for a Codex error cell. An
 agent's own reply (`●` for Claude, `•` for Codex) that happens to begin with the phrase never
 counts, nor does any other prefix (quotes, diffs, code, greps). Codex's warning rows carry `⚠`
-or no glyph, and count only with the chooser on screen.
+or no glyph, and count only above the chooser at the bottom of the pane (#61).
 
   python lib/limits.py classify --tool codex < frame.txt     # prints JSON
 """
@@ -64,6 +64,7 @@ LIMITED = {
 WARNING_CODEX = [r"Approaching rate limits\b", r"Heads up, you have less than \d+% of your \w+ limit left\b",
                  r"Switch to \S+ for lower credit usage\?"]
 CHOOSER_ROW = re.compile(r"^\s*[›>❯]?\s*\d\.\s+(?:Switch to|Keep current model)")
+CHOOSER_HINT = re.compile(r"^\s*Press enter to confirm\b", re.IGNORECASE)
 
 RULE_RE = re.compile(r"^\s*[─━—-]{10,}\s*$")
 CLAUDE_PROMPT_RE = re.compile(r"^\s*[>❯]\s?")
@@ -192,12 +193,26 @@ def _codex(rows: list[str]) -> Limit | None:
 
 
 def _codex_warning(rows: list[str]) -> Limit | None:
-    if not any(CHOOSER_ROW.match(row) for row in rows):
+    """The chooser replaces Codex's composer, so it counts only at the bottom of the pane (#61): the
+    last row is an option or the confirm hint, the options run up from there, and a warning row sits
+    above them before any other cell or tool output. A dump of the chooser in history has the
+    composer and its footer below it."""
+    filled = [row for row in rows if row.strip()]
+    end = len(filled)
+    if end and CHOOSER_HINT.match(filled[-1]):
+        end -= 1
+    start = end
+    while start and CHOOSER_ROW.match(filled[start - 1]):
+        start -= 1
+    if start == end:
         return None
-    for row in rows:
+    found = None
+    for row in reversed(filled[:start]):
         if _starts_with(row, WARNING_CODEX, WARNING_GLYPH):
-            return Limit("warning", row.strip())
-    return None
+            found = row                # keep climbing: the topmost warning row names the episode
+        elif CODEX_CELL_RE.match(row) or row.strip().startswith(FORBIDDEN_TOOL_OUTPUT):
+            break                      # another history cell or tool output: the chooser ends here
+    return Limit("warning", found.strip()) if found else None
 
 
 def classify(text: str, tool: str) -> Limit | None:

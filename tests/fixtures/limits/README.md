@@ -24,5 +24,8 @@ The layout around each row is **constructed**, not captured, from the shapes in 
 - Codex's `›` composer and `•`/`└` history cells.
 
 The Codex warning chooser (`codex-warning-chooser.txt`) quotes the rows the planner captured from
-the real #68 pane on 2026-09-24. When a real limit frame is seen, add it here verbatim and keep the
+the real #68 pane on 2026-09-24. Two frames are cut from it, with no row retyped (#61):
+`codex-warning-chooser-no-heads-up.txt` drops the `⚠` rows (the chooser a fresh pane shows), and
+`codex-warning-chooser-in-tool-output.txt` is the whole frame printed by a `cat` inside Codex, with
+the composer below it - the chooser counts only at the bottom of the pane. When a real limit frame is seen, add it here verbatim and keep the
 constructed one only if it still adds a case.
