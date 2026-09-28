@@ -50,9 +50,31 @@ class QueueReports(unittest.TestCase):
         self.assertIsNone(report['reason'])
         self.assertEqual([], list(self.state.glob('*.tmp')))
 
+    def test_live_reports_disarm_only_a_no_pr_completion(self):
+        path = self.state / 'loop-done.json'
+        for state, pr in (('resumed', None), ('pr-open', 'https://github.com/o/r/pull/2')):
+            self.q.atomic_json(path, {'noPr': True, 'pr': None, 'issue': 1, 'at': 1})
+            self.assertEqual(0, self.report(state, pr=pr))
+            self.assertFalse(path.exists())
+            self.assertTrue((self.state / 'loop-done-refused.json').exists())
+            self.q.atomic_json(path, {'pr': 2, 'sha': 'abc'})
+            self.assertEqual(0, self.report(state, pr=pr))
+            self.assertEqual(2, self.q.read_json(path)['pr'])
+            path.unlink()
+
+    def test_refused_no_pr_record_is_replaced_only_when_timestamp_matches(self):
+        path = self.state / 'loop-done.json'
+        self.q.atomic_json(path, {'noPr': True, 'pr': None, 'issue': 1, 'at': 2})
+        self.assertFalse(self.q.retire_no_pr_done(path, expected_at=1, issue=1))
+        self.assertEqual(2, self.q.read_json(path)['at'])
+        self.assertTrue(self.q.retire_no_pr_done(path, expected_at=2, issue=1))
+        self.assertFalse(path.exists())
+        self.assertEqual(2, self.q.read_json(self.state / 'loop-done-refused.json')['at'])
+
     def test_invalid_state_url_reason_or_identity_does_not_publish(self):
         for state, pr, reason in [('bad', None, None), ('pr-open', None, None),
-                                  ('pr-open', 'https://github.com/other/repo/pull/1', None), ('blocked', None, None)]:
+                                  ('pr-open', 'https://github.com/other/repo/pull/1', None),
+                                  ('blocked', None, None), ('closed', None, None)]:
             self.assertEqual(2, self.report(state, pr, reason))
         with patch.dict(os.environ, CLAUDE_CODE_SESSION_ID=str(uuid.uuid4())):
             self.assertEqual(2, self.report('blocked', reason='x'))
@@ -84,6 +106,69 @@ class QueueReports(unittest.TestCase):
         self.assertIn('Outside queue mode', phase6)
         self.assertIn('loop-state resumed', text)
         self.assertIn('loop-state blocked --reason "mail waiter configuration error"', text)
+        self.assertIn('AGREED: no-op', text)
+        self.assertIn('loop-state done --no-pr --reason', text)
+        self.assertIn('loop-state blocked --reason "no-op: <evidence>; close the issue to finish"', text)
+        self.assertIn('wb.py status blocked --sound', text)
+
+    def test_no_pr_requires_a_closed_issue_and_publishes_queue_completion(self):
+        (self.state / 'waiting.json').write_text('{}', encoding='utf-8')
+        with patch.object(wb.subprocess, 'run', return_value=type('Done', (), {'stdout': 'issue-1-fix'})()), \
+                patch.object(wb, 'gh_json', side_effect=[{'state': 'OPEN', 'stateReason': None}]):
+            self.assertEqual(1, wb.loop_done_no_pr(self.folder, 'duplicate'))
+        self.assertFalse((self.state / 'loop-done.json').exists())
+        self.assertFalse((self.state / 'loop.json').exists())
+        with patch.object(wb.subprocess, 'run', return_value=type('Done', (), {'stdout': 'issue-1-fix'})()), \
+                patch.object(wb, 'gh_json', side_effect=[{'state': 'CLOSED', 'stateReason': 'NOT_PLANNED'}, []]), \
+                patch.object(sys, 'argv', ['wb.py', 'loop-state', 'done', '--no-pr', '--reason', 'duplicate of #2']):
+            self.assertEqual(0, wb.main())
+        done = self.q.read_json(self.state / 'loop-done.json')
+        self.assertEqual((None, True, 1, 'NOT_PLANNED', 'duplicate of #2'),
+                         (done['pr'], done['noPr'], done['issue'], done['stateReason'], done['reason']))
+        self.assertEqual('closed', self.q.read_json(self.state / 'loop.json')['state'])
+        self.assertFalse((self.state / 'waiting.json').exists())
+
+    def test_no_pr_refusals_leave_no_done_record(self):
+        run = patch.object(wb.subprocess, 'run', return_value=type('Done', (), {'stdout': 'issue-1-fix'})())
+        with run:
+            self.assertEqual(2, wb.loop_done_no_pr(self.folder, None))
+            self.assertEqual(2, wb.loop_done_no_pr(self.folder, 'why', '7'))
+            with patch.object(wb, 'gh_json', side_effect=RuntimeError('offline')):
+                self.assertEqual(2, wb.loop_done_no_pr(self.folder, 'why'))
+            with patch.object(wb, 'gh_json', side_effect=[{'state': 'CLOSED'}, [{'number': 7}]]):
+                self.assertEqual(1, wb.loop_done_no_pr(self.folder, 'why'))
+            wb.save_follow_ups(self.folder, [{'key': 'later', 'url': None}])
+            with patch.object(wb, 'gh_json', side_effect=[{'state': 'CLOSED'}, []]):
+                self.assertEqual(1, wb.loop_done_no_pr(self.folder, 'why'))
+            wb.save_follow_ups(self.folder, [])
+            with patch.object(wb, 'gh_json', side_effect=[{'state': 'CLOSED'}, []]), \
+                    patch.object(self.q, 'write_loop_state', side_effect=self.q.QueueError('bad identity')):
+                self.assertEqual(2, wb.loop_done_no_pr(self.folder, 'why'))
+        self.assertFalse((self.state / 'loop-done.json').exists())
+
+    def test_busy_done_lock_reports_queue_report_was_written(self):
+        original_acquire = self.q.Lock.acquire
+        def acquire(lock):
+            if lock.path.name == 'loop-done.lock':
+                raise self.q.QueueError('lock busy')
+            return original_acquire(lock)
+        err = io.StringIO()
+        with patch.object(wb.subprocess, 'run', return_value=type('Done', (), {'stdout': 'issue-1-fix'})()), \
+                patch.object(wb, 'gh_json', side_effect=[{'state': 'CLOSED'}, []]), \
+                patch.object(self.q.Lock, 'acquire', acquire), contextlib.redirect_stderr(err):
+            self.assertEqual(2, wb.loop_done_no_pr(self.folder, 'duplicate'))
+        self.assertEqual('closed', self.q.read_json(self.state / 'loop.json')['state'])
+        self.assertFalse((self.state / 'loop-done.json').exists())
+        self.assertIn('queue report `closed` written; ', err.getvalue())
+        self.assertIn('rerun to record completion', err.getvalue())
+
+    def test_no_pr_works_outside_queue_mode(self):
+        (self.state / 'queue-member.json').unlink()
+        with patch.object(wb.subprocess, 'run', return_value=type('Done', (), {'stdout': 'issue-1-fix'})()), \
+                patch.object(wb, 'gh_json', side_effect=[{'state': 'CLOSED', 'stateReason': 'COMPLETED'}, []]):
+            self.assertEqual(0, wb.loop_done_no_pr(self.folder, 'already fixed'))
+        self.assertTrue((self.state / 'loop-done.json').exists())
+        self.assertFalse((self.state / 'loop.json').exists())
 
 
 class HelperWorkspace(unittest.TestCase):

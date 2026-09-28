@@ -159,8 +159,8 @@ from a list turns watching on. A switch on an append (`-Autonomous`, `-Implement
 waiting. The append prints each such change (`settings: autonomous null -> true`).
 
 A visible, restart-pinned `#queue owner/repo` conductor starts one issue at a time by default
-(`-Parallel 1..8`). Each issue has its own clone, Claude, Codex, and review relay. PR-open or blocked
-releases the initial-work slot immediately. Human-directed fixes on an earlier issue can continue
+(`-Parallel 1..8`). Each issue has its own clone, Claude, Codex, and review relay. A PR-open, blocked,
+or no-PR closed report releases the initial-work slot immediately. Human-directed fixes on an earlier issue can continue
 alongside later issues. Agents never merge or approve PRs. Queue launches preserve focus, and Claude
 does not open revdiff automatically; run `wb.py human-review --base origin/main` in the issue's
 context to open it on demand, or review on GitHub.
@@ -181,6 +181,8 @@ mailing a conductor agent. The conductor reads those reports; each issue's mailb
 background waiter continue to handle human review independently. Queue mode does not attach to
 an existing non-queue workbench loop. Internal `-QueueMember`, `-QueueAttempt`, and `-QueueToken`
 arguments are supplied by the conductor, not ordinary launch commands.
+When a closed issue needs no change, `wb.py loop-state done --no-pr --reason "<why>"` records it as
+`closed`, releases its queue slot, and counts it separately from `merged` in the summary.
 
 Claude's conversation ID, original project directory and pane binding live in
 `.workbench/state/claude.json`. The launcher reserves the ID before starting Claude, so an
@@ -403,15 +405,18 @@ The boundary survives same-branch restarts, resets on a branch change, and is in
 same way when upgrading state that has no boundary.
 
 OPEN observation also survives restarts: if that PR finishes while the relay is offline, its
-merge or closure still ends the loop after the final notices drain. Once those notices and
-status resets are resolved, the PR is retired. Each run exits after its current watched PR
-finishes; if several eligible PRs finished between polls, the newest by creation time (then PR number) is handled
-first and the others remain available on restart. Pending final notices from older relay
-versions are also drained once for compatibility.
+merge or closure still gets final notices and a drain. Once those notices and status resets are
+resolved, the PR is retired. A MERGED PR ends the relay run and starts the autonomous close. A
+CLOSED unmerged PR leaves the same relay watching for another PR or a later no-PR completion. If
+several eligible PRs finished between polls, the newest by creation time (then PR number) is
+handled first; the remaining PRs can be found on subsequent polls after a CLOSED PR, or on restart
+after a MERGED PR. Pending final notices from older relay versions are also drained once for
+compatibility.
 
 When a newer open PR appears, the relay checks the previous PR before switching. If the watched
-PR has finished, the relay drains its terminal notices and exits; the newer PR waits for the next
-run. Otherwise, it logs that the unresolved watch was superseded. PR events are saved in an outbox
+PR has finished, the relay drains its terminal notices. After a MERGED PR it exits and the newer
+PR waits for the next run. After a CLOSED unmerged PR it keeps running and can watch the newer PR.
+Otherwise, it logs that the unresolved watch was superseded. PR events are saved in an outbox
 with IDs derived from GitHub event identities before publication. A restart
 replays that outbox without overwriting existing mail or resurrecting mail already read or
 archived, then resumes normal delivery and final-notice draining. Publication errors are logged
@@ -449,13 +454,14 @@ merges, unless you opted in for that checkout.
 - **Only Minor findings may be deferred.** A Major or blocker review finding stops the merge and
   waits for you, whether it was deferred or ended disputed. Minor and Immaterial ones may be
   deferred as follow-ups. The merge comment lists them all with their severity and issue links.
-- **It closes the sessions.** After a MERGED PR, never a closed one, the relay first closes the
+- **It closes the sessions.** After a MERGED PR, or after a closed issue with a recorded no-PR completion,
+  the relay first closes the
   issue's revmux and review sessions that have finished, each on its own evidence (below), whatever
   the agents are doing; a running revdiff stays open and is named. The issue session and the relay
   itself close only once the planner has recorded `wb.py loop-state done`, the planner has read
   all its mail, and both panes are unchanged for 30 s with empty composers and no
   `.git/index.lock`. The implementer's unread mail works differently (#44). The relay's own
-  `PR #N MERGED` notice and anything sent after the merge, such as the planner's "loop complete"
+  `PR #N MERGED` notice and anything sent after the merge or no-PR done record, such as the planner's "loop complete"
   note, never hold the close. Older unread implementer mail holds it for 10 minutes; then the
   close goes ahead and logs the ids. It only ever touches this repository's workspace. Every step
   goes to `.workbench/state/relay-close.log`. Nothing else is overridden on a timeout: it alerts
@@ -465,6 +471,7 @@ merges, unless you opted in for that checkout.
   left in the repo's workspace, then deletes the clone, but only when it is safe: nothing
   uncommitted, untracked or stashed, no linked worktree, no submodule, no `.git/index.lock`, no launcher or queue
   still using it, and every local commit on a remote-tracking ref or inside the merged PR's head.
+  For a no-PR completion, only remote-tracking refs can vouch for local commits.
   Otherwise the checkout stays and the reason is logged. The delete renames the directory to
   `<name>-issue-<N>.deleting-<ts>` first, which Windows refuses while anything holds a file or its
   cwd inside it. Every decision goes to `<checkoutRoot>/.agworkbench-cleanup.log`; a refusal also
@@ -486,7 +493,7 @@ How the close proves each thing (#33):
   pane showed). A helper closes when its marker exists, no shell is live in its pane, the pane shows
   exactly the marker's rows, and it has been unchanged for 30 s. Helpers close first, even while the
   agents are still busy. A helper session opened the old way, inside a shell, is left for you.
-- **A relay that died or gave up:** the queue's conductor runs the same close for a merged member
+- **A relay that died or gave up:** the queue's conductor runs the same close for a merged or no-PR closed member
   whose close has been pending for 15 minutes and whose `#N relay` session is gone. While that
   relay is still alive, the member is only flagged `closeStuck` in the queue file, because one
   closer at a time. A queue member's relay whose close gives up after its 10-minute wait hands it

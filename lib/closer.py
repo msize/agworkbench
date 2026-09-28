@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""closer - the autonomous close after a merge (#27, #33): one implementation, two callers.
+"""closer - the autonomous close after a merge or closed no-op issue: one implementation, two callers.
 
-The relay runs it after a MERGED PR's final notices are drained. The conductor runs it as a backstop
-for a merged member whose relay has gone (#33). Neither closes on a timeout alone: after CLOSE_WAIT only
-unread pre-merge implementer mail is overridden (#44); every other blocker still refuses.
+The relay runs it after a MERGED PR's final notices are drained or a closed no-op issue is recorded.
+The conductor runs it as a backstop for a terminal member whose relay has gone (#33). Neither closes
+on a timeout alone: after CLOSE_WAIT only unread implementer mail from before the merge or no-PR
+done record is overridden (#44); every other blocker still refuses. No-PR closes require a fresh
+GitHub CLOSED check before touching a helper or issue session.
 
 Stepwise on purpose: `step_helpers()` and `agent_blockers()` each look once and return, keeping
 their evidence (settled pane hashes) in the object, so the relay can loop on them while it keeps
@@ -18,11 +20,12 @@ delivering mail, and the conductor can advance one check per tick without blocki
   (a helper started with a shell, the old way, never qualifies), and it has been unchanged for
   CLOSE_SETTLE seconds. No prompt parsing.
 - The issue session (exactly the two agent panes) closes only when the planner recorded
-  `loop-state done` for this PR, no mail is unread, no .git/index.lock exists, and both agent panes
+  `loop-state done` for this PR or a `done --no-pr` record for this issue, no mail is unread,
+  no .git/index.lock exists, and both agent panes
   are idle with a provably empty composer and unchanged for CLOSE_SETTLE seconds.
 - Mail the implementer never has to act on does not count as unread (#44): the relay's own final
-  notices for this PR (`github-pr<N>-...`), and anything created at or after the merge
-  (`close_merged_at` in relay.json). Other unread implementer mail is a soft blocker: it waits for
+  notices for this PR (`github-pr<N>-...`), and anything created at or after the merge or no-PR done
+  time (`close_merged_at` in relay.json). Other unread implementer mail is a soft blocker: it waits for
   CLOSE_WAIT, and then the close goes ahead and logs the ids.
 """
 
@@ -31,6 +34,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,6 +45,7 @@ import limits
 
 CLOSE_WAIT = 600.0       # how long a close waits for the loop to be provably over (#27)
 CLOSE_SETTLE = 30.0      # a pane must be unchanged this long before it may be closed
+NO_PR = 'no-pr'
 # The helper sessions wb.py opens, after the `#N `: a revmux round, the human's revdiff, a suite (#45).
 HELPER_NAMES = r'revmux r\d+|your review|suite [A-Za-z0-9._-]+'
 
@@ -60,6 +65,14 @@ def parse_time(value) -> datetime | None:
 def issue_from_branch(branch: str) -> str | None:
     match = re.match(r'issue-(\d+)', branch or '')
     return match.group(1) if match else None
+
+
+def pending_key(number: int | None) -> int | str:
+    return NO_PR if number is None else number
+
+
+def pending_number(key: int | str) -> int | None:
+    return None if key == NO_PR else key
 
 
 def filled_rows(text: str) -> list[str]:
@@ -121,7 +134,7 @@ class Closer:
             return 'off'
         return value
 
-    def start_cleanup(self, pr: int) -> None:
+    def start_cleanup(self, pr: int | None) -> None:
         """After the issue session is closed: start the detached after-close (#41), which waits for
         every `#N` session to go and then deletes the checkout if it is safe. Never raises."""
         mode = self.cleanup_mode()
@@ -152,15 +165,40 @@ class Closer:
         self.log(f"closing after {CLOSE_WAIT:.0f}s despite unread implementer mail: {', '.join(self.soft)}")
         return True
 
-    def merge_time(self, number: int) -> datetime | None:
-        """When the PR merged, as the relay recorded it with the pending close; None when unknown."""
+    def merge_time(self, number: int | None) -> datetime | None:
+        """The merge or no-PR done time saved with the pending close; None when unknown."""
         try:
             state = json.loads((self.hub_dir / 'state' / 'relay.json').read_text(encoding='utf-8-sig'))
         except (OSError, ValueError):
             return None
-        if not isinstance(state, dict) or state.get('close_pending') != number:
+        if not isinstance(state, dict) or state.get('close_pending') != pending_key(number):
             return None
         return parse_time(state.get('close_merged_at'))
+
+    def issue_closed(self, gh) -> tuple[bool | None, str]:
+        """A fresh, fail-closed GitHub check shared by relay and conductor."""
+        if not self.issue:
+            return None, 'issue number unknown'
+        try:
+            issue = gh('issue', 'view', str(self.issue), '--repo', self.repo, '--json', 'state')
+            if not isinstance(issue, dict) or issue.get('state') not in ('OPEN', 'CLOSED'):
+                return None, 'invalid issue state'
+            return issue['state'] == 'CLOSED', issue['state']
+        except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as err:
+            return None, str(err)
+
+    def open_prs(self, gh, branch: str) -> tuple[bool | None, str]:
+        """Whether this branch has an open PR; an unreadable list is unknown, never empty."""
+        if not branch or issue_from_branch(branch) != self.issue:
+            return None, 'issue branch unavailable'
+        try:
+            prs = gh('pr', 'list', '--repo', self.repo, '--head', branch,
+                     '--state', 'open', '--json', 'number')
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as err:
+            return None, f'open PR list unavailable: {err}'
+        if not isinstance(prs, list) or not all(isinstance(pr, dict) and type(pr.get('number')) is int for pr in prs):
+            return None, 'open PR list unavailable'
+        return bool(prs), f'an open PR exists for {branch}' if prs else 'no open PR'
 
     def settle(self, pane: str, text: str) -> str | None:
         """None once the pane's tail has been unchanged for CLOSE_SETTLE seconds, else the reason."""
@@ -185,7 +223,7 @@ class Closer:
     def marker_path(self, pane: str) -> Path:
         return self.hub_dir / 'state' / 'helpers' / f'{pane}.done'
 
-    def step_helpers(self) -> list[str]:
+    def step_helpers(self, gate: Callable[[], bool] | None = None) -> list[str]:
         """One look at every helper; closes those proven done and untouched. Returns what stays open."""
         left_open = []
         snapshot = agw.tree()
@@ -205,6 +243,10 @@ class Closer:
                 continue
             if self.dry_run:
                 self.log(f"[dry-run] would close helper {label}")
+                continue
+            if gate is not None and not gate():
+                self.log(f"helper {label} stays open: issue not verified CLOSED")
+                left_open.append(f"{session.get('name')} (issue not verified CLOSED)")
                 continue
             self.log(f"closing helper {label}: done and untouched")
             for pane in panes:
@@ -236,7 +278,18 @@ class Closer:
         return f'pane {state}' if state else None
 
     # --- the agents and the issue session -----------------------------------------------------
-    def agent_blockers(self, number: int) -> list[str]:
+    def no_pr_done_record(self) -> dict | None:
+        try:
+            done = json.loads((self.hub_dir / 'state' / 'loop-done.json').read_text(encoding='utf-8-sig'))
+        except (OSError, ValueError):
+            return None
+        return done if (isinstance(done, dict) and done.get('noPr') is True and done.get('pr') is None
+                        and str(done.get('issue')) == str(self.issue)) else None
+
+    def no_pr_done(self) -> bool:
+        return self.no_pr_done_record() is not None
+
+    def agent_blockers(self, number: int | None) -> list[str]:
         """What still stops the issue-session close. Empty only when the loop is provably over. Keeps
         the split for overdue_ok(): `hard` (every other reason) and `soft` (unread implementer mail ids)."""
         import hub
@@ -246,7 +299,10 @@ class Closer:
             done = json.loads((self.hub_dir / 'state' / 'loop-done.json').read_text(encoding='utf-8-sig'))
         except (OSError, ValueError):
             done = {}
-        if not isinstance(done, dict) or done.get('pr') != number:
+        if number is None:
+            if not self.no_pr_done():
+                hard.append('the planner has not recorded `wb.py loop-state done --no-pr`')
+        elif not isinstance(done, dict) or done.get('pr') != number or done.get('noPr') is True:
             hard.append(f'the planner has not recorded `wb.py loop-state done --pr {number}`')
         inbox = self.hub_dir / 'inbox'
         for path in sorted((inbox / 'claude').glob('*.md')):
@@ -263,9 +319,9 @@ class Closer:
             if sender not in (None, 'claude', 'human', 'github'):
                 continue
             created = parse_time(message.get('created'))
-            if ((sender == 'github' and path.stem.startswith(f'github-pr{number}-'))
+            if ((number is not None and sender == 'github' and path.stem.startswith(f'github-pr{number}-'))
                     or (merged_at is not None and created is not None and created >= merged_at)):
-                # The relay's own final notice, or sent after the merge: nothing the PR still needs.
+                # The relay's final PR notice, or mail after the merge/no-PR done time: no action needed.
                 ignored.append(path.stem)
                 continue
             soft.append(path.stem)

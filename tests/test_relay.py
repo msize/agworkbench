@@ -813,7 +813,7 @@ class GithubLookup(DeliveryFixture):
             self.assertNotIn(53, stored.get('completed_prs', []))
             self.open_pages = [[]]
             self.views[53] = with_(OPEN, number=53, state=ending)
-            self.r.stop_file = SimpleNamespace(exists=lambda: self.t >= 60)
+            self.r.stop_file = SimpleNamespace(exists=lambda: self.t >= 60 and 53 in self.r.state.get('completed_prs', []))
 
             def advance(seconds):
                 self.t += seconds
@@ -1417,7 +1417,7 @@ class GithubLookup(DeliveryFixture):
         first_open = hub.unread('claude')[0]
         self.open_pages = [[]]
         self.views[53].update(state='CLOSED', closedAt='2026-09-24T16:01:00Z')
-        self.r.stop_file = SimpleNamespace(exists=lambda: False)
+        self.r.stop_file = SimpleNamespace(exists=lambda: 53 in self.r.state.get('completed_prs', []))
         self.assertEqual(0, self.r.run())
         self.assertEqual([53], self.r.state['completed_prs'])
         self.restart_from_disk()
@@ -1715,6 +1715,8 @@ class FinalNotices(DeliveryFixture):
         for state in ['MERGED', 'CLOSED']:
             with self.subTest(state=state):
                 self.prepare_final(state)
+                self.r.stop_file = SimpleNamespace(
+                    exists=lambda: state == 'CLOSED' and 7 in self.r.state.get('completed_prs', []))
                 self.r.peers.append(relay.Peer('codex', 'codex', 'codex-pane'))
                 self.unread['codex'] = []
                 self.pane.side_effect = [CLAUDE_RUNNING, CLAUDE_RUNNING, CLAUDE_IDLE]
@@ -2150,6 +2152,236 @@ class AutonomousClose(unittest.TestCase):
         self.assertFalse((self.state / 'helpers' / f'{self.REVMUX}.done').exists())     # its marker is gone
         self.assertGreaterEqual(self.t, closer.CLOSE_SETTLE)                            # panes had to settle
 
+    def test_no_pr_close_uses_the_same_gates_and_cleanup(self):
+        self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 1})
+        with patch.object(relay, 'gh_json', side_effect=lambda args: [] if args[:2] == ['pr', 'list'] else {'state': 'CLOSED'}):
+            self.r.close_after_merge(None)
+        self.assertEqual([self.REVMUX, self.PLANNER, self.RELAY], self.closes())
+        self.assertIn(('cleanup', (self.folder, 'o/repo', '7', None, 'merged')), self.actions)
+
+    def test_run_detects_no_pr_done_and_closes_a_closed_issue(self):
+        self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 1})
+        with patch.object(relay, 'gh_json', side_effect=lambda args: [] if args[:2] == ['pr', 'list'] else {'state': 'CLOSED'}), \
+                patch.object(self.r, 'flush_outbox', return_value=True), \
+                patch.object(self.r, 'deliver_mail'), patch.object(self.r, 'watch_pr', return_value=False), \
+                patch.object(self.r, 'read_panes', return_value={}), \
+                patch.object(self.r, 'check_limits'), patch.object(self.r.stall, 'tick'):
+            self.assertEqual(0, self.r.run())
+        self.assertIn(self.PLANNER, self.closes())
+        self.assertNotIn('close_pending', self.r.state)
+
+    def test_closed_unmerged_pr_can_retire_before_no_pr_done_arrives(self):
+        self.r.state.update(pr=with_(OPEN, state='CLOSED', number=7), seen_open=[7], terminal_mail=[])
+        original_retire = self.r.retire
+        def retire_then_done(number):
+            original_retire(number)
+            self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 1})
+        with patch.object(self.r, 'retire', side_effect=retire_then_done), \
+                patch.object(relay, 'gh_json', side_effect=lambda args: [] if args[:2] == ['pr', 'list'] else {'state': 'CLOSED'}), \
+                patch.object(self.r, 'flush_outbox', return_value=True), patch.object(self.r, 'deliver_mail'), \
+                patch.object(self.r, 'watch_pr', return_value=False), \
+                patch.object(self.r, 'read_panes', return_value={}), \
+                patch.object(self.r, 'check_limits'), patch.object(self.r.stall, 'tick'):
+            self.assertEqual(0, self.r.run())
+        self.assertIn(7, self.r.state['completed_prs'])
+        self.assertIn(self.PLANNER, self.closes())
+        self.assertIn(('cleanup', (self.folder, 'o/repo', '7', None, 'merged')), self.actions)
+
+    def test_no_pr_trigger_requires_a_fresh_empty_open_pr_list(self):
+        for result in ([{'number': 8}], None):
+            self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 1})
+            with self.subTest(result=result), patch.object(relay, 'gh_json', return_value=result) as gh:
+                self.assertIsNone(self.r.no_pr_close_due())
+                gh.assert_called_once()
+            self.assertEqual(result is None, (self.state / 'loop-done.json').exists())
+
+    def test_no_pr_trigger_retires_done_when_issue_reopens(self):
+        self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 1})
+        with patch.object(relay, 'gh_json', side_effect=lambda args: [] if args[:2] == ['pr', 'list']
+                          else {'state': 'OPEN'}):
+            self.assertIsNone(self.r.no_pr_close_due())
+        self.assertFalse(self.r.closer().no_pr_done())
+        self.assertTrue((self.state / 'loop-done-refused.json').exists())
+        self.assertNotIn('the loop is done', self.r.stall.exemptions([]))
+
+    def test_busy_done_lock_does_not_end_live_relay(self):
+        import conductor
+        self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 1})
+        self.r.state['close_pending'] = 'no-pr'
+        with patch.object(conductor.Lock, 'acquire', side_effect=conductor.QueueError('lock busy')):
+            self.assertFalse(self.r.resume_no_pr_loop(self.r.closer(), 'issue #7 was reopened', 1))
+        self.assertNotIn('close_pending', self.r.state)
+        self.assertEqual(1, self.r.state['refused_no_pr_at'])
+        self.assertEqual(1, json.loads((self.state / 'relay.json').read_text())['refused_no_pr_at'])
+        self.assertIn('could not retire refused no-PR completion', self.log())
+        self.r.state['completed_prs'] = [8]  # an unmerged PR was retired; the issue is CLOSED again
+        with patch.object(conductor, 'retire_no_pr_done', side_effect=conductor.QueueError('lock busy')), \
+                patch.object(relay, 'gh_json') as gh:
+            self.assertIsNone(self.r.no_pr_close_due())
+            gh.assert_not_called()
+        self.assertTrue((self.state / 'loop-done.json').exists())
+        self.assertIsNone(self.r.no_pr_close_due())  # the retry retires the stale record
+        self.assertFalse((self.state / 'loop-done.json').exists())
+        self.assertNotIn('refused_no_pr_at', self.r.state)
+        self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 2})
+        with patch.object(relay, 'gh_json', side_effect=lambda args: [] if args[:2] == ['pr', 'list']
+                          else {'state': 'CLOSED'}):
+            self.assertIsNotNone(self.r.no_pr_close_due())
+
+    def test_final_issue_lookup_retries_a_transient_failure(self):
+        self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 1})
+        lookups = iter([{'state': 'CLOSED'}, None, {'state': 'CLOSED'}, {'state': 'CLOSED'}])
+        def lookup(args):
+            return [] if args[:2] == ['pr', 'list'] else next(lookups, {'state': 'CLOSED'})
+        with patch.object(relay, 'gh_json', side_effect=lookup) as gh:
+            self.r.close_after_merge(None)
+        self.assertIn(self.PLANNER, self.closes())
+        self.assertGreaterEqual(gh.call_count, 4)
+
+    def test_ready_helper_stays_open_if_issue_reopens_before_its_close(self):
+        self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 1})
+        self.r.pr_interval = 60
+        issue_calls = [0]
+        def lookup(args):
+            if args[:2] == ['issue', 'view']:
+                issue_calls[0] += 1
+                return {'state': 'CLOSED' if issue_calls[0] == 1 else 'OPEN'}
+            return []
+        with patch.object(relay, 'gh_json', side_effect=lookup):
+            self.assertFalse(self.r.close_after_merge(None))
+        self.assertNotIn(self.REVMUX, self.closes())
+        self.assertNotIn(self.PLANNER, self.closes())
+        self.assertIn('helper #7 revmux r1 (a1) stays open: issue not verified CLOSED', self.log())
+
+    def test_new_open_pr_at_final_gate_keeps_relay_watching(self):
+        self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 1})
+        pr_calls = [0]
+        def lookup(args):
+            if args[:2] == ['pr', 'list']:
+                pr_calls[0] += 1
+                return [] if pr_calls[0] == 1 else [{'number': 8}]
+            return {'state': 'CLOSED'}
+        def stop_after_watch():
+            self.r.stop_file.write_text('stop', encoding='utf-8')
+            return False
+        with patch.object(relay, 'gh_json', side_effect=lookup), \
+                patch.object(self.r, 'flush_outbox', return_value=True), \
+                patch.object(self.r, 'deliver_mail'), patch.object(self.r, 'watch_pr', side_effect=stop_after_watch) as watch, \
+                patch.object(self.r, 'read_panes', return_value={}), \
+                patch.object(self.r, 'check_limits'), patch.object(self.r.stall, 'tick'):
+            self.assertEqual(0, self.r.run())
+        watch.assert_called()
+        self.assertNotIn(self.PLANNER, self.closes())
+        self.assertNotIn('close_pending', self.r.state)
+        self.assertFalse((self.state / 'loop-done.json').exists())
+        self.assertTrue((self.state / 'loop-done-refused.json').exists())
+
+    def test_unreadable_final_open_pr_list_blocks_issue_close(self):
+        self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 1})
+        with patch.object(relay, 'gh_json', side_effect=lambda args: None if args[:2] == ['pr', 'list']
+                          else {'state': 'CLOSED'}):
+            self.assertTrue(self.r.close_after_merge(None))
+        self.assertNotIn(self.PLANNER, self.closes())
+        self.assertGreaterEqual(self.t, closer.CLOSE_WAIT)
+        self.assertIn('open PR list unavailable', self.log())
+
+    def test_failed_handoff_during_no_pr_refusal_is_caught(self):
+        self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 1})
+        self.r.state['close_pending'] = 'no-pr'
+        with patch.object(relay, 'gh_json', return_value=None) as gh, \
+                patch.object(self.r, 'hand_off_close', side_effect=OSError('terminal gone')):
+            self.r.close_after_merge(None)
+        self.assertEqual([], self.closes())
+        self.assertNotIn('close_pending', self.r.state)
+        self.assertLessEqual(gh.call_count, 3)  # the 5-second mail loop does not poll GitHub each time
+
+    def test_run_does_not_start_no_pr_close_for_an_open_issue(self):
+        self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 1})
+        def stop_after_poll():
+            self.r.stop_file.write_text('stop', encoding='utf-8')
+            return False
+        with patch.object(relay, 'gh_json', side_effect=lambda args: [] if args[:2] == ['pr', 'list'] else {'state': 'OPEN'}) as gh, \
+                patch.object(self.r, 'flush_outbox', return_value=True), \
+                patch.object(self.r, 'deliver_mail'), patch.object(self.r, 'watch_pr', side_effect=stop_after_poll), \
+                patch.object(self.r, 'read_panes', return_value={}), \
+                patch.object(self.r, 'check_limits'), patch.object(self.r.stall, 'tick'), \
+                patch.object(self.r, 'close_after_merge') as close:
+            self.assertEqual(0, self.r.run())
+        close.assert_not_called()
+        self.assertTrue(any(call.args[0][:2] == ['issue', 'view'] for call in gh.call_args_list))
+        self.assertEqual([], self.closes())
+        self.assertFalse((self.state / 'loop-done.json').exists())
+
+    def test_reopened_or_unknown_issue_closes_no_helper_or_issue_session(self):
+        self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 1})
+        for result in ({'state': 'OPEN'}, RuntimeError('offline')):
+            with self.subTest(result=result):
+                self.actions.clear()
+                self.t = 0
+                self.r.state['close_pending'] = 'no-pr'
+                self.write('relay.json', self.r.state)
+                with patch.object(relay, 'gh_json', side_effect=result if isinstance(result, Exception) else None,
+                                  return_value=result if isinstance(result, dict) else None):
+                    self.r.close_after_merge(None)
+                self.assertEqual([], self.closes())
+                self.assertEqual([], [a for a in self.actions if a[0] == 'cleanup'])
+
+    def test_restarted_pending_no_pr_close_rechecks_issue(self):
+        self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 1})
+        self.r.state['close_pending'] = 'no-pr'
+        self.write('relay.json', self.r.state)
+        self.r.stop_file = SimpleNamespace(exists=lambda: self.t >= 5)
+        with patch.object(relay, 'gh_json', return_value={'state': 'OPEN'}), \
+                patch.object(self.r, 'watch_pr', return_value=False) as watch:
+            self.assertEqual(0, self.r.run())
+        watch.assert_called()
+        self.assertEqual([], self.closes())
+        self.assertNotIn('close_pending', self.r.state)
+        self.assertFalse(self.r.closer().no_pr_done())
+        self.assertFalse((self.state / 'loop-done.json').exists())
+        self.assertTrue((self.state / 'loop-done-refused.json').exists())
+        self.assertNotIn('the loop is done', self.r.stall.exemptions([]))
+        with patch.object(relay, 'gh_json', return_value={'state': 'CLOSED'}) as gh:
+            self.assertIsNone(self.r.no_pr_close_due())
+            gh.assert_not_called()
+        self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 2})
+        with patch.object(relay, 'gh_json', side_effect=lambda args: [] if args[:2] == ['pr', 'list']
+                          else {'state': 'CLOSED'}):
+            self.assertIsNotNone(self.r.no_pr_close_due())
+
+    def test_withdrawn_no_pr_done_during_wait_returns_to_pr_watching(self):
+        self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 1})
+        def withdraw(seconds):
+            self.advance(seconds)
+            (self.state / 'loop-done.json').unlink(missing_ok=True)
+        with patch.object(relay, 'pause', side_effect=withdraw), \
+                patch.object(relay, 'gh_json', side_effect=lambda args: [] if args[:2] == ['pr', 'list']
+                             else {'state': 'CLOSED'}):
+            self.assertFalse(self.r.close_after_merge(None))
+        self.assertEqual(5, self.t)
+        self.assertNotIn(self.PLANNER, self.closes())
+
+    def test_restarted_pending_no_pr_close_with_resumed_report_watches_prs(self):
+        self.write('loop.json', {'state': 'resumed'})
+        self.r.state['close_pending'] = 'no-pr'
+        self.write('relay.json', self.r.state)
+        self.r.stop_file = SimpleNamespace(exists=lambda: self.t >= 5)
+        with patch.object(self.r, 'watch_pr', return_value=False) as watch, \
+                patch.object(relay, 'gh_json') as gh:
+            self.assertEqual(0, self.r.run())
+        watch.assert_called()
+        gh.assert_not_called()
+        self.assertNotIn('close_pending', self.r.state)
+
+    def test_no_pr_done_record_is_required_for_no_pr_gate(self):
+        close = self.r.closer()
+        self.assertIn('loop-state done --no-pr', ' '.join(close.agent_blockers(None)))
+        self.r.close_after_merge(None)
+        self.assertEqual([], self.closes())
+        self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7})
+        self.assertNotIn('loop-state done --no-pr', ' '.join(close.agent_blockers(None)))
+        self.assertIn('loop-state done --pr 7', ' '.join(close.agent_blockers(7)))
+
     def blocked(self):
         self.r.close_after_merge(7)
         # The finished helper may close regardless (#33); the agents' session and the relay may not.
@@ -2196,6 +2428,9 @@ class AutonomousClose(unittest.TestCase):
         self.r.close_after_merge(7)
         self.assertEqual([], self.actions)
         self.assertEqual('', self.log())
+        self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 1})
+        self.r.close_after_merge(None)
+        self.assertEqual([], self.actions)
 
     def test_no_loop_done_record_for_this_pr(self):
         (self.state / 'loop-done.json').unlink()

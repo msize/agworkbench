@@ -20,10 +20,10 @@ Five jobs, one loop, one process per issue, running in its own visible agwinterm
    `limits.classify` whether the agent there has hit its usage limit. An episode seen on two
    consecutive reads is mailed to the planner once (sender `relay`), with a blocked status and a
    notification; mail to a limited implementer is held until the planner fails it over. Checks
-   stop once the PR is finished.
+   stop after a MERGED PR; a CLOSED unmerged PR leaves the relay watching.
 
-4. **The close after merge (#27, #33).** On an autonomous checkout, after a MERGED PR's final
-   notices are delivered, it runs closer.py while it keeps delivering mail. Helper sessions close
+4. **The close after merge or a no-op issue (#27, #33, #53).** On an autonomous checkout, after a MERGED PR's final
+   notices are delivered or a closed issue has a no-PR done record, it runs closer.py while it keeps delivering mail. Helper sessions close
    first, each on its own evidence (its completion marker, an ended direct-mode pane showing exactly
    the marker's rows), whatever the agents are doing. The gates - the planner has recorded
    `loop-state done`, no mail is unread, both agent panes are provably idle - apply to the issue
@@ -275,6 +275,10 @@ def gh_json(args: list[str]) -> Any:
         return json.loads(done.stdout) if done.returncode == 0 else None
     except (OSError, ValueError):
         return None
+
+
+def gh_call(*args: str) -> Any:
+    return gh_json(list(args))
 
 
 def gh_pages(endpoint: str) -> list[dict[str, Any]] | None:
@@ -914,7 +918,7 @@ class Relay:
         except (OSError, KeyError, TypeError, ValueError):   # conductor.QueueError is a ValueError
             return False
 
-    def hand_off_close(self, close: "closer.Closer", number: int, reasons: list[str]) -> bool:
+    def hand_off_close(self, close: "closer.Closer", number: int | None, reasons: list[str]) -> bool:
         """Queue mode (#44): leave the refused close to the conductor's backstop. It keeps
         close_pending and closes this relay's session, since the conductor defers to a live one.
         False (nothing handed off) outside queue mode, when no conductor is running to take it (a
@@ -931,8 +935,9 @@ class Relay:
             close.log("NOT handing the close to the queue conductor: this relay's session is not provably its own")
             return False
         mine, session = own
-        self.state['close_pending'] = number
-        self.state['close_handoff'] = {'pr': number, 'at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+        key = closer.pending_key(number)
+        self.state['close_pending'] = key
+        self.state['close_handoff'] = {'pr': key, 'at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
                                        'reasons': reasons}
         self._save()
         if not self.conductor_running():
@@ -941,7 +946,7 @@ class Relay:
             return False
         close.log(f"handing the close to the queue conductor; closing the relay session {session.get('id')}")
         try:
-            agw.notify(mine, f"PR #{number}: autonomous close handed to the queue conductor", title='workbench relay')
+            agw.notify(mine, f"{'issue closed without a PR' if number is None else f'PR #{number}'}: autonomous close handed to the queue conductor", title='workbench relay')
         except (agw.CtlError, OSError) as err:
             self.log(f"could not notify: {err}")
         agw.clear_restore(mine)
@@ -965,60 +970,161 @@ class Relay:
             except (agw.CtlError, OSError) as err:
                 self.log(f"could not notify: {err}")
 
-    def close_after_merge(self, number: int) -> None:
-        """After a merged PR and a complete drain, on an autonomous checkout: close the issue's
+    def refuse_close(self, close: "closer.Closer", number: int | None, reasons: str | list[str],
+                     *, handoff: bool = True) -> None:
+        """Refuse a close without letting a failed queue handoff crash the relay."""
+        import agw
+        items = [reasons] if isinstance(reasons, str) else reasons
+        detail = '; '.join(items)
+        close.log(f"NOT closing{', ' if detail.startswith('still waiting after') else ': '}{detail}")
+        self.close_alert(detail)
+        handed = False
+        if handoff:
+            try:
+                handed = self.hand_off_close(close, number, items)
+            except (agw.CtlError, OSError) as err:
+                close.log(f'could not hand the close to the queue conductor: {err}')
+        if not handed:
+            self.finish_close()
+
+    def resume_no_pr_loop(self, close: "closer.Closer", reason: str, expected_at) -> bool:
+        """Disarm a refused done record, or persist its timestamp until retirement can retry."""
+        import conductor
+        try:
+            retired = conductor.retire_no_pr_done(
+                self.hub_dir / 'state' / 'loop-done.json', expected_at=expected_at, issue=close.issue)
+        except (OSError, ValueError) as err:
+            close.log(f'could not retire refused no-PR completion: {err}')
+            self.state['refused_no_pr_at'] = expected_at
+            if not self.dry_run:
+                self._save()
+            self.refuse_close(close, None, reason, handoff=False)
+            return False
+        if retired:
+            close.log('preserved refused no-PR completion as loop-done-refused.json')
+            if 'refused_no_pr_at' in self.state:
+                self.state.pop('refused_no_pr_at')
+                if not self.dry_run:
+                    self._save()
+        self.refuse_close(close, None, reason, handoff=False)
+        return False
+
+    def close_after_merge(self, number: int | None) -> bool:
+        """After a merged PR drain, or a no-PR done record on a CLOSED issue: close the issue's
         helpers as soon as each is proven done and untouched (#33), the issue session only when both
         agents are provably done and idle, then this relay's own session. Mail keeps flowing while it
-        waits; a stop request, unread mail to the planner (a human's above all) or autonomy turned
-        off stops it; never on a timeout
+        waits; number=None requires fresh GitHub CLOSED checks before any session closes. A stop
+        request, unread planner mail (a human's above all), or autonomy turned off stops it; never on a timeout
         alone (after it, only unread implementer mail is overridden, #44). A refusal is handed to the
-        queue conductor's backstop when there is a running one and the session is provably ours (#44)."""
+        queue conductor's backstop when there is a running one and the session is provably ours (#44).
+        A reopened issue or new open PR leaves the relay watching and returns False."""
         import agw
         close = self.closer()
         if not close.autonomous():
             self.log("autonomy is off for this checkout; the sessions stay open")
             self.finish_close()
-            return
-        close.log(f"PR #{number} merged; autonomous close starting")
+            return True
+        close.log(f"{'issue closed without a PR' if number is None else f'PR #{number} merged'}; autonomous close starting")
         if self.state.pop('close_handoff', None) is not None and not self.dry_run:
             # A restarted relay owns the close again; the conductor defers to it while it lives.
             self._save()
         left_open: list[str] = []
+        next_issue_check = 0.0
+        issue_verified = False
+        issue_detail = ''
+        no_pr_at = None
+        saw_no_pr_done = False
         while True:
             if self.stop_file.exists():
                 # The launcher is restarting this relay; the pending close resumes after it.
                 close.log("NOT closing: stop requested; the close resumes when the relay restarts")
-                return
+                return True
             # The planner's "loop complete" mail (and any human mail) must still be rung.
             self.flush_outbox()
             self.deliver_mail()
+            if number is None:
+                done_record = close.no_pr_done_record()
+                if done_record is None:
+                    try:
+                        loop = json.loads((self.hub_dir / 'state' / 'loop.json').read_text(encoding='utf-8-sig'))
+                    except (OSError, ValueError):
+                        loop = {}
+                    if saw_no_pr_done or (isinstance(loop, dict) and loop.get('state') in ('resumed', 'pr-open')):
+                        close.log('no-PR completion was withdrawn; the relay resumes watching')
+                        self.finish_close()
+                        return False
+                    reason = 'the planner has not recorded `wb.py loop-state done --no-pr`'
+                    if close.timed_out():
+                        self.refuse_close(close, number, reason)
+                        return True
+                    pause(self.mail_interval)
+                    continue
+                saw_no_pr_done = True
+                if no_pr_at is None:
+                    no_pr_at = done_record.get('at')
+                if now() >= next_issue_check:
+                    closed, detail = close.issue_closed(gh_call)
+                    next_issue_check = now() + self.pr_interval
+                    issue_verified = closed is True
+                    issue_detail = detail
+                    if closed is False:
+                        return self.resume_no_pr_loop(close, f'issue #{close.issue} was reopened', no_pr_at)
+                if not issue_verified:
+                    if close.timed_out():
+                        self.refuse_close(close, number, f'issue state unknown: {issue_detail}')
+                        return True
+                    pause(self.mail_interval)
+                    continue
             try:
                 # Helpers first, and regardless of the agents (#33).
-                left_open = close.step_helpers()
+                left_open = close.step_helpers(
+                    gate=(lambda: close.issue_closed(gh_call)[0] is True) if number is None else None)
             except (agw.CtlError, OSError) as err:
                 close.log(f"helper check failed: {err}")
             reasons = close.agent_blockers(number)
             if not reasons or close.overdue_ok():
+                if number is None:
+                    closed, detail = close.issue_closed(gh_call)
+                    if closed is False:
+                        return self.resume_no_pr_loop(close, f'issue #{close.issue} was reopened', no_pr_at)
+                    if closed is None:
+                        issue_verified = False
+                        issue_detail = detail
+                        next_issue_check = now() + self.pr_interval
+                        if close.timed_out():
+                            self.refuse_close(close, number, f'issue state unknown: {detail}')
+                            return True
+                        pause(self.mail_interval)
+                        continue
+                    open_pr, detail = close.open_prs(gh_call, self.branch)
+                    if open_pr is True:
+                        return self.resume_no_pr_loop(close, detail, no_pr_at)
+                    if open_pr is None:
+                        issue_verified = False
+                        issue_detail = detail
+                        next_issue_check = now() + self.pr_interval
+                        if close.timed_out():
+                            self.refuse_close(close, number, detail)
+                            return True
+                        pause(self.mail_interval)
+                        continue
+                    current_done = close.no_pr_done_record()
+                    if current_done is None or current_done.get('at') != no_pr_at:
+                        close.log('no-PR completion changed during the close; the relay resumes watching')
+                        self.finish_close()
+                        return False
                 break
             if close.timed_out():
-                close.log(f"NOT closing, still waiting after {closer.CLOSE_WAIT:.0f}s: " + '; '.join(reasons))
-                self.close_alert('; '.join(reasons))
-                try:
-                    handed = self.hand_off_close(close, number, reasons)
-                except (agw.CtlError, OSError) as err:
-                    close.log(f"could not hand the close to the queue conductor: {err}")
-                    handed = False
-                if not handed:
-                    self.finish_close()
-                return
+                self.refuse_close(close, number, f"still waiting after {closer.CLOSE_WAIT:.0f}s: " + '; '.join(reasons))
+                return True
             pause(self.mail_interval)
         if not close.autonomous():
             close.log("NOT closing: autonomy was turned off during the wait")
             self.finish_close()
-            return
+            return True
         if self.dry_run:
             close.log('[dry-run] would close the issue session and the relay')
-            return
+            return True
         try:
             close.close_issue_session()
             # Before this relay's own session goes (that ends this process), and detached from it (#41).
@@ -1028,10 +1134,11 @@ class Relay:
             close.log(f"close failed: {err}")
             self.close_alert(f"a close step failed: {err}")
             self.finish_close()
+        return True
 
-    def close_own_session(self, close: "closer.Closer", number: int, left_open: list[str]) -> None:
+    def close_own_session(self, close: "closer.Closer", number: int | None, left_open: list[str]) -> None:
         import agw
-        summary = (f"PR #{number} merged; sessions closed"
+        summary = (f"{'issue closed without a PR' if number is None else f'PR #{number} merged'}; sessions closed"
                    + (f"; left open: {', '.join(left_open)}" if left_open else '')
                    + "; log: .workbench/state/relay-close.log")
         mine = agw.my_pane()
@@ -1143,8 +1250,9 @@ class Relay:
         self.state['completed_prs'] = sorted({*self.state.get('completed_prs', []), number})
         self.state.pop('pr', None)
         self.state.pop('terminal_mail', None)
-        self.state.pop('limits', None)      # the loop is over; nobody fails over any more
-        self.log(f'retired finished PR #{number}; a restart can watch the next PR')
+        if self.state.get('close_pending') == number:
+            self.state.pop('limits', None)  # a merged PR ends the loop
+        self.log(f'retired finished PR #{number}; the relay can watch the next PR if this one was unmerged')
         if not self.dry_run:
             self._save()
 
@@ -1354,6 +1462,55 @@ class Relay:
                   for box in {box for box, _ in targets} for path in self.hub.unread(box)}
         return {(box, mid) for box, mid in targets & unread if mid not in announced}
 
+    def no_pr_close_due(self) -> str | None:
+        """Return a safe done time. An open PR or issue retires the stale record as a live loop."""
+        import conductor
+        close = self.closer()
+        if not close.no_pr_done():
+            return None
+        try:
+            done = json.loads((self.hub_dir / 'state' / 'loop-done.json').read_text(encoding='utf-8-sig'))
+            at = datetime.fromtimestamp(done['at'], timezone.utc).isoformat()
+        except (OSError, ValueError, OverflowError, KeyError, TypeError):
+            return None
+        if 'refused_no_pr_at' in self.state:
+            if done['at'] == self.state['refused_no_pr_at']:
+                try:
+                    if conductor.retire_no_pr_done(self.hub_dir / 'state' / 'loop-done.json',
+                                                   expected_at=done['at'], issue=close.issue):
+                        self.state.pop('refused_no_pr_at', None)
+                        if not self.dry_run:
+                            self._save()
+                except (OSError, ValueError) as err:
+                    self.log(f'could not retry refused no-PR completion retirement: {err}')
+                return None
+            self.state.pop('refused_no_pr_at', None)
+            if not self.dry_run:
+                self._save()
+        def retire_live_record():
+            try:
+                if conductor.retire_no_pr_done(self.hub_dir / 'state' / 'loop-done.json',
+                                               expected_at=done['at'], issue=close.issue):
+                    self.log('preserved live-loop no-PR completion as loop-done-refused.json')
+            except (OSError, ValueError) as err:
+                self.log(f'could not retire live-loop no-PR completion: {err}')
+                self.state['refused_no_pr_at'] = done['at']
+                if not self.dry_run:
+                    self._save()
+        open_pr, detail = close.open_prs(gh_call, self.branch)
+        if open_pr is not False:
+            self.log(f'{detail}; no-PR close waits')
+            if open_pr is True:
+                retire_live_record()
+            return None
+        closed, detail = close.issue_closed(gh_call)
+        if closed is False:
+            self.log(f'issue #{close.issue} is open; no-PR close waits')
+            retire_live_record()
+        elif closed is None:
+            self.log(f'cannot check issue #{close.issue} for no-PR close: {detail}')
+        return at if closed is True else None
+
     def run(self) -> int:
         self.log(f"relay up: {self.repo} {self.branch}; mailbox {self.hub_dir}")
         next_pr = 0.0
@@ -1368,15 +1525,19 @@ class Relay:
                 return 0
             self.log('saved PR is finished; resuming final notice drain')
         if self.state.get('close_pending') and not self.dry_run:
-            self.close_after_merge(self.state['close_pending'])
+            pending = self.state['close_pending']
+            over = self.close_after_merge(closer.pending_number(pending))
+            if pending == closer.NO_PR and over:
+                return 0
         next_limit = 0.0
+        next_no_pr = 0.0
         while True:
             if self.stop_file.exists():
                 self.log("stop file found; exiting")
                 return 0
             published = self.flush_outbox()
             if drain_deadline is None and now() >= next_limit:
-                # After a merge or close only the final notices matter; nobody fails over then.
+                # A CLOSED unmerged PR keeps the relay watching after its notices drain.
                 next_limit = now() + self.limit_interval
                 texts = self.read_panes()
                 self.check_limits(texts)
@@ -1392,10 +1553,15 @@ class Relay:
                 if not pending and not resets and published:
                     number, state = self.state['pr']['number'], self.state['pr'].get('state')
                     self.retire(number)
-                    self.log("PR is finished; final notices delivered or read; the relay's job is done")
+                    self.log("PR is finished; final notices delivered or read")
                     if state == 'MERGED':
                         self.close_after_merge(number)
-                    return 0
+                        return 0
+                    # A CLOSED PR may be followed by an issue closed without a new PR.
+                    drain_deadline = None
+                    self.draining = False
+                    next_pr = now() + self.pr_interval
+                    continue
                 if now() >= drain_deadline:
                     details = []
                     pending.update((m['to'], m['message_id']) for m in self.state.get('outbox', []))
@@ -1407,7 +1573,19 @@ class Relay:
                     detail = '; '.join(details)
                     self.log(f"PR is finished; drain deadline reached; still held or awaiting status reset: {detail}")
                     return 0
-            elif published and now() >= next_pr:
+            elif published and not self.state.get('pr') and now() >= next_no_pr:
+                next_no_pr = now() + self.pr_interval
+                done_at = self.no_pr_close_due()
+                if done_at is not None:
+                    self.state['close_pending'] = closer.NO_PR
+                    self.state['close_merged_at'] = done_at
+                    if not self.dry_run:
+                        self._save()
+                        if self.close_after_merge(None):
+                            return 0
+                        next_no_pr = now() + self.pr_interval
+                        next_pr = now()
+            if drain_deadline is None and published and now() >= next_pr:
                 next_pr = now() + self.pr_interval
                 if self.watch_pr():
                     if self.dry_run:
@@ -1415,7 +1593,7 @@ class Relay:
                         return 0
                     drain_deadline = now() + TERMINAL_DRAIN_TIMEOUT
                     self.draining = True
-                    self.log('PR is finished; draining final notices before exit')
+                    self.log('PR is finished; draining final notices')
                     if not self.state.get('outbox'):
                         continue
             delay = self.mail_interval
