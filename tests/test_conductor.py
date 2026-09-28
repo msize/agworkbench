@@ -1017,6 +1017,44 @@ class CloseBackstop(unittest.TestCase):
         self.assertFalse((self.state / 'loop-done.json').exists())
         self.assertTrue((self.state / 'loop-done-refused.json').exists())
 
+    def test_busy_done_lock_does_not_skip_backstop_end_close(self):
+        with self.store.transaction() as data:
+            data['members'][0].update(state='closed', phase='closed', pr=None, reason='duplicate')
+        q.atomic_json(self.state / 'relay.json', {'close_pending': 'no-pr', 'branch': 'issue-7'})
+        q.atomic_json(self.state / 'loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 1})
+        self.relay_gone()
+        self.w.gh = lambda *args: {'state': 'OPEN'} if args[:2] == ('issue', 'view') else self.gh(*args)
+        original_acquire = q.Lock.acquire
+        def acquire(lock):
+            if lock.path.name == 'loop-done.lock':
+                raise q.QueueError('lock busy')
+            return original_acquire(lock)
+        with patch.object(q.Lock, 'acquire', acquire):
+            self.run_for(1000)
+        self.assertNotIn('close_pending', q.read_json(self.state / 'relay.json'))
+        self.assertNotIn('closePending', self.member(7))
+        self.assertIn('could not retire refused no-PR completion',
+                      (self.state / 'relay-close.log').read_text(encoding='utf-8'))
+
+    def test_replacement_no_pr_record_is_adopted_during_backstop(self):
+        with self.store.transaction() as data:
+            data['members'][0].update(state='closed', phase='closed', pr=None, reason='duplicate')
+        q.atomic_json(self.state / 'relay.json', {'close_pending': 'no-pr', 'branch': 'issue-7'})
+        q.atomic_json(self.state / 'loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 1})
+        self.relay_gone()
+        issue_calls = [0]
+        def gh(*args):
+            if args[:2] == ('issue', 'view'):
+                issue_calls[0] += 1
+                if issue_calls[0] == 2:
+                    q.atomic_json(self.state / 'loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 2})
+                return {'state': 'CLOSED'}
+            return self.gh(*args)
+        self.w.gh = gh
+        self.run_for(950)
+        self.assertIn(('close', self.PLANNER), self.actions)
+        self.assertNotIn('closeStuck', self.member(7))
+
     def test_closed_no_pr_backstop_closes_and_starts_cleanup(self):
         with self.store.transaction() as data:
             data['members'][0].update(state='closed', phase='closed', pr=None, reason='duplicate')

@@ -1073,9 +1073,12 @@ class Worker:
             attempt.log(f'NOT closing: {reason}')
             self.notify(f'#{number}: autonomous close stopped: {reason}')
             if live_loop:
-                if retire_no_pr_done(hub_dir / 'state' / 'loop-done.json',
-                                     expected_at=watch.get('no_pr_at'), issue=number):
-                    attempt.log('preserved refused no-PR completion as loop-done-refused.json')
+                try:
+                    if retire_no_pr_done(hub_dir / 'state' / 'loop-done.json',
+                                         expected_at=watch.get('no_pr_at'), issue=number):
+                        attempt.log('preserved refused no-PR completion as loop-done-refused.json')
+                except (OSError, ValueError) as err:
+                    attempt.log(f'could not retire refused no-PR completion: {err}')
             self.end_close(m, pr, hub_dir, stuck=stuck or reason)
 
         def no_pr_preclose():
@@ -1096,8 +1099,11 @@ class Worker:
                 watch['issue_result'] = (None, detail)
                 return detail, True
             current_done = attempt.no_pr_done_record()
-            if current_done is None or current_done.get('at') != watch.get('no_pr_at'):
+            if current_done is None:
                 return 'no-PR completion changed during the close', False
+            if current_done.get('at') != watch.get('no_pr_at'):
+                watch['no_pr_at'] = current_done.get('at')
+                return 'no-PR completion changed during the close', True
             return None, False
 
         if pr is None:
@@ -1125,7 +1131,7 @@ class Worker:
                 if pr is None:
                     reason, wait = no_pr_preclose()
                     if reason:
-                        if not wait or attempt.timed_out():
+                        if not wait or (attempt.timed_out() and reason != 'no-PR completion changed during the close'):
                             refuse(reason, live_loop=not wait)
                         return
                 attempt.close_issue_session()

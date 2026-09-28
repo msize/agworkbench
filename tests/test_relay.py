@@ -2188,11 +2188,30 @@ class AutonomousClose(unittest.TestCase):
         self.assertIn(('cleanup', (self.folder, 'o/repo', '7', None, 'merged')), self.actions)
 
     def test_no_pr_trigger_requires_a_fresh_empty_open_pr_list(self):
-        self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 1})
         for result in ([{'number': 8}], None):
+            self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 1})
             with self.subTest(result=result), patch.object(relay, 'gh_json', return_value=result) as gh:
                 self.assertIsNone(self.r.no_pr_close_due())
                 gh.assert_called_once()
+            self.assertEqual(result is None, (self.state / 'loop-done.json').exists())
+
+    def test_no_pr_trigger_retires_done_when_issue_reopens(self):
+        self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 1})
+        with patch.object(relay, 'gh_json', side_effect=lambda args: [] if args[:2] == ['pr', 'list']
+                          else {'state': 'OPEN'}):
+            self.assertIsNone(self.r.no_pr_close_due())
+        self.assertFalse(self.r.closer().no_pr_done())
+        self.assertTrue((self.state / 'loop-done-refused.json').exists())
+        self.assertNotIn('the loop is done', self.r.stall.exemptions([]))
+
+    def test_busy_done_lock_does_not_end_live_relay(self):
+        import conductor
+        self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 1})
+        self.r.state['close_pending'] = 'no-pr'
+        with patch.object(conductor.Lock, 'acquire', side_effect=conductor.QueueError('lock busy')):
+            self.assertFalse(self.r.resume_no_pr_loop(self.r.closer(), 'issue #7 was reopened', 1))
+        self.assertNotIn('close_pending', self.r.state)
+        self.assertIn('could not retire refused no-PR completion', self.log())
 
     def test_final_issue_lookup_retries_a_transient_failure(self):
         self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 1})
@@ -2276,6 +2295,7 @@ class AutonomousClose(unittest.TestCase):
         close.assert_not_called()
         self.assertTrue(any(call.args[0][:2] == ['issue', 'view'] for call in gh.call_args_list))
         self.assertEqual([], self.closes())
+        self.assertFalse((self.state / 'loop-done.json').exists())
 
     def test_reopened_or_unknown_issue_closes_no_helper_or_issue_session(self):
         self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 1})

@@ -993,10 +993,10 @@ class Relay:
         try:
             retired = conductor.retire_no_pr_done(
                 self.hub_dir / 'state' / 'loop-done.json', expected_at=expected_at, issue=close.issue)
-        except OSError as err:
+        except (OSError, ValueError) as err:
             close.log(f'could not retire refused no-PR completion: {err}')
             self.refuse_close(close, None, reason, handoff=False)
-            return True
+            return False
         if retired:
             close.log('preserved refused no-PR completion as loop-done-refused.json')
         self.refuse_close(close, None, reason, handoff=False)
@@ -1457,6 +1457,7 @@ class Relay:
 
     def no_pr_close_due(self) -> str | None:
         """Return the no-PR done time only while the issue is closed and the branch has no open PR."""
+        import conductor
         close = self.closer()
         if not close.no_pr_done():
             return None
@@ -1465,13 +1466,23 @@ class Relay:
             at = datetime.fromtimestamp(done['at'], timezone.utc).isoformat()
         except (OSError, ValueError, OverflowError, KeyError, TypeError):
             return None
+        def retire_live_record():
+            try:
+                if conductor.retire_no_pr_done(self.hub_dir / 'state' / 'loop-done.json',
+                                               expected_at=done['at'], issue=close.issue):
+                    self.log('preserved live-loop no-PR completion as loop-done-refused.json')
+            except (OSError, ValueError) as err:
+                self.log(f'could not retire live-loop no-PR completion: {err}')
         open_pr, detail = close.open_prs(gh_call, self.branch)
         if open_pr is not False:
             self.log(f'{detail}; no-PR close waits')
+            if open_pr is True:
+                retire_live_record()
             return None
         closed, detail = close.issue_closed(gh_call)
         if closed is False:
             self.log(f'issue #{close.issue} is open; no-PR close waits')
+            retire_live_record()
         elif closed is None:
             self.log(f'cannot check issue #{close.issue} for no-PR close: {detail}')
         return at if closed is True else None

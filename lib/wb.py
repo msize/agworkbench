@@ -950,8 +950,10 @@ def loop_done_no_pr(root: Path, reason: str | None, pr: str | None = None) -> in
         from conductor import Lock, atomic_json
         with Lock(path.with_name('loop-done.lock')):
             atomic_json(path, record)
-    except OSError as err:
-        print(f'wb: loop-state done --no-pr: cannot record completion: {err}', file=sys.stderr)
+    except (OSError, ValueError) as err:
+        prefix = 'queue report `closed` written; ' if member_path.exists() else ''
+        print(f'wb: loop-state done --no-pr: {prefix}cannot record completion: {err}; '
+              'rerun to record completion', file=sys.stderr)
         return 2
     print(f"loop done: issue #{number} closed without a PR; {len(items)} follow-up(s)")
     return 0
