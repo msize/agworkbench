@@ -50,6 +50,10 @@ all stop you exactly as they do without autonomy.
   The severity is revmux's, as you verified it. You may raise it, but never lower it below revmux's
   without saying so in the merge comment.
   Add `--file <path:line>` when the finding names a place in the code.
+  Minor, Immaterial and plan items from one PR go into one checklist issue named
+  `Leftovers from #N: <issue title>`. Major and blocker items get their own issue. The planner must
+  explicitly add `--own-issue` for a planned out-of-scope feature the spec needs, regardless of
+  severity. A deferred review point is still recorded with `follow-up add` before filing.
   Before merge-check, file them all with `python "$AGWORKBENCH/lib/wb.py" follow-up file --source <N> --pr <P>`
   (`--pr is required` while `followUp.dedupe` is on, the default). It labels a new issue `follow-up`
   (`follow-up-nested` when this issue is itself a follow-up) and adds the planner marker. With dedupe on
@@ -64,8 +68,9 @@ all stop you exactly as they do without autonomy.
   be deferred, but only as a filed follow-up. A Major or blocker **never** may, disputed or not: it
   stops as today. merge-check refuses any Major or blocker review item in follow-ups.json, so record
   it honestly (with `--disputed` when it ended disputed) and the human decides.
-- **The merge comment** lists every follow-up URL, and every disputed or deferred finding with its
-  severity. It marks each duplicate (an item with `duplicateOf` in follow-ups.json) as "reported
+- **The merge comment** lists the leftovers issue once with its checklist items, every separate
+  follow-up URL, and every disputed or deferred finding with its severity. It marks each duplicate
+  (an item with `duplicateOf` in follow-ups.json) as "reported
   again on #M" rather than as a new issue.
 - **Your last act** is `python "$AGWORKBENCH/lib/wb.py" loop-state done --pr <P> --sha <merged sha>` after the
   Phase 7 merge steps, or `loop-state done --no-pr --reason "<why>"` after the no-op path has closed

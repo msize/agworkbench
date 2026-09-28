@@ -19,7 +19,7 @@ import os
 import re
 import string
 import subprocess
-import tempfile
+import uuid
 import unicodedata
 from pathlib import Path
 from urllib.parse import quote, unquote
@@ -36,6 +36,8 @@ MATCHER_TIMEOUT = triage.MODEL_TIMEOUT
 FINDING_RE = re.compile(r"<!-- agworkbench:finding ([^>]*?) -->\r?\n" + re.escape(PLANNER_MARKER) + r"\s*\Z")
 DUP_RE = re.compile(r"<!-- agworkbench:dup ([^>]*?) -->\r?\n<!-- agworkbench:dup-count \d+ -->\r?\n"
                     + re.escape(PLANNER_MARKER) + r"\s*\Z")
+LEFTOVERS_RE = re.compile(r"<!-- agworkbench:leftovers ([^>]*?) -->\r?\n" + re.escape(PLANNER_MARKER) + r"\s*\Z")
+CHECKLIST_RE = re.compile(r"^- \[([ xX])\] \*\*(.*?)\*\* \(.*?\): (.*)$", re.M)
 STRIP = string.punctuation + "‘’“”«»" + string.whitespace
 
 
@@ -97,6 +99,51 @@ def dup_marker(item: dict, source: int, pr: int) -> str:
 def parse_finding(body: str) -> dict | None:
     match = FINDING_RE.search(body or "")
     return _parse(match[1]) if match else None
+
+
+def parse_leftovers(body: str) -> dict | None:
+    match = LEFTOVERS_RE.search(body or "")
+    return _parse(match[1]) if match else None
+
+
+def own_leftovers(issue: dict, source: int, pr: int) -> bool:
+    if not trusted(issue.get("author_association"), issue.get("body")):
+        return False
+    fields = parse_leftovers(issue.get("body")) or {}
+    return (fields.get("source"), fields.get("pr")) == (str(source), str(pr))
+
+
+def leftovers_lines(issue: dict) -> list[tuple[str, str]]:
+    if (closed_reason(issue) is not None or not trusted(issue.get("author_association"), issue.get("body"))
+            or parse_leftovers(issue.get("body")) is None):
+        return []
+    return [(key, title) for checked, key, title in CHECKLIST_RE.findall(issue.get("body") or "")
+            if checked == " "]
+
+
+def own_issue(item: dict) -> bool:
+    return item.get("severity") in ("major", "blocker") or bool(item.get("ownIssue"))
+
+
+def leftovers_severity(items: list[dict]) -> str:
+    return min((item.get("severity", "plan") for item in items),
+               key=lambda value: {"minor": 0, "immaterial": 1, "plan": 2}.get(value, 2))
+
+
+def leftovers_body(items: list[dict], source: int, pr: int, checked: set[str] = frozenset()) -> str:
+    lines = [f"Leftovers from #{source} (PR #{pr}): minor review findings and plan items deferred by the loop.", ""]
+    for item in items:
+        where = f", `{item['file']}`" if item.get("file") else ""
+        mark = "x" if item["key"] in checked else " "
+        lines.append(f"- [{mark}] **{item['key']}** ({item.get('severity')}, {item.get('origin')}{where}): {item.get('title')}")
+    for item in items:
+        if (item.get("body") or "").strip():
+            lines += ["", f"<details><summary>{item['key']}</summary>", "", item["body"].rstrip(), "", "</details>"]
+    lines += ["", f"Source: #{source}, PR #{pr}", f"Severity: {leftovers_severity(items)}",
+              f"<!-- agworkbench:follow-up source=#{source} -->",
+              "<!-- agworkbench:leftovers " + _fields(dict(source=source, pr=pr)) + " -->",
+              PLANNER_MARKER]
+    return "\n".join(lines) + "\n"
 
 
 def trusted_author(association: str | None) -> bool:
@@ -228,7 +275,9 @@ def pick_exact(item: dict, candidates: list[dict], labels: set[str]) -> tuple[di
     """(duplicate, related): open first (lowest number), then closed as completed (most recently
     closed); an issue closed as not planned or duplicate is never a duplicate, only related."""
     title = normalise_title(item.get("title", ""))
-    same = [c for c in candidates if set(c["labels"]) & labels and normalise_title(c["title"]) == title]
+    same = [c for c in candidates if set(c["labels"]) & labels and
+            (normalise_title(c["title"]) == title or
+             any(normalise_title(line) == title for _, line in leftovers_lines(c)))]
     open_ = sorted((c for c in same if closed_reason(c) is None), key=lambda c: c["number"])
     if open_:
         return open_[0], None
@@ -302,7 +351,8 @@ def semantic_matches(items: list[dict], candidates: list[dict], note) -> dict[st
                            "file": normalise_file(i.get("file")) or None} for i in items],
              "candidates": [{"number": c["number"], "title": c["title"], "body": c["body"][:BODY_CAP],
                              "labels": c["labels"]} for c in candidates]}
-    folder = Path(tempfile.mkdtemp(prefix="agworkbench-followup-"))
+    folder = Path(os.environ.get("AI_HUB") or Path.cwd()) / f"agworkbench-followup-{uuid.uuid4().hex}"
+    folder.mkdir()
     try:
         facts_file = folder / "facts.json"
         facts_file.write_text(json.dumps(facts, indent=2), encoding="utf-8")

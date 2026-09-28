@@ -445,12 +445,16 @@ merges, unless you opted in for that checkout.
 - **It merges** behind the auto-merge gate. Autonomy implies auto-merge, and `-NoAutoMerge` on an
   autonomous checkout is refused.
 - **It files follow-up issues.** Every deferred finding, and every out-of-scope item in the agreed
-  plan, is filed before the merge (`wb.py follow-up`). The label is `follow-up`, or
+  plan, is recorded before the merge (`wb.py follow-up`). Minor, Immaterial and plan items from a PR
+  share one `Leftovers from #N: <issue title>` checklist issue. Major and blocker items get separate
+  issues; the planner uses `follow-up add --own-issue` when a planned out-of-scope feature needs its
+  own issue. The label is `follow-up`, or
   `follow-up-nested` for a follow-up's own follow-ups, so a `-Watch label:follow-up` queue chains at
   most one level. merge-check refuses while any is unfiled.
 - **A problem reported again gets more urgent (#42).** Before filing, `follow-up file` looks for an
   issue that already describes the finding: the same normalised title among the follow-up issues
-  (open, or closed as completed, which it reopens), then one restricted `claude -p` call over the
+  (open, or closed as completed, which it reopens), or an unchecked checklist line in an open,
+  trusted leftovers issue. It then makes one restricted `claude -p` call over the
   open follow-up and bug issues, where only a high-confidence answer naming an issue opened by the
   owner, a member or a collaborator counts (anything else is linked as possibly related). On a match it comments
   a duplicate report there instead of filing. At 2, 3 and 5 reports in all, the issue's label goes
@@ -460,7 +464,8 @@ merges, unless you opted in for that checkout.
   owner, members and collaborators that carry the planner marker count as reports.
 - **Only Minor findings may be deferred.** A Major or blocker review finding stops the merge and
   waits for you, whether it was deferred or ended disputed. Minor and Immaterial ones may be
-  deferred as follow-ups. The merge comment lists them all with their severity and issue links.
+  deferred as follow-ups. The merge comment lists the leftovers issue with its items and every
+  separate issue with its severity and link.
 - **It closes the sessions.** After a MERGED PR, or after a closed issue with a recorded no-PR completion,
   the relay first closes the
   issue's revmux and review sessions that have finished, each on its own evidence (below), whatever
