@@ -445,12 +445,16 @@ merges, unless you opted in for that checkout.
 - **It merges** behind the auto-merge gate. Autonomy implies auto-merge, and `-NoAutoMerge` on an
   autonomous checkout is refused.
 - **It files follow-up issues.** Every deferred finding, and every out-of-scope item in the agreed
-  plan, is filed before the merge (`wb.py follow-up`). The label is `follow-up`, or
+  plan, is recorded before the merge (`wb.py follow-up`). Minor, Immaterial and plan items from a PR
+  share one `Leftovers from #N: <issue title>` checklist issue. Major and blocker items get separate
+  issues; the planner uses `follow-up add --own-issue` when a planned out-of-scope feature needs its
+  own issue. The label is `follow-up`, or
   `follow-up-nested` for a follow-up's own follow-ups, so a `-Watch label:follow-up` queue chains at
   most one level. merge-check refuses while any is unfiled.
 - **A problem reported again gets more urgent (#42).** Before filing, `follow-up file` looks for an
   issue that already describes the finding: the same normalised title among the follow-up issues
-  (open, or closed as completed, which it reopens), then one restricted `claude -p` call over the
+  (open, or closed as completed, which it reopens), or an unchecked checklist line in an open,
+  trusted leftovers issue. It then makes one restricted `claude -p` call over the
   open follow-up and bug issues, where only a high-confidence answer naming an issue opened by the
   owner, a member or a collaborator counts (anything else is linked as possibly related). On a match it comments
   a duplicate report there instead of filing. At 2, 3 and 5 reports in all, the issue's label goes
@@ -460,7 +464,8 @@ merges, unless you opted in for that checkout.
   owner, members and collaborators that carry the planner marker count as reports.
 - **Only Minor findings may be deferred.** A Major or blocker review finding stops the merge and
   waits for you, whether it was deferred or ended disputed. Minor and Immaterial ones may be
-  deferred as follow-ups. The merge comment lists them all with their severity and issue links.
+  deferred as follow-ups. The merge comment lists the leftovers issue with its items and every
+  separate issue with its severity and link.
 - **It closes the sessions.** After a MERGED PR, or after a closed issue with a recorded no-PR completion,
   the relay first closes the
   issue's revmux and review sessions that have finished, each on its own evidence (below), whatever
@@ -682,7 +687,7 @@ the autonomous close can close it. revmux and revdiff rounds that fail also mail
 | `failover` | `true` | when the implementer hits its usage limit, the planner stops it (only when idle at the limit) and switches to the other tool; `false` only reports |
 | `bugLabel` | `"bug"` | the label `-Queue bugs` stands for (non-empty, no comma) |
 | `triage` | none | per product repo: `{"owner/repo": {"specRepos": [...], "model": "..."}}`, the private spec repos `-Triage` judges against (see Issue triage) |
-| `followUp` | `{"dedupe": true, "bumpAt": {"P2": 2, "P1": 3, "P0": 5}}` | `dedupe: false` keeps #27's filing (a new issue unless an open one has exactly the same title); `bumpAt` is the total number of reports that raises a matched issue to each priority |
+| `followUp` | `{"dedupe": true, "bumpAt": {"P2": 2, "P1": 3, "P0": 5}}` | `dedupe: false` skips duplicate matching: separate items keep #27's filing, leftovers still share one issue per PR (per item without `--pr`); `bumpAt` is the total number of reports that raises a matched issue to each priority |
 | `autonomous` | `false` | full autonomy: merge, file follow-up issues, close the sessions after the merge; implies `autoMerge` |
 | `cleanup` | `"merged"` | after an autonomous close: `merged` deletes the checkout when it is safe, `build` deletes only its build outputs, `off` keeps it (see Cleaning up checkouts) |
 | `minFreeGB` | `20` | the queue admits no member while the checkout drive has less free space (GiB); `0` turns the guard off |

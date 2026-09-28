@@ -512,7 +512,8 @@ def merge_failures(pr: dict, inline: list[dict], head: str, root: Path, checks: 
 
 # --- follow-up issues (#27) ----------------------------------------------------------------------
 # One machine-readable list the planner fills as it defers findings or agrees a plan's out-of-scope
-# items; `follow-up file` turns every unfiled item into a GitHub issue and writes the url back.
+# items; `follow-up file` turns each unfiled item into its own issue or a line of the PR's shared
+# leftovers issue, and writes the URL back.
 
 SEVERITIES = ("blocker", "major", "minor", "immaterial", "plan")
 SEVERE = ("blocker", "major")
@@ -550,11 +551,14 @@ def cmd_follow_up_add(args: argparse.Namespace) -> int:
         items.append(item)
     if item.get("url"):
         # Filed already: the issue stays, but merge-check gates on severity and disputed (r18 m8).
+        if item.get("leftovers") and (item.get("severity") != args.severity or item.get("origin") != args.origin):
+            item["refresh"] = True
         item.update(severity=args.severity, origin=args.origin, disputed=bool(args.disputed))
         save_follow_ups(root, items)
         print(f"{args.key}: already filed as {item['url']}; severity/origin/disputed updated")
         return 0
-    item.update(title=args.title, body=body, severity=args.severity, origin=args.origin, disputed=bool(args.disputed))
+    item.update(title=args.title, body=body, severity=args.severity, origin=args.origin,
+                disputed=bool(args.disputed), ownIssue=bool(args.own_issue))
     if args.file:
         item["file"] = args.file              # #42: named in a duplicate report, a hint to the matcher
     save_follow_ups(root, items)
@@ -581,7 +585,8 @@ def cmd_follow_up_file(args: argparse.Namespace) -> int:
     root = checkout()
     items = load_follow_ups(root)
     pending = [item for item in items if not item.get("url")]
-    if not pending:
+    refreshing = [item for item in items if item.get("leftovers") and item.get("refresh")]
+    if not pending and not refreshing:
         print("no unfiled follow-ups")
         return 0
     try:
@@ -595,11 +600,12 @@ def cmd_follow_up_file(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 2
     # One level of chaining at most: a follow-up of a follow-up is filed under another label.
-    source = gh_run(root, "issue", "view", str(args.source), "--json", "labels")
+    source = gh_run(root, "issue", "view", str(args.source), "--json", "title,labels")
     if source.returncode != 0:
         print(f"wb: follow-up: cannot read issue #{args.source}: {source.stderr.strip()}", file=sys.stderr)
         return 1
-    labels = {label.get("name") for label in json.loads(source.stdout).get("labels", [])}
+    source_info = json.loads(source.stdout)
+    labels = {label.get("name") for label in source_info.get("labels", [])}
     label = NESTED_LABEL if labels & {FOLLOW_UP_LABEL, NESTED_LABEL} else FOLLOW_UP_LABEL
     created = gh_run(root, "label", "create", label, "--color", "BFD4F2",
                      "--description", "filed automatically by an agworkbench loop")
@@ -607,7 +613,16 @@ def cmd_follow_up_file(args: argparse.Namespace) -> int:
     if not use_label:
         print(f"wb: follow-up: cannot create label '{label}' ({created.stderr.strip()}); filing without it")
     if settings["dedupe"]:
-        return file_deduped(root, args, items, pending, label if use_label else None, config, settings)
+        return file_deduped(root, args, items, pending, label if use_label else None, config, settings,
+                            source_info.get("title") or f"Issue #{args.source}")
+    if args.pr:
+        return file_without_dedupe(root, args, items, pending, label if use_label else None, config,
+                                   source_info.get("title") or f"Issue #{args.source}")
+    return file_legacy(root, args, items, pending, label if use_label else None)
+
+
+def file_legacy(root: Path, args: argparse.Namespace, items: list[dict], pending: list[dict],
+                label: str | None) -> int:
     failed = 0
     for item in pending:
         # A quoted phrase: `-Flag`, `word:`, `#12` or a quote in a title are not search syntax (r18 m9).
@@ -626,7 +641,7 @@ def cmd_follow_up_file(args: argparse.Namespace) -> int:
             body_file = root / ".workbench" / "state" / f"follow-up-{item['key']}.md"
             body_file.write_text(issue_body(item, args.source, args.pr), encoding="utf-8")
             argv = ["issue", "create", "--title", item["title"], "--body-file", str(body_file)]
-            if use_label:
+            if label:
                 argv += ["--label", label]
             done = gh_run(root, *argv)
             body_file.unlink(missing_ok=True)
@@ -640,6 +655,22 @@ def cmd_follow_up_file(args: argparse.Namespace) -> int:
             print(f"{item['key']}: filed {url}")
         save_follow_ups(root, items)          # after each one, so a failure never loses a filed url
     return 1 if failed else 0
+
+
+def file_without_dedupe(root: Path, args: argparse.Namespace, items: list[dict], pending: list[dict],
+                        label: str | None, config: dict, source_title: str) -> int:
+    own = [i for i in pending if followup.own_issue(i)]
+    failed = file_legacy(root, args, items, own, label)
+    if any(not followup.own_issue(i) for i in pending) or any(i.get("refresh") for i in items):
+        try:
+            repo = json.loads(gh_ok(root, "reading the repository", "repo", "view", "--json", "nameWithOwner")
+                              .stdout)["nameWithOwner"]
+            file_leftovers(root, repo, args, items, [], label, source_title,
+                           triaged=followup.triage_on(config, repo))
+        except (DedupeFailed, ValueError, KeyError, TypeError) as err:
+            print(f"wb: follow-up: leftovers: {err}", file=sys.stderr)
+            failed = 1
+    return failed
 
 
 # --- dedupe and bump (#42) -----------------------------------------------------------------------
@@ -700,15 +731,116 @@ def read_issue(root: Path, repo: str, number: int) -> dict:
 def find_own_unlabelled(root: Path, repo: str, item: dict, args: argparse.Namespace) -> dict | None:
     """Without the follow-up label, an issue an earlier run filed for this item is no candidate; the
     #27 exact-title search finds it, and its trusted finding marker proves it is this item's (r1 M1)."""
-    phrase = '"' + item["title"].replace('"', " ").strip() + '"'
-    found = gh_ok(root, f"searching for '{item['key']}'", "issue", "list", "--state", "open", "--search",
+    return find_by_title(root, repo, item["title"], f"searching for '{item['key']}'",
+                         lambda issue: followup.is_own(issue, item, args.source, args.pr))
+
+
+def find_by_title(root: Path, repo: str, title: str, what: str, accept) -> dict | None:
+    phrase = '"' + title.replace('"', " ").strip() + '"'
+    found = gh_ok(root, what, "issue", "list", "--state", "open", "--search",
                   f"{phrase} in:title", "--json", "number,title", "--limit", "200")
     for hit in json.loads(found.stdout or "[]"):
-        if hit.get("title") == item["title"] and isinstance(hit.get("number"), int):
+        if hit.get("title") == title and isinstance(hit.get("number"), int):
             issue = read_issue(root, repo, hit["number"])
-            if followup.is_own(issue, item, args.source, args.pr):
+            if accept(issue):
                 return issue
     return None
+
+
+def find_leftovers(root: Path, repo: str, args: argparse.Namespace, items: list[dict],
+                   pool: list[dict], title: str) -> dict | None:
+    accept = lambda issue: (followup.closed_reason(issue) is None
+                            and followup.own_leftovers(issue, args.source, args.pr))
+    prior = next((i for i in items if i.get("leftovers") and i.get("url")), None)
+    if prior:
+        match = re.search(r"/issues/(\d+)$", prior["url"])
+        if match:
+            issue = read_issue(root, repo, int(match[1]))
+            if accept(issue):
+                return issue
+    own = next((c for c in pool if accept(c)), None)
+    if own:
+        return own
+    return find_by_title(root, repo, title, "searching for leftovers", accept)
+
+
+def file_leftovers(root: Path, repo: str, args: argparse.Namespace, items: list[dict],
+                   pool: list[dict], label: str | None, source_title: str, *, triaged: bool,
+                   excluded: set[str] = frozenset()) -> None:
+    listed = [i for i in items if (i.get("leftovers") or (not i.get("url") and not followup.own_issue(i)))
+              and not i.get("duplicateOf")
+              and i["key"] not in excluded]
+    if not listed or not any(not i.get("url") or i.get("refresh") for i in listed):
+        return
+    title = f"Leftovers from #{args.source}: {source_title}"
+    existing = find_leftovers(root, repo, args, items, pool, title)
+    active = [i for i in listed if not i.get("url") or (existing and i.get("url") == existing["url"])]
+    orphaned = [i for i in listed if i.get("refresh") and i not in active]
+    for item in orphaned:
+        number = (re.search(r"/issues/(\d+)$", item["url"] or "") or [None, "?"])[1]
+        print(f"wb: follow-up: leftovers #{number} is closed or no longer recognised; "
+              f"re-rating of '{item['key']}' to {item.get('severity')} not written there - update it by hand")
+        item.pop("refresh", None)
+    if orphaned:
+        save_follow_ups(root, items)
+    if not active or not any(not i.get("url") or i.get("refresh") for i in active):
+        return
+    old_body = existing["body"] if existing else ""
+    severity = followup.leftovers_severity(active)
+    target = followup.severity_priority(severity)
+    body = (followup.extend_leftovers_body(old_body, active, severity) if existing else
+            followup.leftovers_body(active, args.source, args.pr))
+    body_file = root / ".workbench" / "state" / "follow-up-leftovers.md"
+    body_file.write_text(body, encoding="utf-8")
+    try:
+        if existing:
+            if body != old_body:
+                gh_ok(root, f"editing leftovers #{existing['number']}", "issue", "edit",
+                      str(existing["number"]), "--body-file", str(body_file))
+            url = existing["url"]
+            current = triage.priority_of(existing["labels"])
+            if not triaged and (current is None or triage.RANK[target] < triage.RANK[current]):
+                try:
+                    set_priority(root, existing["number"], existing["labels"], target,
+                                 f"labelling leftovers #{existing['number']}")
+                except DedupeFailed as err:
+                    print(f"wb: follow-up: {err}; leftovers #{existing['number']} keeps "
+                          f"{f'priority:{current}' if current else 'no priority label'}")
+        else:
+            argv = ["issue", "create", "--title", title, "--body-file", str(body_file)]
+            names = [label] if label else []
+            if not triaged:
+                priority = f"priority:{target}"
+                if ensure_label(root, priority):
+                    names.append(priority)
+                else:
+                    print(f"wb: follow-up: cannot create label '{priority}'; filing leftovers untriaged")
+            for name in names:
+                argv += ["--label", name]
+            done = gh_ok(root, "creating leftovers", *argv)
+            url = next((line.strip() for line in (done.stdout or "").splitlines() if "/issues/" in line), None)
+            if not url:
+                raise DedupeFailed("creating leftovers returned no issue URL")
+        for item in active:
+            if not item.get("url"):
+                item.update(url=url, leftovers=True)
+            item.pop("refresh", None)
+        save_follow_ups(root, items)
+        print(f"{len(active)} leftover(s): filed {url}")
+    finally:
+        body_file.unlink(missing_ok=True)
+
+
+def set_priority(root: Path, number: int, labels: list[str], target: str, what: str) -> None:
+    """Raise an issue's priority label, replacing its old priority label if present."""
+    name = f"priority:{target}"
+    if not ensure_label(root, name):
+        raise DedupeFailed(f"cannot create label '{name}'")
+    argv = ["issue", "edit", str(number), "--add-label", name]
+    for old in labels:
+        if PRIORITY_LABEL.fullmatch(old.strip()) and old != name:
+            argv += ["--remove-label", old]
+    gh_ok(root, what, *argv)
 
 
 def record_duplicate(root: Path, repo: str, item: dict, number: int, semantic: bool,
@@ -745,21 +877,14 @@ def record_duplicate(root: Path, repo: str, item: dict, number: int, semantic: b
             body_file.unlink(missing_ok=True)
     if target != current:
         # After the comment: a crash in between heals on the rerun, which finds its own marker.
-        name = f"priority:{target}"
-        if not ensure_label(root, name):
-            raise DedupeFailed(f"cannot create label '{name}'")
-        argv = ["issue", "edit", str(number), "--add-label", name]
-        for old in issue["labels"]:
-            if PRIORITY_LABEL.fullmatch(old.strip()) and old != name:
-                argv += ["--remove-label", old]
-        gh_ok(root, f"labelling #{number}", *argv)
+        set_priority(root, number, issue["labels"], target, f"labelling #{number}")
     shown = f"{current or 'untriaged'} -> {target}" if target != current else (current or "untriaged")
     return issue, (f"duplicate of #{number} ({'semantic' if semantic else 'exact'}"
                    f"{', already recorded' if already else ''}); {count} duplicate(s), priority {shown}")
 
 
 def file_deduped(root: Path, args: argparse.Namespace, items: list[dict], pending: list[dict],
-                 label: str | None, config: dict, settings: dict) -> int:
+                 label: str | None, config: dict, settings: dict, source_title: str) -> int:
     note = lambda text: print(f"wb: follow-up: {text}")
     if label is None:
         note("an issue filed without the follow-up label cannot be found as a duplicate later")
@@ -774,7 +899,7 @@ def file_deduped(root: Path, args: argparse.Namespace, items: list[dict], pendin
         print(f"wb: follow-up: {err}", file=sys.stderr)
         return 1
     candidates.pop(args.source, None)                     # the issue this PR closes cannot hold its findings
-    pool = list(candidates.values())
+    pool = [c for c in candidates.values() if not followup.own_leftovers(c, args.source, args.pr)]
     labelled = {FOLLOW_UP_LABEL, NESTED_LABEL}
     rest = [item for item in pending if followup.pick_exact(item, pool, labelled)[0] is None]
     semantic, semantic_pool = {}, {}
@@ -788,10 +913,13 @@ def file_deduped(root: Path, args: argparse.Namespace, items: list[dict], pendin
                 bugs = fetch_issues(root, repo, bug, "open")
             except DedupeFailed as err:
                 note(f"{err}; bug issues are not semantic candidates")
-        semantic_pool = {c["number"]: c for c in pool + bugs if c["state"] == "open" and c["number"] != args.source}
+        semantic_pool = {c["number"]: c for c in pool + bugs if c["state"] == "open"
+                         and c["number"] != args.source
+                         and not followup.own_leftovers(c, args.source, args.pr)}
         semantic = followup.semantic_matches(rest, list(semantic_pool.values()), note)
     triaged = followup.triage_on(config, repo)
     failed = 0
+    excluded = set()
     for item in pending:
         try:
             own = next((c for c in pool if followup.is_own(c, item, args.source, args.pr)), None)
@@ -825,6 +953,10 @@ def file_deduped(root: Path, args: argparse.Namespace, items: list[dict], pendin
                     save_follow_ups(root, items)
                     continue
                 notes.append(message)
+            if not followup.own_issue(item):
+                if notes:
+                    item["related"] = notes
+                continue
             filed = file_new(root, item, args, label, notes, triaged)
             pool.append(filed)
             item["url"] = filed["url"]
@@ -832,8 +964,17 @@ def file_deduped(root: Path, args: argparse.Namespace, items: list[dict], pendin
         except (DedupeFailed, ValueError, KeyError, TypeError) as err:
             print(f"wb: follow-up: '{item['key']}': {err}", file=sys.stderr)
             failed += 1
+            excluded.add(item["key"])
             continue
         save_follow_ups(root, items)          # after each one, so a failure never loses a filed url
+    if (any(not followup.own_issue(i) and not i.get("url") for i in pending)
+            or any(i.get("leftovers") and i.get("refresh") for i in items)):
+        try:
+            file_leftovers(root, repo, args, items, list(candidates.values()), label, source_title,
+                           triaged=triaged, excluded=excluded)
+        except (DedupeFailed, ValueError, KeyError, TypeError) as err:
+            print(f"wb: follow-up: leftovers: {err}", file=sys.stderr)
+            failed += 1
     return 1 if failed else 0
 
 
@@ -883,7 +1024,7 @@ def loop_done(root: Path, pr: str | None, sha: str | None) -> int:
         print(f"wb: loop-state done: follow-ups not filed yet: {', '.join(unfiled)}", file=sys.stderr)
         return 1
     record = {"pr": int(str(pr).rsplit("/", 1)[-1]), "sha": sha,
-              "followUps": [item["url"] for item in items], "at": time.time()}
+              "followUps": list(dict.fromkeys(item["url"] for item in items)), "at": time.time()}
     path = root / ".workbench" / "state" / "loop-done.json"
     from conductor import Lock, atomic_json, read_json, write_loop_state, repo_name, pr_number, pr_url, QueueError
     member_path = path.with_name('queue-member.json')
@@ -972,7 +1113,7 @@ def loop_done_no_pr(root: Path, reason: str | None, pr: str | None = None) -> in
             return 2
     record = dict(pr=None, noPr=True, issue=int(number), issueState='CLOSED',
                   stateReason=issue.get('stateReason'), reason=reason.strip(),
-                  followUps=[item['url'] for item in items], at=time.time())
+                  followUps=list(dict.fromkeys(item['url'] for item in items)), at=time.time())
     path = root / '.workbench/state/loop-done.json'
     try:
         from conductor import Lock, atomic_json
@@ -1359,6 +1500,7 @@ def main() -> int:
     q.add_argument("--origin", required=True, help='"review r<K>" or "plan"')
     q.add_argument("--disputed", action="store_true")
     q.add_argument("--file", help="path[:line] the finding is about (#42)")
+    q.add_argument("--own-issue", action="store_true", help="file this item separately even when minor")
     q.set_defaults(func=cmd_follow_up_add)
     q = follow.add_parser("file", help="file every recorded follow-up that has no issue yet")
     q.add_argument("--source", required=True, type=int, help="the issue this loop works on")

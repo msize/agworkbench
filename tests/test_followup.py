@@ -12,6 +12,7 @@ import sys
 import unittest
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'lib'))
@@ -33,6 +34,7 @@ class FakeRepo:
         for issue in issues:
             self.put(**issue)
         self.source_labels = list(source_labels)
+        self.source_title = 'The source issue'
         self.fail = set(fail)          # e.g. ('edit', 5), ('comment', 5), ('create', 'Title')
         self.calls = []
         self.next = 100
@@ -55,7 +57,8 @@ class FakeRepo:
         args = argv[1:]
         done = lambda out='', code=0, err='': subprocess.CompletedProcess(argv, code, out, err)
         if args[:2] == ['issue', 'view']:
-            return done(json.dumps({'labels': [{'name': n} for n in self.source_labels]}))
+            return done(json.dumps({'title': self.source_title,
+                                    'labels': [{'name': n} for n in self.source_labels]}))
         if args[:2] == ['label', 'create']:
             return done(code=1, err='HTTP 403') if ('label', args[2]) in self.fail else done()
         if args[:2] == ['repo', 'view']:
@@ -76,7 +79,7 @@ class FakeRepo:
             return done(json.dumps(self.issues[number]))
         if args[:2] == ['issue', 'list']:                  # the #27 exact-title search
             phrase = args[args.index('--search') + 1][1:-len('" in:title')]
-            return done(json.dumps([{'number': i['number'], 'title': i['title']} for i in self.issues.values()
+            return done(json.dumps([{'number': i['number'], 'title': i['title'], 'url': i['html_url']} for i in self.issues.values()
                                     if i['state'] == 'open' and phrase in i['title']]))
         if args[:2] == ['issue', 'reopen']:
             self.issues[int(args[2])].update(state='open', state_reason='reopened')
@@ -94,7 +97,12 @@ class FakeRepo:
                 return done(code=1, err='HTTP 502')
             names = self.labels(number)
             for flag, name in zip(args[3::2], args[4::2]):
-                names = names + [name] if flag == '--add-label' else [n for n in names if n != name]
+                if flag == '--body-file':
+                    self.issues[number]['body'] = Path(name).read_text(encoding='utf-8')
+                elif flag == '--add-label':
+                    names = names + [name]
+                elif flag == '--remove-label':
+                    names = [n for n in names if n != name]
             self.issues[number]['labels'] = [{'name': n} for n in names]
             return done()
         if args[:2] == ['issue', 'create']:
@@ -133,6 +141,11 @@ class Dedupe(unittest.TestCase):
         self.matcher = patch.object(followup, 'find_claude', side_effect=triage.ConfigError('claude is not on PATH'))
         self.enterContext(self.matcher)
         self.model_calls = []
+        def model_tempdir(**_):
+            folder = self.folder / ('model ' + uuid.uuid4().hex)
+            folder.mkdir()
+            return str(folder)
+        self.enterContext(patch.object(followup, 'tempfile', SimpleNamespace(mkdtemp=model_tempdir)))
 
     def config(self, **values):
         self.config_file.write_text(json.dumps(values), encoding='utf-8')
@@ -153,12 +166,14 @@ class Dedupe(unittest.TestCase):
                 patch.object(wb.subprocess, 'run', side_effect=gh or AssertionError('gh called')):
             return wb.main()
 
-    def add(self, key='r5-m1', title='Fix the relay drain', severity='minor', origin='review r5', file=None, body=None):
+    def add(self, key='r5-m1', title='Fix the relay drain', severity='minor', origin='review r5', file=None,
+            body=None, own_issue=True):
         path = self.folder / f'{key}.md'
         path.write_text(body if body is not None else f'evidence for {key}', encoding='utf-8')
         argv = ['follow-up', 'add', '--key', key, '--title', title, '--body-file', str(path),
                 '--severity', severity, '--origin', origin]
-        self.assertEqual(0, self.run_wb(*argv + (['--file', file] if file else [])))
+        self.assertEqual(0, self.run_wb(*argv + (['--file', file] if file else [])
+                                        + (['--own-issue'] if own_issue else [])))
 
     def file(self, gh, pr=30, source=27):
         return self.run_wb('follow-up', 'file', '--source', str(source), '--pr', str(pr), gh=gh)
@@ -603,6 +618,330 @@ class Dedupe(unittest.TestCase):
         self.assertEqual(['https://github.com/o/r/issues/5'], record['followUps'])
 
 
+class Leftovers(unittest.TestCase):
+    setUp = Dedupe.setUp
+    config = Dedupe.config
+    stub_model = Dedupe.stub_model
+    run_wb = Dedupe.run_wb
+    add = Dedupe.add
+    file = Dedupe.file
+    items = Dedupe.items
+    def test_four_minor_and_major_create_two_issues(self):
+        for n in range(4):
+            self.add(f'm{n}', title=f'Minor {n}', own_issue=False, file=f'lib/x.py:{n + 1}')
+        self.add('major', title='Major defect', severity='major', own_issue=False)
+        gh = FakeRepo()
+        self.assertEqual(0, self.file(gh), self.err.getvalue())
+        self.assertEqual(2, len(gh.calls_of('issue', 'create')))
+        self.assertEqual(4, gh.issues[102]['body'].count('- [ ]'))
+        self.assertEqual('Leftovers from #27: The source issue', gh.issues[102]['title'])
+        self.assertIn('Severity: minor', gh.issues[102]['body'])
+        self.assertEqual(['follow-up', 'priority:P2'], gh.labels(102))
+        self.assertEqual(4, sum(i.get('leftovers', False) for i in self.items()))
+        self.assertEqual([], wb.check_follow_ups(self.folder))
+        self.assertEqual(0, self.run_wb('loop-state', 'done', '--pr', '30', '--sha', 'abc'))
+        record = json.loads((self.state / 'loop-done.json').read_text(encoding='utf-8'))
+        self.assertEqual(2, len(record['followUps']))
+
+    def test_own_issue_switch_on_minor(self):
+        self.add('own', title='Separate work', own_issue=True)
+        self.add('left', title='Deferred point', own_issue=False)
+        gh = FakeRepo()
+        self.assertEqual(0, self.file(gh))
+        self.assertEqual(['Separate work', 'Leftovers from #27: The source issue'],
+                         [gh.issues[n]['title'] for n in (101, 102)])
+
+    def test_crash_retry_adopts_labelled_and_unlabelled(self):
+        for label_fails in (False, True):
+            with self.subTest(label_fails=label_fails):
+                (self.state / 'follow-ups.json').unlink(missing_ok=True)
+                self.add(own_issue=False)
+                gh = FakeRepo(fail={('label', 'follow-up')} if label_fails else ())
+                with patch.object(wb, 'save_follow_ups', side_effect=OSError('disk full')), self.assertRaises(OSError):
+                    self.file(gh)
+                self.assertEqual(0, self.file(gh), self.err.getvalue())
+                self.assertEqual(1, len(gh.calls_of('issue', 'create')))
+                self.assertEqual([], gh.calls_of('issue', 'edit'))
+                self.assertEqual('https://github.com/o/r/issues/101', self.items()[0]['url'])
+
+    def test_later_item_keeps_checked_line_and_raises_priority(self):
+        self.add('a', title='Small task', severity='immaterial', own_issue=False)
+        gh = FakeRepo()
+        self.assertEqual(0, self.file(gh))
+        self.assertEqual(['follow-up', 'priority:P3'], gh.labels(101))
+        gh.issues[101]['body'] = gh.issues[101]['body'].replace('- [ ] **a**', '- [x] **a**')
+        self.add('b', title='Minor task', own_issue=False)
+        self.assertEqual(0, self.file(gh), self.err.getvalue())
+        self.assertEqual(1, len(gh.calls_of('issue', 'create')))
+        self.assertEqual(2, len(gh.calls_of('issue', 'edit')))
+        self.assertIn('- [x] **a**', gh.issues[101]['body'])
+        self.assertIn('- [ ] **b**', gh.issues[101]['body'])
+        self.assertIn('Severity: minor', gh.issues[101]['body'])
+        self.assertEqual(['follow-up', 'priority:P2'], gh.labels(101))
+
+    def test_cross_pr_unchecked_line_dedupes_but_checked_does_not(self):
+        body = followup.leftovers_body([{'key': 'old', 'title': 'Same problem', 'severity': 'minor',
+                                         'origin': 'review r1'}], 11, 12)
+        gh = FakeRepo([dict(number=5, title='Leftovers from #11: Old', body=body)])
+        self.add('new', title='Same problem', own_issue=False)
+        self.assertEqual(0, self.file(gh), self.err.getvalue())
+        self.assertEqual(5, self.items()[0]['duplicateOf'])
+        self.assertEqual(0, len(gh.calls_of('issue', 'create')))
+        (self.state / 'follow-ups.json').unlink()
+        gh.issues[5]['body'] = body.replace('- [ ] **old**', '- [x] **old**')
+        self.add('next', title='Same problem', own_issue=False)
+        self.assertEqual(0, self.file(gh), self.err.getvalue())
+        self.assertEqual(1, len(gh.calls_of('issue', 'create')))
+
+    def test_own_container_does_not_dedupe_new_line(self):
+        self.add('a', title='Same problem', own_issue=False)
+        gh = FakeRepo()
+        self.assertEqual(0, self.file(gh))
+        self.add('b', title='Same problem', own_issue=False)
+        self.assertEqual(0, self.file(gh), self.err.getvalue())
+        self.assertEqual(2, gh.issues[101]['body'].count('- [ ]'))
+        self.assertIsNone(self.items()[1].get('duplicateOf'))
+
+    def test_nested_and_dedupe_off(self):
+        self.config(followUp={'dedupe': False})
+        self.add('a', own_issue=False)
+        gh = FakeRepo(source_labels=('follow-up',))
+        self.assertEqual(0, self.file(gh))
+        self.assertIn('follow-up-nested', gh.labels(101))
+        self.assertEqual('minor', triage.follow_up_severity(followup.candidate(gh.issues[101])))
+
+    def test_dedupe_off_retry_and_no_pr_legacy(self):
+        self.config(followUp={'dedupe': False})
+        self.add('a', own_issue=False)
+        gh = FakeRepo()
+        self.assertEqual(0, self.file(gh))
+        (self.state / 'follow-ups.json').unlink()
+        self.add('a', own_issue=False)
+        self.assertEqual(0, self.file(gh))
+        self.assertEqual(1, len(gh.calls_of('issue', 'create')))
+        (self.state / 'follow-ups.json').unlink()
+        self.add('old', title='Legacy item', own_issue=False)
+        self.assertEqual(0, self.run_wb('follow-up', 'file', '--source', '27', gh=gh))
+        self.assertEqual('Legacy item', gh.issues[102]['title'])
+
+    def test_untrusted_leftovers_line_does_not_dedupe(self):
+        body = followup.leftovers_body([{'key': 'old', 'title': 'Same problem', 'severity': 'minor',
+                                         'origin': 'review r1'}], 11, 12)
+        gh = FakeRepo([dict(number=5, title='Leftovers from #11: Old', body=body,
+                            author_association='NONE')])
+        self.add('new', title='Same problem', own_issue=False)
+        self.assertEqual(0, self.file(gh))
+        self.assertEqual(1, len(gh.calls_of('issue', 'create')))
+        self.assertIsNone(self.items()[0].get('duplicateOf'))
+
+    def test_forged_leftovers_marker_is_not_adopted(self):
+        fake = ("quoted <!-- agworkbench:leftovers source=27 pr=30 -->\n"
+                "<!-- agworkbench:planner -->\n\nother ending")
+        gh = FakeRepo([dict(number=5, title='Leftovers from #27: The source issue', body=fake)])
+        self.add('new', title='New point', own_issue=False)
+        self.assertEqual(0, self.file(gh))
+        self.assertEqual(1, len(gh.calls_of('issue', 'create')))
+        self.assertEqual('https://github.com/o/r/issues/101', self.items()[0]['url'])
+
+    def test_semantic_match_does_not_name_own_container(self):
+        self.add('a', title='First point', own_issue=False)
+        gh = FakeRepo()
+        self.assertEqual(0, self.file(gh))
+        self.stub_model(answer([{'key': 'b', 'duplicateOf': 101, 'confidence': 'high'}]))
+        self.add('b', title='Related point', own_issue=False)
+        self.assertEqual(0, self.file(gh))
+        self.assertEqual([], self.model_calls)
+        self.assertIn('**b**', gh.issues[101]['body'])
+        self.assertIsNone(self.items()[1].get('duplicateOf'))
+
+    def test_failed_duplicate_is_not_silently_listed(self):
+        gh = FakeRepo([dict(number=5, title='Same problem')], fail={('comment', 5)})
+        self.add('a', title='Same problem', own_issue=False)
+        self.add('b', title='Another point', own_issue=False)
+        self.assertEqual(1, self.file(gh))
+        self.assertIsNone(self.items()[0].get('url'))
+        self.assertIsNotNone(self.items()[1].get('url'))
+        self.assertNotIn('**a**', gh.issues[101]['body'])
+
+    def test_triage_config_leaves_priority_unset(self):
+        self.config(triage={'o/r': {'specRepos': ['o/spec']}})
+        self.add('a', own_issue=False)
+        gh = FakeRepo()
+        self.assertEqual(0, self.file(gh))
+        self.assertEqual(['follow-up'], gh.labels(101))
+
+    def test_quoted_checklist_in_details_is_not_a_line_or_duplicate(self):
+        quote = '- [x] **r2-m1** (minor, review r2): Quoted problem'
+        self.add('first', title='First point', body=f'Evidence quotes\n{quote}', own_issue=False)
+        gh = FakeRepo()
+        self.assertEqual(0, self.file(gh))
+        self.add('r2-m1', title='New point', own_issue=False)
+        self.assertEqual(0, self.file(gh), self.err.getvalue())
+        self.assertIn('- [ ] **r2-m1**', gh.issues[101]['body'])
+        self.assertEqual(2, len(followup.checklist_entries(gh.issues[101]['body'])))
+        (self.state / 'follow-ups.json').unlink()
+        self.add('other', title='Quoted problem', own_issue=False)
+        self.assertEqual(0, self.file(gh, pr=31, source=28))
+        self.assertIsNone(self.items()[0].get('duplicateOf'))
+
+    def test_dedupe_off_never_adopts_another_pr_or_outsider(self):
+        self.config(followUp={'dedupe': False})
+        title = 'Leftovers from #27: The source issue'
+        other = followup.leftovers_body([{'key': 'old', 'title': 'Old item', 'severity': 'minor',
+                                          'origin': 'review r1'}], 27, 29)
+        gh = FakeRepo([dict(number=5, title=title, body=other),
+                       dict(number=6, title=title, body='outsider text', author_association='NONE')])
+        self.add('new', title='New item', own_issue=False)
+        self.assertEqual(0, self.file(gh))
+        self.assertEqual('https://github.com/o/r/issues/101', self.items()[0]['url'])
+        self.assertEqual(other, gh.issues[5]['body'])
+        self.assertEqual('outsider text', gh.issues[6]['body'])
+
+    def test_rerating_filed_items_preserves_their_destination_and_body(self):
+        self.add('left', title='Left item', own_issue=False)
+        self.add('own', title='Own item', severity='major', own_issue=False)
+        gh = FakeRepo()
+        self.assertEqual(0, self.file(gh))
+        own_url, left_url = self.items()[1]['url'], self.items()[0]['url']
+        body = gh.issues[102]['body'].replace('- [ ] **left**', '- [x] **left**')
+        gh.issues[102]['body'] = body.replace('\n\nSource:', '\n\nHuman note.\n\nSource:')
+        self.add('left', severity='major', own_issue=False)
+        self.add('own', severity='minor', own_issue=False)
+        self.add('new', title='New point', own_issue=False)
+        self.assertEqual(0, self.file(gh), self.err.getvalue())
+        self.assertEqual((left_url, own_url), (self.items()[0]['url'], self.items()[1]['url']))
+        self.assertIn('- [x] **left**', gh.issues[102]['body'])
+        self.assertIn('Human note.', gh.issues[102]['body'])
+        self.assertIn('- [ ] **new**', gh.issues[102]['body'])
+        self.assertNotIn('**own**', gh.issues[102]['body'])
+
+    def test_closed_leftovers_issue_is_not_reused(self):
+        self.add('a', own_issue=False)
+        gh = FakeRepo()
+        self.assertEqual(0, self.file(gh))
+        gh.issues[101]['state'] = 'closed'
+        self.add('b', title='New point', own_issue=False)
+        self.assertEqual(0, self.file(gh))
+        self.assertEqual('https://github.com/o/r/issues/101', self.items()[0]['url'])
+        self.assertEqual('https://github.com/o/r/issues/102', self.items()[1]['url'])
+        self.assertNotIn('**a**', gh.issues[102]['body'])
+        self.assertEqual(2, len(gh.calls_of('issue', 'create')))
+
+    def test_appended_note_makes_a_new_container_for_only_new_items(self):
+        self.add('a', own_issue=False)
+        gh = FakeRepo()
+        self.assertEqual(0, self.file(gh))
+        gh.issues[101]['body'] += '\nMaintainer note after marker.'
+        self.add('b', title='New point', own_issue=False)
+        self.assertEqual(0, self.file(gh))
+        self.assertEqual('https://github.com/o/r/issues/101', self.items()[0]['url'])
+        self.assertEqual('https://github.com/o/r/issues/102', self.items()[1]['url'])
+        self.assertNotIn('**a**', gh.issues[102]['body'])
+
+    def test_quoted_source_in_details_does_not_split_new_details(self):
+        self.add('a', body='A quotation\n\nSource: #99, PR #98\nSeverity: minor', own_issue=False)
+        gh = FakeRepo()
+        self.assertEqual(0, self.file(gh))
+        self.add('b', body='Evidence for b', own_issue=False)
+        self.assertEqual(0, self.file(gh))
+        body = gh.issues[101]['body']
+        self.assertLess(body.index('</details>'), body.index('<details><summary>b</summary>'))
+        self.assertIn('Evidence for b', body)
+
+    def test_removed_intro_blank_line_keeps_checked_keys(self):
+        self.add('a', own_issue=False)
+        gh = FakeRepo()
+        self.assertEqual(0, self.file(gh))
+        gh.issues[101]['body'] = gh.issues[101]['body'].replace('\n\n- [ ] **a**', '\n- [x] **a**')
+        self.add('b', title='Second point', own_issue=False)
+        self.assertEqual(0, self.file(gh))
+        self.assertEqual(2, len(followup.checklist_entries(gh.issues[101]['body'])))
+        self.assertIn('- [x] **a**', gh.issues[101]['body'])
+
+    def test_dedupe_off_with_triage_leaves_priority_unset(self):
+        self.config(followUp={'dedupe': False}, triage={'o/r': {'specRepos': ['o/spec']}})
+        self.add('a', own_issue=False)
+        gh = FakeRepo()
+        self.assertEqual(0, self.file(gh))
+        self.assertEqual(['follow-up'], gh.labels(101))
+
+    def test_rerated_leftovers_refreshes_without_new_item(self):
+        self.add('a', severity='immaterial', own_issue=False)
+        gh = FakeRepo()
+        self.assertEqual(0, self.file(gh))
+        gh.issues[101]['body'] = gh.issues[101]['body'].replace('- [ ] **a**', '- [x] **a**')
+        self.add('a', severity='major', own_issue=False)
+        self.assertTrue(self.items()[0]['refresh'])
+        self.assertEqual(0, self.file(gh), self.err.getvalue())
+        self.assertEqual(1, len(gh.calls_of('issue', 'create')))
+        self.assertIn('- [x] **a** (major,', gh.issues[101]['body'])
+        self.assertIn('Severity: major', gh.issues[101]['body'])
+        self.assertEqual(['follow-up', 'priority:P1'], gh.labels(101))
+        self.assertNotIn('refresh', self.items()[0])
+
+    def test_unadoptable_leftovers_refresh_warns_once(self):
+        for change in ('closed', 'appended note'):
+            with self.subTest(change=change):
+                self.out.seek(0)
+                self.out.truncate(0)
+                (self.state / 'follow-ups.json').unlink(missing_ok=True)
+                self.add('a', severity='immaterial', own_issue=False)
+                gh = FakeRepo()
+                self.assertEqual(0, self.file(gh))
+                original = gh.issues[101]['body']
+                if change == 'closed':
+                    gh.issues[101]['state'] = 'closed'
+                else:
+                    gh.issues[101]['body'] += '\nMaintainer note after marker.'
+                self.add('a', severity='major', own_issue=False)
+                self.assertEqual(0, self.file(gh))
+                self.assertIn("leftovers #101 is closed or no longer recognised; re-rating of 'a' to major not written there",
+                              self.out.getvalue())
+                self.assertNotIn('refresh', self.items()[0])
+                self.assertEqual('https://github.com/o/r/issues/101', self.items()[0]['url'])
+                self.assertEqual(original, gh.issues[101]['body'] if change == 'closed'
+                                 else gh.issues[101]['body'].removesuffix('\nMaintainer note after marker.'))
+                before = len(gh.calls)
+                self.assertEqual(0, self.file(gh))
+                self.assertEqual(before, len(gh.calls))
+
+    def test_failed_priority_raise_reports_the_label_it_keeps(self):
+        self.add('a', severity='immaterial', own_issue=False)
+        gh = FakeRepo()
+        self.assertEqual(0, self.file(gh))
+        gh.fail.add(('label', 'priority:P2'))
+        self.add('b', title='Minor point', own_issue=False)
+        self.assertEqual(0, self.file(gh))
+        self.assertIn('leftovers #101 keeps priority:P3', self.out.getvalue())
+        self.assertEqual(['follow-up', 'priority:P3'], gh.labels(101))
+
+    def test_priority_label_failure_is_reported(self):
+        self.add('a', own_issue=False)
+        gh = FakeRepo(fail={('label', 'priority:P2')})
+        self.assertEqual(0, self.file(gh))
+        self.assertIn("cannot create label 'priority:P2'", self.out.getvalue())
+
+    def test_related_hint_is_kept_in_its_details(self):
+        gh = FakeRepo([dict(number=5, title='A related defect')])
+        self.stub_model(answer([{'key': 'a', 'duplicateOf': 5, 'confidence': 'medium'}]))
+        self.add('a', title='Different defect', own_issue=False)
+        self.assertEqual(0, self.file(gh))
+        self.assertIn('Possibly related: #5 (medium confidence)', gh.issues[101]['body'])
+
+    def test_duplicate_and_new_leftover_keep_separate_urls_on_later_edit(self):
+        gh = FakeRepo([dict(number=5, title='Same problem')])
+        self.add('a', title='Same problem', own_issue=False)
+        self.add('b', title='Other point', own_issue=False)
+        self.assertEqual(0, self.file(gh))
+        self.assertEqual(5, self.items()[0]['duplicateOf'])
+        self.assertEqual('https://github.com/o/r/issues/5', self.items()[0]['url'])
+        self.assertNotIn('**a**', gh.issues[101]['body'])
+        self.add('c', title='Third point', own_issue=False)
+        self.assertEqual(0, self.file(gh))
+        self.assertEqual('https://github.com/o/r/issues/5', self.items()[0]['url'])
+        self.assertNotIn('**a**', gh.issues[101]['body'])
+
+
 class Rules(unittest.TestCase):
 
     def test_normalise_title(self):
@@ -650,7 +989,8 @@ class Prose(unittest.TestCase):
             self.assertIn(needle, section)
         readme = ' '.join((root / 'README.md').read_text(encoding='utf-8').split())
         self.assertIn('| `followUp` |', readme)
-        self.assertIn("keeps #27's filing (a new issue unless an open one has exactly the same title)", readme)
+        self.assertIn('share one `Leftovers from #N: <issue title>` checklist issue', readme)
+        self.assertIn('leftovers still share one issue per PR (per item without `--pr`)', readme)
         self.assertIn('an untriaged issue gets no label below P1', readme)
 
 

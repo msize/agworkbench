@@ -2,11 +2,12 @@
 priority of a problem that keeps being reported (#42). wb.py's `follow-up file` drives it; this module
 holds the rules, the marker grammar and the semantic matcher, and does no GitHub I/O of its own.
 
-- The exact stage: same normalised title among the `follow-up` / `follow-up-nested` issues (any state).
+- The exact stage: same normalised title among the `follow-up` / `follow-up-nested` issues (any state),
+  or an unchecked checklist line of an open trusted leftovers issue.
 - The semantic stage: one restricted `claude -p` call for every item the exact stage left, over the
   open follow-up and bug issues. Only a `high` answer naming a candidate opened by the repo's owner,
   a member or a collaborator is a duplicate (an outsider's issue text could steer the model); anything
-  else, or any failure, files a new issue (a false duplicate hides a finding).
+  else, or any failure, files it (its own issue, or a line in the PR's leftovers issue).
 - The count lives on the issue: N = distinct (source, pr, key) dup markers in trusted, planner-marked
   comments. It is derived every time, never read back, so a forged comment or two racing loops cannot
   skew it. Total reports = 1 + N; the priority label follows `bumpAt`, upward only.
@@ -36,6 +37,8 @@ MATCHER_TIMEOUT = triage.MODEL_TIMEOUT
 FINDING_RE = re.compile(r"<!-- agworkbench:finding ([^>]*?) -->\r?\n" + re.escape(PLANNER_MARKER) + r"\s*\Z")
 DUP_RE = re.compile(r"<!-- agworkbench:dup ([^>]*?) -->\r?\n<!-- agworkbench:dup-count \d+ -->\r?\n"
                     + re.escape(PLANNER_MARKER) + r"\s*\Z")
+LEFTOVERS_RE = re.compile(r"<!-- agworkbench:leftovers ([^>]*?) -->\r?\n" + re.escape(PLANNER_MARKER) + r"\s*\Z")
+CHECKLIST_RE = re.compile(r"^- \[([ xX])\] \*\*(.*?)\*\* \(.*?\): (.*)$", re.M)
 STRIP = string.punctuation + "‘’“”«»" + string.whitespace
 
 
@@ -97,6 +100,117 @@ def dup_marker(item: dict, source: int, pr: int) -> str:
 def parse_finding(body: str) -> dict | None:
     match = FINDING_RE.search(body or "")
     return _parse(match[1]) if match else None
+
+
+def parse_leftovers(body: str) -> dict | None:
+    match = LEFTOVERS_RE.search(body or "")
+    return _parse(match[1]) if match else None
+
+
+def own_leftovers(issue: dict, source: int, pr: int) -> bool:
+    if not trusted(issue.get("author_association"), issue.get("body")):
+        return False
+    fields = parse_leftovers(issue.get("body")) or {}
+    return (fields.get("source"), fields.get("pr")) == (str(source), str(pr))
+
+
+def checklist_entries(body: str) -> list[tuple[str, str, str]]:
+    """Only lines after the intro and before the first details block or final Source trailer."""
+    text = (body or "").replace("\r\n", "\n")
+    start, end = checklist_bounds(text)
+    return CHECKLIST_RE.findall(text[start:end])
+
+
+def checklist_bounds(text: str) -> tuple[int, int]:
+    intro = text.find("\n")
+    trailers = list(re.finditer(r"(?m)^Source: #", text))
+    if intro < 0 or not trailers:
+        raise ValueError("leftovers body has no intro or Source trailer")
+    trailer = trailers[-1].start()
+    details = re.search(r"(?m)^<details><summary>", text[intro + 1:trailer])
+    end = intro + 1 + details.start() if details else trailer
+    return intro + 1, end
+
+
+def leftovers_lines(issue: dict) -> list[tuple[str, str]]:
+    if (closed_reason(issue) is not None or not trusted(issue.get("author_association"), issue.get("body"))
+            or parse_leftovers(issue.get("body")) is None):
+        return []
+    try:
+        entries = checklist_entries(issue.get("body") or "")
+    except ValueError:
+        return []
+    return [(key, title) for checked, key, title in entries
+            if checked == " "]
+
+
+def own_issue(item: dict) -> bool:
+    return item.get("severity") in ("major", "blocker") or bool(item.get("ownIssue"))
+
+
+def leftovers_severity(items: list[dict]) -> str:
+    return min((item.get("severity", "plan") for item in items),
+               key=lambda value: {"blocker": 0, "major": 1, "minor": 2,
+                                  "immaterial": 3, "plan": 4}.get(value, 4))
+
+
+def leftovers_line(item: dict, checked: bool = False) -> str:
+    where = f", `{item['file']}`" if item.get("file") else ""
+    mark = "x" if checked else " "
+    return (f"- [{mark}] **{item['key']}** ({item.get('severity')}, {item.get('origin')}{where}): "
+            f"{item.get('title')}")
+
+
+def leftovers_detail(item: dict) -> str:
+    content = [item.get("body", "").rstrip(), *(item.get("related") or [])]
+    content = [part for part in content if part]
+    return (f"<details><summary>{item['key']}</summary>\n\n" + "\n\n".join(content)
+            + "\n\n</details>") if content else ""
+
+
+def leftovers_body(items: list[dict], source: int, pr: int) -> str:
+    lines = [f"Leftovers from #{source} (PR #{pr}): minor review findings and plan items deferred by the loop.", ""]
+    for item in items:
+        lines.append(leftovers_line(item))
+    for item in items:
+        detail = leftovers_detail(item)
+        if detail:
+            lines += ["", detail]
+    lines += ["", f"Source: #{source}, PR #{pr}", f"Severity: {leftovers_severity(items)}",
+              f"<!-- agworkbench:follow-up source=#{source} -->",
+              "<!-- agworkbench:leftovers " + _fields(dict(source=source, pr=pr)) + " -->",
+              PLANNER_MARKER]
+    return "\n".join(lines) + "\n"
+
+
+def extend_leftovers_body(body: str, items: list[dict], severity: str) -> str:
+    """Keep current details and checked state; add missing keys and refresh marked lines."""
+    text = body.replace("\r\n", "\n")
+    start, end = checklist_bounds(text)
+    entries = checklist_entries(text)
+    if not entries:
+        raise ValueError("leftovers body has no recognisable checklist")
+    present = {key for _, key, _ in entries}
+    missing = [item for item in items if item["key"] not in present]
+    refresh = {item["key"]: item for item in items if item.get("refresh")}
+    if not missing and not refresh:
+        return body
+    block = CHECKLIST_RE.sub(lambda match: leftovers_line(refresh[match[2]], match[1].lower() == "x")
+                             if match[2] in refresh else match[0], text[start:end])
+    text = text[:start] + block.rstrip("\n") + ("\n" + "\n".join(leftovers_line(i) for i in missing)
+                                           if missing else "") + "\n\n" + text[end:]
+    details = [detail for item in missing if (detail := leftovers_detail(item))]
+    if details:
+        trailers = list(re.finditer(r"\n\n(?=Source: #)", text))
+        if not trailers:
+            raise ValueError("leftovers body has no Source trailer")
+        trailer = trailers[-1]
+        text = text[:trailer.start()] + "\n\n" + "\n\n".join(details) + text[trailer.start():]
+    matches = list(re.finditer(r"(?m)^Severity: \w+", text))
+    if not matches:
+        raise ValueError("leftovers body has no Severity trailer")
+    last = matches[-1]
+    return text[:last.start()] + f"Severity: {severity}" + text[last.end():]
 
 
 def trusted_author(association: str | None) -> bool:
@@ -228,7 +342,9 @@ def pick_exact(item: dict, candidates: list[dict], labels: set[str]) -> tuple[di
     """(duplicate, related): open first (lowest number), then closed as completed (most recently
     closed); an issue closed as not planned or duplicate is never a duplicate, only related."""
     title = normalise_title(item.get("title", ""))
-    same = [c for c in candidates if set(c["labels"]) & labels and normalise_title(c["title"]) == title]
+    same = [c for c in candidates if set(c["labels"]) & labels and
+            (normalise_title(c["title"]) == title or
+             any(normalise_title(line) == title for _, line in leftovers_lines(c)))]
     open_ = sorted((c for c in same if closed_reason(c) is None), key=lambda c: c["number"])
     if open_:
         return open_[0], None

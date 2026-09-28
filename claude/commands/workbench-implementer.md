@@ -83,6 +83,11 @@ commands you ran and their results, and anything in the plan you did not do and 
 
 ## Phase 3 - review findings
 
+When a point is deferred, tell the planner to record it with `follow-up add`. Minor, Immaterial and
+plan items land in the PR's single leftovers checklist issue; major/blocker items and items explicitly
+marked `--own-issue` by the planner get separate issues. The planner decides `--own-issue` for a
+planned out-of-scope feature the spec needs.
+
 The planner sends `FIX r<K>` with verified findings. Answer **every** finding with exactly one of:
 
 - **fixed**: the commit that fixes it, and the test that now covers it;
