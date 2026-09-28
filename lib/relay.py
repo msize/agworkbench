@@ -812,8 +812,11 @@ class Relay:
             found = limits.classify(text, peer.tool)
             episode = episodes.get(peer.box)
             if peer.box not in self.limit_baseline:
+                # Only an old `limited` row is history. A warning is Codex's modal chooser, live at
+                # the bottom of the pane: it never scrolls away, so a baseline would hide it (#61).
                 continuing = bool(found and episode and episode.get('line') == found.line)
-                self.limit_baseline[peer.box] = {found.line} if found and not continuing else set()
+                old = found and found.kind == 'limited' and not continuing
+                self.limit_baseline[peer.box] = {found.line} if old else set()
                 if self.limit_baseline[peer.box]:
                     self.log(f"limit check: ignoring {peer.box}'s limit row already on screen at start: {found.line}")
             baseline = self.limit_baseline[peer.box]
@@ -862,14 +865,15 @@ class Relay:
         if peer.box == 'claude':
             step = ("The planner itself is limited, so nobody can act on this mail until it can: "
                     "the human has been notified. The loop waits.")
-        elif episode['kind'] == 'warning':
-            step = ("The implementer shows a usage warning with a chooser. Never answer it: tell the "
-                    "human in one line and set blocked (start-github-issue.md, Usage limits).")
         else:
-            step = ("The implementer has hit its usage limit"
-                    + (" and exited to a shell" if episode.get('exited') else "")
-                    + ". Follow start-github-issue.md, Usage limits: check the frame below, then fail "
-                    "over with `github-workbench.cmd <issue> -Failover` (Bash timeout 600000).")
+            # A warning chooser fails over like the hard limit (#61): nobody answers it.
+            if episode['kind'] == 'warning':
+                what = "shows Codex's usage-warning chooser (it is nearly limited). Never answer the chooser"
+            else:
+                what = "has hit its usage limit" + (" and exited to a shell" if episode.get('exited') else "")
+            step = (f"The implementer {what}. Follow start-github-issue.md, Usage limits: check the frame "
+                    "below, then fail over with `github-workbench.cmd <issue> -Failover` (Bash timeout "
+                    "600000) when failover is on.")
         body = "\n".join([f"Matched: {episode['line']}", f"Pane: {peer.box} ({peer.tool}) {peer.pane}",
                            f"First seen: {episode['firstSeen']}", "", "Next step: " + step, "",
                            "Last rows of the pane:", "", "```", *rows, "```"])
@@ -1191,7 +1195,7 @@ class Relay:
                                        self.holds[(peer.box, mid)].clear_pending):
                     continue
                 episode = self.state.get('limits', {}).get(peer.box)
-                if (episode and episode.get('kind') == 'limited' and episode.get('announced')
+                if (episode and episode.get('kind') in ('limited', 'warning') and episode.get('announced')
                         and not self.draining):
                     self.hold(peer, mid, 'usage limit')
                     continue
