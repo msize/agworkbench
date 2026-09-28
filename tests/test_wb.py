@@ -145,6 +145,11 @@ class QueueReports(unittest.TestCase):
         self.assertEqual(0, wb.loop_done(self.folder, '457', 'sha'))
         self.assertFalse((self.state / 'loop.json').exists())
 
+    def test_done_does_not_increment_a_canonical_case_pr_report(self):
+        self.q.write_loop_state(self.folder, 'pr-open', 'https://github.com/O/R/pull/457')
+        self.assertEqual(0, wb.loop_done(self.folder, '457', 'sha'))
+        self.assertEqual(1, self.q.read_json(self.state / 'loop.json')['rev'])
+
     def test_no_pr_refusals_leave_no_done_record(self):
         run = patch.object(wb.subprocess, 'run', return_value=type('Done', (), {'stdout': 'issue-1-fix'})())
         with run:

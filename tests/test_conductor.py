@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT / 'lib'))
 import conductor as q
 import closer
 import cleanup
+import wb
 
 REAL_FREE_BYTES = q.free_bytes          # QueueCase patches it; the real one is tested on its own
 
@@ -626,6 +627,23 @@ class QueueCase(unittest.TestCase):
         self.assertEqual(('merged', 'MERGED', True, report['rev']),
                          (m['state'], m['prState'], m['slotReleased'], m['consumedRev']))
 
+    def test_done_report_after_merge_stays_merged_through_tick(self):
+        self.start('o/r#1')
+        worker = self.worker(); worker.tick(); worker.tick()
+        with self.store.transaction() as data:
+            data['members'][0].update(state='merged', pr='https://github.com/O/R/pull/5',
+                                      prState='MERGED', slotReleased=True)
+        checkout = Path(self.member()['checkout'])
+        identity = q.read_json(checkout / '.workbench/state/claude.json')
+        with patch.dict(os.environ, CLAUDE_CODE_SESSION_ID=identity['sessionId']):
+            self.assertEqual(0, wb.loop_done(checkout, '5', 'sha'))
+        worker.tick()
+        self.assertEqual(('merged', 'MERGED', True),
+                         (self.member()['state'], self.member()['prState'], self.member()['slotReleased']))
+        with self.store.transaction() as data:
+            self.assertTrue(q.apply_loop(data, data['members'][0], self.store.path))
+        self.assertEqual('merged', self.member()['state'])
+
     def test_stale_active_merged_pr_wins_and_releases_slot(self):
         self.start('o/r#1')
         worker = self.worker(); worker.tick(); worker.tick()
@@ -694,6 +712,66 @@ class QueueCase(unittest.TestCase):
             worker.refresh_remote()
         self.assertNotIn('goneSince', self.member())
 
+    def test_stale_open_pr_keeps_active_even_if_issue_closed(self):
+        self.start('o/r#1')
+        worker = self.worker(); worker.tick(); worker.tick()
+        with self.store.transaction() as data:
+            data['members'][0]['goneSince'] = self.now - 1801
+        self.now += 1801
+        worker.gh = Mock(side_effect=lambda *args: [{'number': 12, 'state': 'OPEN'}]
+                         if args[:2] == ('pr', 'list') else {'state': 'CLOSED'})
+        with patch.object(q.agw, 'tree', return_value={'workspaces': []}), \
+                patch.object(q.subprocess, 'run', return_value=Mock(returncode=0, stdout='issue-1-fix')):
+            worker.refresh_remote()
+        self.assertEqual(('active', None, False),
+                         (self.member()['state'], self.member()['pr'], self.member()['slotReleased']))
+        self.assertFalse(any(c.args[:2] == ('issue', 'view') for c in worker.gh.call_args_list))
+
+    def test_stale_uses_relay_issue_branch_after_checkout_switches_to_main(self):
+        self.start('o/r#1')
+        worker = self.worker(); worker.tick(); worker.tick()
+        with self.store.transaction() as data:
+            data['members'][0]['goneSince'] = self.now - 1801
+        state = Path(self.member()['checkout']) / '.workbench/state'
+        q.atomic_json(state / 'relay.json', {'branch': 'issue-1-fix'})
+        self.now += 1801
+        worker.gh = Mock(return_value=[{'number': 5, 'state': 'MERGED'}])
+        with patch.object(q.agw, 'tree', return_value={'workspaces': []}), \
+                patch.object(q.subprocess, 'run', return_value=Mock(returncode=0, stdout='main')) as git:
+            worker.refresh_remote()
+        git.assert_not_called()
+        self.assertEqual('merged', self.member()['state'])
+        self.assertIn('issue-1-fix', worker.gh.call_args.args)
+
+    def test_stale_refuses_non_issue_branch(self):
+        self.start('o/r#1')
+        worker = self.worker(); worker.tick(); worker.tick()
+        with self.store.transaction() as data:
+            data['members'][0]['goneSince'] = self.now - 1801
+        self.now += 1801
+        worker.gh = Mock(side_effect=AssertionError('wrong branch queried'))
+        with patch.object(q.agw, 'tree', return_value={'workspaces': []}), \
+                patch.object(q.subprocess, 'run', return_value=Mock(returncode=0, stdout='main')):
+            worker.refresh_remote()
+        worker.gh.assert_not_called()
+        self.assertEqual('active', self.member()['state'])
+        self.assertIn('goneSince', self.member())
+
+    def test_stale_rechecks_sessions_before_resolving(self):
+        self.start('o/r#1')
+        worker = self.worker(); worker.tick(); worker.tick()
+        with self.store.transaction() as data:
+            data['members'][0]['goneSince'] = self.now - 1801
+        self.now += 1801
+        worker.gh = Mock(return_value=[{'number': 5, 'state': 'MERGED'}])
+        empty = {'workspaces': []}
+        live = {'workspaces': [{'name': 'r', 'sessions': [{'name': '#1 review'}]}]}
+        with patch.object(q.agw, 'tree', side_effect=[empty, live]), \
+                patch.object(q.subprocess, 'run', return_value=Mock(returncode=0, stdout='issue-1-fix')):
+            worker.refresh_remote()
+        self.assertEqual('active', self.member()['state'])
+        self.assertNotIn('goneSince', self.member())
+
     def test_mark_cli_records_audit_and_refuses_invalid_targets(self):
         self.start('o/r#1,2')
         worker = self.worker(); worker.tick(); worker.tick()
@@ -710,9 +788,23 @@ class QueueCase(unittest.TestCase):
         self.assertEqual(dict(number=1, **audit), line)
         for number, pr in [(1, 'https://github.com/other/repo/pull/1'), (99, url), (2, url)]:
             with self.subTest(number=number, pr=pr):
-                self.assertNotEqual(0, q.main(['mark', '--file', str(self.store.path),
-                                               '--number', str(number), '--pr', pr]))
+                self.assertEqual(2, q.main(['mark', '--file', str(self.store.path),
+                                            '--number', str(number), '--pr', pr]))
         self.assertEqual(1, len((self.store.directory / 'operator.log').read_text().splitlines()))
+
+    def test_failed_mark_commit_does_not_write_operator_log(self):
+        self.start('o/r#1')
+        worker = self.worker(); worker.tick(); worker.tick()
+        original = q.atomic_json
+        def fail_queue(path, data):
+            if Path(path) == self.store.path:
+                raise OSError('queue commit failed')
+            return original(path, data)
+        with patch.object(q, 'atomic_json', side_effect=fail_queue):
+            self.assertEqual(1, q.main(['mark', '--file', str(self.store.path), '--number', '1',
+                                        '--pr', 'https://github.com/o/r/pull/5']))
+        self.assertFalse((self.store.directory / 'operator.log').exists())
+        self.assertEqual('active', self.member()['state'])
 
     def test_gh_uses_a_deadline_and_never_modifies_a_pr(self):
         with patch.object(q.subprocess, 'Popen') as spawn, patch.object(q.shutil, 'which', return_value='gh'):

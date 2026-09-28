@@ -461,7 +461,10 @@ def mark_pr(path, number, pr, reason=None):
     """Operator recovery for a missing planner PR report, with a durable audit line."""
     store = Store(path)
     with store.transaction() as data:
-        url = pr_url(pr, data['repo'])
+        try:
+            url = pr_url(pr, data['repo'])
+        except QueueError as err:
+            raise UsageError(str(err)) from err
         member = find_member(data, number)
         if member is None:
             raise UsageError(f'unknown queue member #{number}')
@@ -470,9 +473,9 @@ def mark_pr(path, number, pr, reason=None):
         audit = dict(at=time.time(), pr=url, user=getpass.getuser(), reason=reason)
         member.update(pr=url, prState=None, state='pr-open', phase='pr-open',
                       slotReleased=True, reason=None, operatorMark=audit)
-        store.directory.mkdir(parents=True, exist_ok=True)
-        with (store.directory / 'operator.log').open('a', encoding='utf-8') as log:
-            log.write(json.dumps(dict(number=number, **audit)) + '\n')
+    store.directory.mkdir(parents=True, exist_ok=True)
+    with (store.directory / 'operator.log').open('a', encoding='utf-8') as log:
+        log.write(json.dumps(dict(number=number, **audit)) + '\n')
     return audit
 
 
@@ -727,8 +730,10 @@ def apply_loop(data, member, path):
         raise QueueError(f"{report['state']} loop report requires a reason")
     if report.get('pr'):
         pr_url(report['pr'], data['repo'])
+    # Defensive for direct callers: tick normally skips reports on merged members.
     if (report['state'] == 'pr-open' and member['state'] == 'merged' and
-            member.get('prState') == 'MERGED' and member.get('pr') == report['pr']):
+            member.get('prState') == 'MERGED' and
+            pr_number(member.get('pr')) == pr_number(report['pr'])):
         member.update(consumedLoop=loop, consumedRev=report['rev'], slotReleased=True)
         return True
     if report.get('pr'):
@@ -988,17 +993,17 @@ class Worker:
                 if now - gone < 1800:
                     continue
                 checkout = Path(m['checkout'])
-                result = subprocess.run([shutil.which('git') or 'git', '-C', str(checkout),
-                                         'branch', '--show-current'], capture_output=True, text=True,
-                                        timeout=30)
-                branch = result.stdout.strip() if result.returncode == 0 else ''
+                relay = checkout / '.workbench/state/relay.json'
+                saved = read_json(relay) if relay.exists() else {}
+                branch = saved.get('branch', '') if isinstance(saved, dict) else ''
                 if not branch:
-                    relay = checkout / '.workbench/state/relay.json'
-                    if relay.exists():
-                        saved = read_json(relay)
-                        branch = saved.get('branch', '') if isinstance(saved, dict) else ''
-                if not isinstance(branch, str) or not branch.strip():
-                    raise QueueError('cannot identify branch')
+                    result = subprocess.run([shutil.which('git') or 'git', '-C', str(checkout),
+                                             'branch', '--show-current'], capture_output=True, text=True,
+                                            timeout=30)
+                    branch = result.stdout.strip() if result.returncode == 0 else ''
+                if (not isinstance(branch, str) or
+                        not re.fullmatch(r'issue-' + str(m['number']) + r'(?:-.*)?', branch)):
+                    raise QueueError(f'cannot identify issue branch for #{m["number"]}: {branch!r}')
                 prs = self.gh('pr', 'list', '--repo', data['repo'], '--head', branch,
                               '--state', 'all', '--json', 'number,state,url')
                 if not isinstance(prs, list) or any(not isinstance(p, dict) or
@@ -1006,10 +1011,21 @@ class Worker:
                     p.get('state') not in {'OPEN', 'CLOSED', 'MERGED'} for p in prs):
                     raise QueueError('invalid PR list response')
                 merged = next((p for p in prs if p['state'] == 'MERGED'), None)
+                if not merged and any(p['state'] == 'OPEN' for p in prs):
+                    self.errors.pop(key, None)
+                    continue
                 issue = None if merged else self.gh('issue', 'view', str(m['number']),
                                                     '--repo', data['repo'], '--json', 'state')
                 if issue is not None and (not isinstance(issue, dict) or issue.get('state') not in {'OPEN', 'CLOSED'}):
                     raise QueueError('invalid issue response')
+                # The original snapshot may predate a newly opened review/helper session.
+                if cleanup.live_sessions(data['repo'], m['number'], agw.tree()):
+                    with self.store.transaction() as current:
+                        member = find_member(current, m['number'])
+                        if member and member['state'] == 'active':
+                            member.pop('goneSince', None)
+                    self.errors.pop(key, None)
+                    continue
                 with self.store.transaction() as current:
                     member = find_member(current, m['number'])
                     if not member or member['state'] != 'active' or member.get('pr'):
@@ -1021,7 +1037,7 @@ class Worker:
                         member.update(state='closed', phase='closed', slotReleased=True,
                                       reason='stale: issue closed and no session remains')
                 self.errors.pop(key, None)
-            except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as err:
+            except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, agw.CtlError) as err:
                 self.error(key, err)
 
     # --- priorities (#34) ----------------------------------------------------------------------------
