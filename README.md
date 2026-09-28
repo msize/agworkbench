@@ -592,8 +592,9 @@ cannot be failed over: you get the notification, and the loop waits. Set `"failo
 have limits only reported. In a queue, a limit that any live member recorded sends later members
 to Claude (with `failover` on). If Claude is limited, or failover is off, the queue pauses with
 `toolsPaused: "tool limits: ..."`. Once the limit has reset, clear it for the queue with
-`-Queue <spec> -Implementer <tool>`, even when that is already the queue's tool. Records made
-before that are ignored from then on. The limit strings come from the installed binaries
+`-Queue <spec> -ClearLimit <tool>`. That changes nothing else: the queue's `-Implementer` stays as
+it is, and setting `-Implementer` never clears a limit. Records made before the clear are ignored
+from then on, and `-DryRun` shows the record it would clear. The limit strings come from the installed binaries
 (`tests/fixtures/limits/`, with the command that extracted them).
 
 ### Auto-merge (opt-in)

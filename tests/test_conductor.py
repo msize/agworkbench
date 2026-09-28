@@ -1934,6 +1934,31 @@ class EnvironmentalBlocks(unittest.TestCase):
         w.tick()
         self.assertEqual([1, 2], self.launched())   # #1 holds the only slot again
 
+    def test_a_resumed_member_with_a_pr_frees_its_slot_when_its_session_is_gone(self):
+        self.start('o/r#1,2', parallel=1)
+        w = self.worker()
+        w.tick(); w.tick()
+        self.sessions = {1}
+        self.report(1, 'pr-open')
+        w.tick()
+        self.report(1, 'blocked', reason='a question on review')
+        w.tick()
+        self.report(1, 'resumed')
+        w.tick()
+        self.assertEqual(('active', False), (self.member(1)['state'], self.member(1)['slotReleased']))
+        self.assertTrue(self.member(1)['pr'])
+        w.tick()
+        self.assertEqual([1, 2], self.launched())     # #2 took the slot #1 freed at pr-open
+        self.report(2, 'pr-open')
+        with self.store.transaction() as data:        # a third member waits behind #1's slot
+            data['members'].append(q.new_member(3, 'o/r', self.root / 'clones'))
+        w.tick()
+        self.assertEqual([1, 2], self.launched())
+        self.sessions = {2}                           # #1's sessions die; its PR is never merged
+        w.tick()
+        self.assertTrue(self.member(1)['slotReleased'])
+        self.assertEqual([1, 2, 3], self.launched())
+
     def test_the_live_ceiling_holds_in_a_cascade(self):
         self.start('o/r#' + ','.join(map(str, range(1, 9))), parallel=1)
         w = self.worker()
@@ -1997,8 +2022,10 @@ class ToolLimits(unittest.TestCase):
                 'kind': kind, 'tool': tool, 'line': f'{tool} {kind}', 'firstSeen': at.isoformat(timespec='seconds'),
                 'announced': True}}})
         else:
+            # The launcher writes [DateTime]::UtcNow.ToString('o'): seven fractional digits and a Z.
+            stamp = at.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f') + '7Z'
             q.atomic_json(state / 'implementer.json', {'tool': 'claude', 'limits': {tool: {
-                'at': at.isoformat(), 'line': f'{tool} {kind}', 'kind': kind}}})
+                'at': stamp, 'line': f'{tool} {kind}', 'kind': kind}}})
 
     def next_member(self):
         self.report(1, 'pr-open')
@@ -2033,31 +2060,65 @@ class ToolLimits(unittest.TestCase):
         self.next_member()
         self.assertEqual([(2, None)], [(n, None if tool == 'claude' else tool) for n, tool in self.implementers])
 
-    def test_the_humans_implementer_clears_it_and_old_records_stay_ignored(self):
-        self.record(1, at=datetime.now(timezone.utc) - timedelta(minutes=5))
-        self.w.tick()
-        self.assertIn('codex', self.store.load()['toolLimits'])
-        self.start('o/r#1', implementer='codex')                    # "codex has reset"
-        self.assertNotIn('toolLimits', self.store.load())
-        self.next_member()
-        self.assertEqual([(2, 'codex')], self.implementers)          # #1's old failover does not bring it back
-        self.assertNotIn('toolLimits', self.store.load())
-        self.record(2, at=datetime.now(timezone.utc) + timedelta(minutes=1), relay=True)
-        self.report(2, 'pr-open')
-        self.w.tick()
-        self.assertEqual([(2, 'codex'), (3, 'claude')], self.implementers)
-
-    def test_the_same_implementer_clears_even_without_a_settings_change(self):
-        with self.store.transaction() as data:
-            data['implementer'] = 'codex'
+    def test_clear_limit_forgets_it_and_old_records_stay_ignored(self):
         self.record(1, at=datetime.now(timezone.utc) - timedelta(minutes=5))
         self.w.tick()
         self.assertIn('codex', self.store.load()['toolLimits'])
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            self.start('o/r#1', implementer='codex')                # already codex: no settings change
+            self.start('o/r#1', clear_limit='codex')                # "codex has reset"
+        self.assertIn('cleared the recorded usage limit for codex (codex warning)', out.getvalue())
         self.assertNotIn('toolLimits', self.store.load())
-        self.assertIn('cleared the recorded usage limit for codex', out.getvalue())
+        self.assertNotIn('implementer', self.store.load())          # nothing else changes
+        self.next_member()
+        self.assertEqual([(2, None)], self.implementers)             # #1's old failover does not bring it back
+        self.assertNotIn('toolLimits', self.store.load())
+        self.record(2, at=datetime.now(timezone.utc) + timedelta(minutes=1), relay=True)
+        self.report(2, 'pr-open')
+        self.w.tick()
+        self.assertEqual([(2, None), (3, 'claude')], self.implementers)
+
+    def test_clear_limit_claude_resumes_a_codex_queue_without_switching_it(self):
+        with self.store.transaction() as data:
+            data['implementer'] = 'codex'
+        self.record(1, tool='claude', kind='limited', relay=True)
+        self.next_member()
+        self.assertIn('toolsPaused', self.store.load())
+        self.start('o/r#1', clear_limit='claude')
+        self.w.tick()
+        self.assertNotIn('toolsPaused', self.store.load())
+        self.assertEqual('codex', self.store.load()['implementer'])
+        self.assertEqual([(2, 'codex')], self.implementers)
+
+    def test_implementer_alone_never_clears_a_limit(self):
+        self.record(1, at=datetime.now(timezone.utc) - timedelta(minutes=5))
+        self.w.tick()
+        self.start('o/r#1', implementer='codex')
+        self.assertIn('codex', self.store.load()['toolLimits'])
+        self.assertNotIn('toolLimitsClearedAt', self.store.load())
+        self.next_member()
+        self.assertEqual([(2, 'claude')], self.implementers)         # still routed away from the limit
+
+    def test_dry_run_shows_the_clear_and_writes_nothing(self):
+        self.record(1)
+        self.w.tick()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.start('o/r#1', clear_limit='codex', dry_run=True)
+        shown = json.loads(out.getvalue())
+        self.assertEqual(('codex', 'codex warning'), (shown['clearLimit']['tool'], shown['clearLimit']['recorded']['line']))
+        self.assertIn('codex', self.store.load()['toolLimits'])
+
+    def test_a_transient_read_error_does_not_alert(self):
+        # r1 m1: the error count resets on success, and each operation has its own key.
+        self.report(1, 'blocked', reason='x')
+        path = Path(self.member(1)['checkout']) / '.workbench/state/relay.json'
+        for broken in (True, False, True, True):
+            path.write_text('{broken' if broken else '{}', encoding='utf-8')
+            self.w.tick()
+        self.assertEqual([], [c for c in self.w.notify.call_args_list if 'limits #1' in c.args[0]
+                              or 'environment #1' in c.args[0]])
+        self.assertEqual(2, self.w.errors['environment #1'])
 
     def test_malformed_tool_limits_are_refused(self):
         for bad in ({'toolLimits': {'aider': {}}}, {'toolLimits': {'codex': {'at': 'x'}}},

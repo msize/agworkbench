@@ -359,26 +359,23 @@ LIVE_STATES = {'active', 'blocked', 'pr-open'}
 _UNREAD = object()
 
 
-def min_free_gb(config):
-    """`minFreeGB` from the config (#41): default 20, 0 turns the guard off. Anything else is an error."""
+def free_setting(config, key, default):
+    """A GiB threshold from the config: `default` when absent, 0 turns its guard off. Anything else is an error."""
     settings = read_json(config) if Path(config).exists() else {}
-    value = settings.get('minFreeGB', 20)
+    value = settings.get(key, default)
     if value is None:
-        return 20
+        return default
     if type(value) not in (int, float) or value < 0:
-        raise QueueError(f'minFreeGB in {config} must be a number >= 0 (got {value!r})')
+        raise QueueError(f'{key} in {config} must be a number >= 0 (got {value!r})')
     return value
+
+
+def min_free_gb(config):
+    return free_setting(config, 'minFreeGB', 20)          # #41
 
 
 def min_free_ram_gb(config):
-    """`minFreeRamGB` from the config (#61): default 3, 0 turns the guard off. Anything else is an error."""
-    settings = read_json(config) if Path(config).exists() else {}
-    value = settings.get('minFreeRamGB', 3)
-    if value is None:
-        return 3
-    if type(value) not in (int, float) or value < 0:
-        raise QueueError(f'minFreeRamGB in {config} must be a number >= 0 (got {value!r})')
-    return value
+    return free_setting(config, 'minFreeRamGB', 3)        # #61
 
 
 def free_ram():
@@ -430,13 +427,8 @@ def valid_tool_limits(data):
 
 def epoch(value):
     """An ISO time (the launcher's `o` format or the relay's) as epoch seconds; None when unreadable."""
-    try:
-        moment = datetime.fromisoformat(value)
-    except (TypeError, ValueError):
-        return None
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=timezone.utc)
-    return moment.timestamp()
+    moment = closer.parse_time(value)
+    return moment.timestamp() if moment else None
 
 
 def member_limits(m):
@@ -662,7 +654,7 @@ def settings_changes(data, parallel, yes, implementer, auto_merge, autonomous, w
 
 def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=False, dry_run=False, root=None,
                 implementer=None, auto_merge=None, autonomous=None, gh=gh_json, triage_on=False,
-                prune=False):
+                prune=False, clear_limit=None):
     repo, numbers, label = resolve_spec(expand_spec(spec, config_path()), repo, gh)
     matched = set(numbers)
     matches = len(numbers)
@@ -676,6 +668,8 @@ def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=Fa
         raise UsageError('-Parallel must be between 1 and 8')
     if implementer not in (None, 'codex', 'claude'):
         raise UsageError('-Implementer must be codex or claude')
+    if clear_limit not in (None, 'codex', 'claude'):
+        raise UsageError('-ClearLimit must be codex or claude')
     existing = store.load() if store.path.exists() else None      # under the state lock, like every other read
     known = {m['number']: m['state'] for m in existing['members']} if existing else {}
     pruned = [m['number'] for m in existing['members']
@@ -692,9 +686,12 @@ def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=Fa
         mode = 'start' if existing is None else ('append to a running queue' if live else 'append to a stopped queue')
         changes = settings_changes(existing, parallel, yes, implementer, auto_merge, autonomous, watch, label, triage_on)
         query = dict(query=label.text, matches=matches) if isinstance(label, labelquery.Query) else {}
+        limits = dict(clearLimit=dict(tool=clear_limit, recorded=((existing or {}).get('toolLimits') or {}).get(clear_limit))
+                      ) if clear_limit else {}
         print(json.dumps(dict(repo=repo, **query, members=numbers, running=live, mode=mode,
                               skipped=[dict(number=n, reason=r) for n, r in sorted(skipped.items())],
-                              settings=changes, pruned=pruned, owner=existing.get('owner') if existing else None)))
+                              settings=changes, pruned=pruned, owner=existing.get('owner') if existing else None,
+                              **limits)))
         return 0
     token = None
     with Lock(store.state_lock):
@@ -713,11 +710,11 @@ def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=Fa
         for key, (_, new) in changes.items():
             data[key] = new
         cleared = None
-        if implementer:
-            # The human says this tool is usable (#61), even when it is already the queue's: records
-            # of it from before now are ignored, so a member's old failover never brings it back.
-            data.setdefault('toolLimitsClearedAt', {})[implementer] = time.time()
-            cleared = (data.get('toolLimits') or {}).pop(implementer, None)
+        if clear_limit:
+            # The human says this tool's limit has reset (#61), and nothing else changes: records of it
+            # from before now are ignored, so a member's old failover never brings it back.
+            data.setdefault('toolLimitsClearedAt', {})[clear_limit] = time.time()
+            cleared = (data.get('toolLimits') or {}).pop(clear_limit, None)
             if not data.get('toolLimits'):
                 data.pop('toolLimits', None)
         pruned = [m['number'] for m in data['members']
@@ -753,8 +750,9 @@ def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=Fa
     for key, (old, new) in changes.items():
         suffix = '' if key in ('label', 'query') else ' (for every member launched from now on)'
         print(f'settings: {key} {json.dumps(old)} -> {json.dumps(new)}{suffix}')
-    if cleared:
-        print(f'settings: cleared the recorded usage limit for {implementer} ({cleared["line"]})')
+    if clear_limit:
+        was = f' ({cleared["line"]})' if cleared else ' (none was recorded)'
+        print(f'settings: cleared the recorded usage limit for {clear_limit}{was}; older records are ignored')
     if token is None:
         if owner.get('session') and not owner.get('pinned'):
             pin_conductor(store, owner)
@@ -1500,6 +1498,7 @@ class Worker:
         if self.tick_sessions is _UNREAD:
             try:
                 self.tick_sessions = session_numbers(repo, agw.tree())
+                self.errors.pop('live sessions', None)
             except (OSError, ValueError, KeyError, TypeError, agw.CtlError) as err:
                 self.error('live sessions', err)
                 self.tick_sessions = None
@@ -1512,12 +1511,21 @@ class Worker:
     def hold_environment(self, data, m):
         """A blocked member keeps its slot while the cause is environmental - its report says so, or
         its relay announced a usage limit - and its issue session is still in the terminal (#61)."""
+        key = f'environment #{m["number"]}'
         try:
             environmental = m.get('cause') == 'environment' or relay_limited(m)
-        except (OSError, ValueError) as err:
-            self.error(f'limits #{m["number"]}', err)
+            self.errors.pop(key, None)
+        except (OSError, ValueError, AttributeError) as err:
+            self.error(key, err)
             environmental = m.get('cause') == 'environment'
         m['slotReleased'] = not (environmental and self.has_session(data, m))
+
+    def release_orphaned_slot(self, data, m):
+        """A resumed member with a PR takes a slot (#61), and refresh_stale skips members with a PR:
+        once its issue session is gone, nothing runs there, so the slot is released - the same rule
+        as an environmental block."""
+        if not m['slotReleased'] and not self.has_session(data, m):
+            m['slotReleased'] = True
 
     def collect_tool_limits(self, data):
         """Merge live members' recorded usage limits into the queue's toolLimits (#61). A record not
@@ -1527,16 +1535,18 @@ class Worker:
         for m in data['members']:
             if m['state'] not in LIVE_STATES or not m['checkoutEstablished']:
                 continue
+            key = f'limits #{m["number"]}'
             try:
                 found = member_limits(m)
+                self.errors.pop(key, None)
             except (OSError, ValueError, AttributeError) as err:
-                self.error(f'limits #{m["number"]}', err)
+                self.error(key, err)
                 continue
             for tool, at, line, kind in found:
                 if at > cleared.get(tool, 0) and tool not in limits:
                     limits[tool] = dict(at=at, line=line, kind=kind, member=m['number'])
                     self.alerts.append(f'#{m["number"]}: {tool} {kind}: new members avoid it until '
-                                       f'-Queue ... -Implementer {tool} clears it')
+                                       f'-Queue ... -ClearLimit {tool} clears it')
         if limits:
             data['toolLimits'] = limits
 
@@ -1586,6 +1596,8 @@ class Worker:
                         self.error(f'loop #{m["number"]}', err)
                 if m['state'] == 'blocked':
                     self.hold_environment(data, m)
+                elif m['state'] == 'active' and m.get('pr'):
+                    self.release_orphaned_slot(data, m)
                 if m['state'] in {'active', 'blocked'} and not m.get('pr'):
                     try:
                         if adopt_done(data, m):
@@ -1821,6 +1833,8 @@ def main(argv=None):
     for flag in ('watch', 'retry', 'yes', 'dry-run', 'triage', 'prune'):
         start.add_argument('--' + flag, action='store_true')
     start.add_argument('--implementer', choices=('codex', 'claude'))
+    start.add_argument('--clear-limit', choices=('codex', 'claude'),
+                       help="forget the queue's recorded usage limit of this tool (#61)")
     merge = start.add_mutually_exclusive_group()
     merge.add_argument('--auto-merge', dest='auto_merge', action='store_const', const=True)
     merge.add_argument('--no-auto-merge', dest='auto_merge', action='store_const', const=False)
@@ -1864,7 +1878,8 @@ def main(argv=None):
                     raise UsageError('--spec-env: AGWORKBENCH_QUEUE_SPEC is empty')
             return start_queue(spec, args.repo, args.parallel, args.watch, args.retry, args.yes, args.dry_run,
                                implementer=args.implementer, auto_merge=args.auto_merge,
-                               autonomous=args.autonomous, triage_on=args.triage, prune=args.prune)
+                               autonomous=args.autonomous, triage_on=args.triage, prune=args.prune,
+                               clear_limit=args.clear_limit)
         if args.command == 'run':
             return Worker(Store(args.file), args.token).run()
         if args.command == 'mark':

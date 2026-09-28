@@ -31,6 +31,7 @@
   github-workbench -Queue 'yeroo/agworkbench#7,10' -Parallel 2
 .EXAMPLE
   github-workbench -Queue 'label:ready' -Repo yeroo/agworkbench -Watch
+  github-workbench -Queue 'label:ready' -Repo yeroo/agworkbench -ClearLimit codex   # codex's limit has reset (#61)
 .EXAMPLE
   github-workbench -Queue bugs -Repo yeroo/docxy -Autonomous   # every open bug nobody is handling
 .EXAMPLE
@@ -65,6 +66,7 @@ param(
     [int] $QueueAttempt,
     [string] $QueueToken,
     [string] $Implementer,
+    [string] $ClearLimit,
     [switch] $AutoMerge,
     [switch] $NoAutoMerge,
     [switch] $Failover,
@@ -168,6 +170,13 @@ if ($PSBoundParameters.ContainsKey('Implementer') -and $Implementer -cnotin @('c
     exit 2
 }
 
+if ($PSBoundParameters.ContainsKey('ClearLimit') -and
+    ($ClearLimit -cnotin @('codex', 'claude') -or -not $PSBoundParameters.ContainsKey('Queue'))) {
+    # A queue's recorded usage limit (#61); a checkout's is cleared by -Implementer <tool> on it.
+    Write-Host "-ClearLimit takes codex or claude and belongs to -Queue (got '$ClearLimit')" -ForegroundColor Yellow
+    exit 2
+}
+
 if ($Failover -and ($Implementer -or $PSBoundParameters.ContainsKey('Queue') -or $NewSession -or $QueueMember)) {
     Write-Host '-Failover picks the other tool itself; it cannot be combined with -Implementer, -Queue, -NewSession or a queue member.' -ForegroundColor Yellow
     exit 2
@@ -214,6 +223,7 @@ if ($PSBoundParameters.ContainsKey('Queue')) {
     if ($Yes) { $queueArgs += '--yes' }
     if ($DryRun) { $queueArgs += '--dry-run' }
     if ($Implementer) { $queueArgs += @('--implementer', $Implementer) }
+    if ($ClearLimit) { $queueArgs += @('--clear-limit', $ClearLimit) }
     if ($AutoMerge) { $queueArgs += '--auto-merge' }
     if ($NoAutoMerge) { $queueArgs += '--no-auto-merge' }
     if ($Autonomous) { $queueArgs += '--autonomous' }
@@ -265,7 +275,7 @@ if (-not $Issue) {
     Write-Host "usage: github-workbench <issue> [-Repo owner/name] [-DryRun] [-Yes] [-NewSession] [-Implementer codex|claude] [-AutoMerge|-NoAutoMerge] [-Autonomous|-NoAutonomous] [-Failover]" -ForegroundColor Yellow
     Write-Host "       github-workbench -Version"
     Write-Host "       (<spec> is a list like 3,4,5, label:<name>, bugs = label:<bugLabel>, or where: <label query>)"
-    Write-Host "       github-workbench -Queue <spec> [-Repo owner/name] [-Parallel 1..8] [-Watch] [-Prune] [-Retry] [-Yes] [-DryRun] [-Implementer codex|claude] [-AutoMerge|-NoAutoMerge] [-Autonomous|-NoAutonomous] [-Triage]"
+    Write-Host "       github-workbench -Queue <spec> [-Repo owner/name] [-Parallel 1..8] [-Watch] [-Prune] [-Retry] [-Yes] [-DryRun] [-Implementer codex|claude] [-ClearLimit codex|claude] [-AutoMerge|-NoAutoMerge] [-Autonomous|-NoAutonomous] [-Triage]"
     Write-Host "       github-workbench -Triage|-Retriage -Repo owner/name [-Limit N] [-DryRun] [-FollowUps] [-Watch]"
     Write-Host "       github-workbench -Cleanup [-Repo owner/name] [-DryRun] [-BuildOnly]"
     Write-Host "  <issue> is 123, owner/repo#123, or https://github.com/owner/repo/issues/123"
