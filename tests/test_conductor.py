@@ -583,6 +583,137 @@ class QueueCase(unittest.TestCase):
         worker.tick()
         self.assertEqual('merged', self.member()['state'])
 
+    def test_done_without_pr_open_is_adopted_and_merged(self):
+        self.start('o/r#1')
+        worker = self.worker(); worker.tick(); worker.tick()
+        state = Path(self.member()['checkout']) / '.workbench/state'
+        q.atomic_json(state / 'loop-done.json', {'pr': 457, 'at': self.now})
+        self.pr_state = 'MERGED'
+        worker.tick()
+        self.assertEqual(('merged', 'MERGED', True),
+                         (self.member()['state'], self.member()['prState'], self.member()['slotReleased']))
+        self.assertEqual('https://github.com/o/r/pull/457', self.member()['pr'])
+
+    def test_adopt_done_ignores_old_no_pr_and_malformed_records(self):
+        self.start('o/r#1')
+        worker = self.worker(); worker.tick(); worker.tick()
+        state = Path(self.member()['checkout']) / '.workbench/state'
+        for record in ({'pr': 2, 'at': self.now - 1}, {'pr': 2, 'at': True},
+                       {'pr': True, 'at': self.now}, {'pr': 0, 'at': self.now},
+                       {'pr': 2, 'at': float('nan')}, {'pr': 2, 'at': self.now, 'noPr': True},
+                       {'pr': '2', 'at': self.now}, []):
+            with self.subTest(record=record):
+                q.atomic_json(state / 'loop-done.json', record)
+                worker.tick()
+                self.assertEqual(('active', None), (self.member()['state'], self.member()['pr']))
+        with self.store.transaction() as data:
+            data['members'][0].pop('startedAt')
+        q.atomic_json(state / 'loop-done.json', {'pr': 2, 'at': self.now})
+        worker.tick()
+        self.assertEqual('active', self.member()['state'])
+
+    def test_late_pr_open_report_cannot_demote_merged_member(self):
+        self.start('o/r#1')
+        worker = self.worker(); worker.tick(); worker.tick()
+        self.report(1)
+        worker.tick()
+        with self.store.transaction() as data:
+            data['members'][0].update(state='merged', prState='MERGED', slotReleased=True)
+        report = self.report(1)
+        with self.store.transaction() as data:
+            self.assertTrue(q.apply_loop(data, data['members'][0], self.store.path))
+        m = self.member()
+        self.assertEqual(('merged', 'MERGED', True, report['rev']),
+                         (m['state'], m['prState'], m['slotReleased'], m['consumedRev']))
+
+    def test_stale_active_merged_pr_wins_and_releases_slot(self):
+        self.start('o/r#1')
+        worker = self.worker(); worker.tick(); worker.tick()
+        self.now += 1801
+        with patch.object(q.agw, 'tree', return_value={'workspaces': []}):
+            worker.refresh_remote()
+        self.assertEqual(self.now, self.member()['goneSince'])
+        self.now += 1801
+        worker.gh = Mock(side_effect=lambda *args: ([{'number': 457, 'state': 'MERGED'}]
+                              if args[:2] == ('pr', 'list') else AssertionError(args)))
+        branch = Mock(returncode=0, stdout='issue-1-fix\n')
+        with patch.object(q.agw, 'tree', return_value={'workspaces': []}), \
+                patch.object(q.subprocess, 'run', return_value=branch):
+            worker.refresh_remote()
+        self.assertEqual(('merged', 'MERGED', True),
+                         (self.member()['state'], self.member()['prState'], self.member()['slotReleased']))
+        self.assertEqual('https://github.com/o/r/pull/457', self.member()['pr'])
+        self.assertFalse(any(c.args[:2] == ('issue', 'view') for c in worker.gh.call_args_list))
+
+    def test_stale_active_checks_sessions_branch_and_closed_issue(self):
+        self.start('o/r#1')
+        worker = self.worker(); worker.tick(); worker.tick()
+        self.now += 1801
+        live = {'workspaces': [{'name': 'r', 'sessions': [{'name': '#1 helper'}]}]}
+        with patch.object(q.agw, 'tree', return_value=live):
+            worker.refresh_remote()
+        self.assertNotIn('goneSince', self.member())
+        self.now += 301
+        with patch.object(q.agw, 'tree', return_value={'workspaces': []}):
+            worker.refresh_remote()
+        self.assertIn('goneSince', self.member())
+        self.now += 1801
+        branch = Mock(returncode=1, stdout='')
+        gh = Mock(side_effect=AssertionError('empty branch must not query GitHub'))
+        worker.gh = gh
+        with patch.object(q.agw, 'tree', return_value={'workspaces': []}), \
+                patch.object(q.subprocess, 'run', return_value=branch):
+            worker.refresh_remote()
+        self.assertEqual('active', self.member()['state'])
+        self.assertIn('goneSince', self.member())
+        gh.assert_not_called()
+        worker.gh = Mock(return_value={'unexpected': 'shape'})
+        with patch.object(q.agw, 'tree', return_value={'workspaces': []}), \
+                patch.object(q.subprocess, 'run', return_value=Mock(returncode=0, stdout='issue-1-fix')):
+            worker.next_pr = 0
+            worker.refresh_remote()
+        self.assertEqual('active', self.member()['state'])
+        self.assertIn('goneSince', self.member())
+        worker.gh = Mock(side_effect=lambda *args: [] if args[:2] == ('pr', 'list') else {'state': 'CLOSED'})
+        with patch.object(q.agw, 'tree', return_value={'workspaces': []}), \
+                patch.object(q.subprocess, 'run', return_value=Mock(returncode=0, stdout='issue-1-fix')):
+            worker.next_pr = 0
+            worker.refresh_remote()
+        self.assertEqual(('closed', True), (self.member()['state'], self.member()['slotReleased']))
+        self.assertTrue(self.member()['reason'].startswith('stale:'))
+
+    def test_stale_session_reappearing_clears_gone_since(self):
+        self.start('o/r#1')
+        worker = self.worker(); worker.tick(); worker.tick()
+        self.now += 1801
+        with patch.object(q.agw, 'tree', return_value={'workspaces': []}):
+            worker.refresh_remote()
+        self.now += 301
+        with patch.object(q.agw, 'tree', return_value={'workspaces': [
+                {'name': 'r', 'sessions': [{'name': '#1 review'}]}]}):
+            worker.refresh_remote()
+        self.assertNotIn('goneSince', self.member())
+
+    def test_mark_cli_records_audit_and_refuses_invalid_targets(self):
+        self.start('o/r#1,2')
+        worker = self.worker(); worker.tick(); worker.tick()
+        url = 'https://github.com/o/r/pull/457'
+        with patch.dict(os.environ):
+            os.environ.pop('CLAUDE_CODE_SESSION_ID', None)
+            self.assertEqual(0, q.main(['mark', '--file', str(self.store.path), '--number', '1',
+                                        '--pr', url, '--reason', 'planner gone']))
+        member = self.member()
+        audit = member['operatorMark']
+        self.assertEqual((url, 'planner gone', 'pr-open', True),
+                         (audit['pr'], audit['reason'], member['state'], member['slotReleased']))
+        line = json.loads((self.store.directory / 'operator.log').read_text().splitlines()[0])
+        self.assertEqual(dict(number=1, **audit), line)
+        for number, pr in [(1, 'https://github.com/other/repo/pull/1'), (99, url), (2, url)]:
+            with self.subTest(number=number, pr=pr):
+                self.assertNotEqual(0, q.main(['mark', '--file', str(self.store.path),
+                                               '--number', str(number), '--pr', pr]))
+        self.assertEqual(1, len((self.store.directory / 'operator.log').read_text().splitlines()))
+
     def test_gh_uses_a_deadline_and_never_modifies_a_pr(self):
         with patch.object(q.subprocess, 'Popen') as spawn, patch.object(q.shutil, 'which', return_value='gh'):
             spawn.return_value.returncode = 0

@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import math
 import os
+import getpass
 import re
 import shutil
 import subprocess
@@ -455,6 +457,25 @@ def find_member(data, number):
     return next((m for m in data['members'] if m['number'] == number), None)
 
 
+def mark_pr(path, number, pr, reason=None):
+    """Operator recovery for a missing planner PR report, with a durable audit line."""
+    store = Store(path)
+    with store.transaction() as data:
+        url = pr_url(pr, data['repo'])
+        member = find_member(data, number)
+        if member is None:
+            raise UsageError(f'unknown queue member #{number}')
+        if member['state'] not in {'active', 'blocked', 'pr-open'}:
+            raise UsageError(f'cannot mark #{number} while {member["state"]}')
+        audit = dict(at=time.time(), pr=url, user=getpass.getuser(), reason=reason)
+        member.update(pr=url, prState=None, state='pr-open', phase='pr-open',
+                      slotReleased=True, reason=None, operatorMark=audit)
+        store.directory.mkdir(parents=True, exist_ok=True)
+        with (store.directory / 'operator.log').open('a', encoding='utf-8') as log:
+            log.write(json.dumps(dict(number=number, **audit)) + '\n')
+    return audit
+
+
 def admission_key(m):
     """Pending members are admitted P0, P1, untriaged, P2, P3 (#34); oldest issue first within a
     rank, then the order they were queued."""
@@ -706,6 +727,11 @@ def apply_loop(data, member, path):
         raise QueueError(f"{report['state']} loop report requires a reason")
     if report.get('pr'):
         pr_url(report['pr'], data['repo'])
+    if (report['state'] == 'pr-open' and member['state'] == 'merged' and
+            member.get('prState') == 'MERGED' and member.get('pr') == report['pr']):
+        member.update(consumedLoop=loop, consumedRev=report['rev'], slotReleased=True)
+        return True
+    if report.get('pr'):
         if member.get('pr') != report['pr']:
             member.update(pr=report['pr'], prState=None)
     state = 'active' if report['state'] == 'resumed' else report['state']
@@ -722,6 +748,27 @@ def apply_loop(data, member, path):
         member.update(pr=None, prState=None)
     if state in {'pr-open', 'blocked', 'closed'}:
         member['slotReleased'] = True
+    return True
+
+
+def adopt_done(data, member):
+    """Recover a current attempt's PR when the planner skipped its queue report."""
+    if member['state'] not in {'active', 'blocked'} or member.get('pr'):
+        return False
+    path = Path(member['checkout']) / '.workbench/state/loop-done.json'
+    if not path.exists():
+        return False
+    done = read_json(path)
+    started = member.get('startedAt')
+    at = done.get('at') if isinstance(done, dict) else None
+    number = done.get('pr') if isinstance(done, dict) else None
+    if (not isinstance(done, dict) or done.get('noPr') is True or
+            type(started) not in (int, float) or not math.isfinite(started) or
+            type(at) not in (int, float) or not math.isfinite(at) or at < started or
+            type(number) is not int or number <= 0):
+        return False
+    member.update(pr=f"https://github.com/{data['repo']}/pull/{number}", prState=None,
+                  state='pr-open', phase='pr-open', reason=None, slotReleased=True)
     return True
 
 
@@ -882,6 +929,7 @@ class Worker:
                     self.errors.pop(key, None)
                 except (OSError, ValueError, KeyError, subprocess.SubprocessError) as err:
                     self.error(key, err)
+            self.refresh_stale(data)
         if data['watch'] and self.clock() >= self.next_scan:
             self.next_scan = self.clock() + 300
             try:
@@ -904,6 +952,77 @@ class Worker:
                 self.errors.pop('label scan', None)
             except (OSError, ValueError, KeyError, subprocess.SubprocessError, QueueError, agw.CtlError) as err:
                 self.error('label scan', err)
+
+    def refresh_stale(self, data):
+        """Resolve a lost active loop only after its sessions have been absent for a grace period."""
+        now = self.clock()
+        candidates = [m for m in data['members'] if m['state'] == 'active' and not m.get('pr') and
+                      type(m.get('startedAt')) in (int, float) and math.isfinite(m['startedAt']) and
+                      (now - m['startedAt'] >= 1800 or m.get('goneSince') is not None)]
+        if not candidates:
+            return
+        try:
+            import cleanup
+            tree = agw.tree()
+        except (OSError, ValueError, KeyError, TypeError, agw.CtlError) as err:
+            self.error('stale sessions', err)
+            return
+        for m in candidates:
+            key = f'stale #{m["number"]}'
+            try:
+                live = cleanup.live_sessions(data['repo'], m['number'], tree)
+                if live:
+                    with self.store.transaction() as current:
+                        member = find_member(current, m['number'])
+                        if member and member['state'] == 'active':
+                            member.pop('goneSince', None)
+                    self.errors.pop(key, None)
+                    continue
+                with self.store.transaction() as current:
+                    member = find_member(current, m['number'])
+                    if not member or member['state'] != 'active' or member.get('pr'):
+                        continue
+                    if type(member.get('goneSince')) not in (int, float):
+                        member['goneSince'] = now
+                    gone = member['goneSince']
+                if now - gone < 1800:
+                    continue
+                checkout = Path(m['checkout'])
+                result = subprocess.run([shutil.which('git') or 'git', '-C', str(checkout),
+                                         'branch', '--show-current'], capture_output=True, text=True,
+                                        timeout=30)
+                branch = result.stdout.strip() if result.returncode == 0 else ''
+                if not branch:
+                    relay = checkout / '.workbench/state/relay.json'
+                    if relay.exists():
+                        saved = read_json(relay)
+                        branch = saved.get('branch', '') if isinstance(saved, dict) else ''
+                if not isinstance(branch, str) or not branch.strip():
+                    raise QueueError('cannot identify branch')
+                prs = self.gh('pr', 'list', '--repo', data['repo'], '--head', branch,
+                              '--state', 'all', '--json', 'number,state,url')
+                if not isinstance(prs, list) or any(not isinstance(p, dict) or
+                    type(p.get('number')) is not int or p['number'] <= 0 or
+                    p.get('state') not in {'OPEN', 'CLOSED', 'MERGED'} for p in prs):
+                    raise QueueError('invalid PR list response')
+                merged = next((p for p in prs if p['state'] == 'MERGED'), None)
+                issue = None if merged else self.gh('issue', 'view', str(m['number']),
+                                                    '--repo', data['repo'], '--json', 'state')
+                if issue is not None and (not isinstance(issue, dict) or issue.get('state') not in {'OPEN', 'CLOSED'}):
+                    raise QueueError('invalid issue response')
+                with self.store.transaction() as current:
+                    member = find_member(current, m['number'])
+                    if not member or member['state'] != 'active' or member.get('pr'):
+                        continue
+                    if merged:
+                        member.update(pr=f"https://github.com/{data['repo']}/pull/{merged['number']}",
+                                      prState='MERGED', state='merged', phase='pr-open', slotReleased=True)
+                    elif issue['state'] == 'CLOSED':
+                        member.update(state='closed', phase='closed', slotReleased=True,
+                                      reason='stale: issue closed and no session remains')
+                self.errors.pop(key, None)
+            except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as err:
+                self.error(key, err)
 
     # --- priorities (#34) ----------------------------------------------------------------------------
     # Pending members are admitted by their issue's `priority:` label. The labels are read once per
@@ -1227,6 +1346,13 @@ class Worker:
                     except (OSError, ValueError, KeyError, TypeError) as err:
                         # A partial/unrelated report never turns into an admission signal.
                         self.error(f'loop #{m["number"]}', err)
+                if m['state'] in {'active', 'blocked'} and not m.get('pr'):
+                    try:
+                        if adopt_done(data, m):
+                            self.next_pr = 0
+                            self.errors.pop(f'done #{m["number"]}', None)
+                    except (OSError, ValueError, KeyError, TypeError) as err:
+                        self.error(f'done #{m["number"]}', err)
         self.refresh_remote()
         self.refresh_priorities()
         self.step_triage()
@@ -1449,6 +1575,11 @@ def main(argv=None):
     run = sub.add_parser('run')
     run.add_argument('--file', required=True)
     run.add_argument('--token', required=True)
+    mark = sub.add_parser('mark')
+    mark.add_argument('--file', required=True)
+    mark.add_argument('--number', required=True, type=int)
+    mark.add_argument('--pr', required=True)
+    mark.add_argument('--reason')
     proxy = sub.add_parser('gh-proxy')
     proxy.add_argument('arguments', nargs=argparse.REMAINDER)
     for verb in ('member-context', 'member-result'):
@@ -1481,6 +1612,10 @@ def main(argv=None):
                                autonomous=args.autonomous, triage_on=args.triage, prune=args.prune)
         if args.command == 'run':
             return Worker(Store(args.file), args.token).run()
+        if args.command == 'mark':
+            mark_pr(args.file, args.number, args.pr, args.reason)
+            print(f'marked #{args.number} PR {args.pr}')
+            return 0
         if args.command == 'member-context':
             print(json.dumps(member_context(args.file, args.number, args.attempt, args.token)))
         else:

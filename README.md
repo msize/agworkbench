@@ -183,6 +183,12 @@ an existing non-queue workbench loop. Internal `-QueueMember`, `-QueueAttempt`, 
 arguments are supplied by the conductor, not ordinary launch commands.
 When a closed issue needs no change, `wb.py loop-state done --no-pr --reason "<why>"` records it as
 `closed`, releases its queue slot, and counts it separately from `merged` in the summary.
+In queue mode, `wb.py loop-state done --pr N --sha S` also reports the PR to the conductor.
+The conductor can recover a PR from `loop-done.json` if that report fails. If a member's
+sessions disappear, it checks the branch PR and issue after a grace period and releases the
+slot when the PR merged or the issue closed. An operator can record a missing PR with
+`python lib/conductor.py mark --file <queue.json> --number N --pr <url> --reason "<why>"`;
+the action is recorded in the queue and its `operator.log`.
 
 Claude's conversation ID, original project directory and pane binding live in
 `.workbench/state/claude.json`. The launcher reserves the ID before starting Claude, so an

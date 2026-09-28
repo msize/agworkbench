@@ -128,6 +128,23 @@ class QueueReports(unittest.TestCase):
         self.assertEqual('closed', self.q.read_json(self.state / 'loop.json')['state'])
         self.assertFalse((self.state / 'waiting.json').exists())
 
+    def test_done_publishes_pr_once_and_keeps_completion_on_report_failure(self):
+        self.assertEqual(0, wb.loop_done(self.folder, '457', 'sha'))
+        report = self.q.read_json(self.state / 'loop.json')
+        self.assertEqual(('pr-open', 'https://github.com/o/r/pull/457', 1),
+                         (report['state'], report['pr'], report['rev']))
+        self.assertEqual(0, wb.loop_done(self.folder, '457', 'sha'))
+        self.assertEqual(1, self.q.read_json(self.state / 'loop.json')['rev'])
+        with patch.dict(os.environ, CLAUDE_CODE_SESSION_ID=str(uuid.uuid4())):
+            self.assertEqual(0, wb.loop_done(self.folder, '458', 'sha2'))
+        self.assertEqual(458, self.q.read_json(self.state / 'loop-done.json')['pr'])
+        self.assertIn('queue report failed', sys.stderr.getvalue())
+
+    def test_done_outside_queue_does_not_publish_loop_report(self):
+        (self.state / 'queue-member.json').unlink()
+        self.assertEqual(0, wb.loop_done(self.folder, '457', 'sha'))
+        self.assertFalse((self.state / 'loop.json').exists())
+
     def test_no_pr_refusals_leave_no_done_record(self):
         run = patch.object(wb.subprocess, 'run', return_value=type('Done', (), {'stdout': 'issue-1-fix'})())
         with run:

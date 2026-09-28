@@ -885,7 +885,22 @@ def loop_done(root: Path, pr: str | None, sha: str | None) -> int:
     record = {"pr": int(str(pr).rsplit("/", 1)[-1]), "sha": sha,
               "followUps": [item["url"] for item in items], "at": time.time()}
     path = root / ".workbench" / "state" / "loop-done.json"
-    from conductor import Lock, atomic_json
+    from conductor import Lock, atomic_json, read_json, write_loop_state, repo_name
+    member_path = path.with_name('queue-member.json')
+    if member_path.exists():
+        try:
+            member = read_json(member_path)
+            url = f"https://github.com/{repo_name(member['repo'])}/pull/{record['pr']}"
+            loop_path = path.with_name('loop.json')
+            previous = read_json(loop_path) if loop_path.exists() else {}
+            identity = read_json(path.with_name('claude.json'))
+            if not (previous.get('state') == 'pr-open' and previous.get('pr') == url and
+                    previous.get('loopId') == identity['sessionId'] and
+                    previous.get('queue') == member['queue']):
+                write_loop_state(root, 'pr-open', url)
+        except (OSError, ValueError, KeyError, TypeError) as err:
+            print(f'wb: loop-state done: queue report failed: {err}; '
+                  'the conductor will adopt the PR from loop-done.json', file=sys.stderr)
     with Lock(path.with_name('loop-done.lock')):
         atomic_json(path, record)
     print(f"loop done: PR #{record['pr']}; {len(items)} follow-up(s)")
