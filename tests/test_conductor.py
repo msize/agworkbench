@@ -1887,8 +1887,31 @@ class EnvironmentalBlocks(unittest.TestCase):
         self.assertFalse(q.finished(self.store.load()))
         self.sessions = set()                       # the human closed it: the slot goes with it
         w.tick()
+        self.now += q.SESSION_GRACE
+        w.tick()
         self.assertTrue(self.member(1)['slotReleased'])
         self.assertEqual([1, 2], self.launched())
+
+    def test_an_environmental_slot_survives_a_missed_read(self):
+        # r3 M1: a terminal that misses every session for one tick must not admit anyone.
+        self.start('o/r#1,2,3', parallel=2)
+        w = self.worker()
+        w.tick(); w.tick()
+        self.assertEqual([1, 2], self.launched())
+        self.sessions = {1, 2}
+        for n in (1, 2):
+            self.report(n, 'blocked', reason='codex limited', cause='environment')
+        w.tick()
+        self.sessions = set()                       # agwinterm restarting: one read lists nothing
+        w.tick()
+        self.assertEqual([1, 2], self.launched())
+        self.assertFalse(any(self.member(n)['slotReleased'] for n in (1, 2)))
+        self.assertFalse(q.finished(self.store.load()))
+        self.sessions = {1, 2}
+        w.tick()
+        self.assertNotIn('sessionGoneSince', self.member(1))
+        self.assertEqual([1, 2], self.launched())
+        self.assertFalse(self.member(1)['slotReleased'])
 
     def test_three_members_blocked_on_a_tool_limit_launch_nothing(self):
         self.start('o/r#1,2,3,4', parallel=3)

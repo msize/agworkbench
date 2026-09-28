@@ -1516,7 +1516,8 @@ class Worker:
 
     def hold_environment(self, data, m):
         """A blocked member keeps its slot while the cause is environmental - its report says so, or
-        its relay announced a usage limit - and its issue session is still in the terminal (#61)."""
+        its relay announced a usage limit - and its issue session is still in the terminal (#61),
+        under the same grace as watch_session. A question for the human frees it at once."""
         key = f'environment #{m["number"]}'
         try:
             environmental = m.get('cause') == 'environment' or relay_limited(m)
@@ -1524,14 +1525,21 @@ class Worker:
         except (OSError, ValueError, AttributeError) as err:
             self.error(key, err)
             environmental = m.get('cause') == 'environment'
-        m['slotReleased'] = not (environmental and self.has_session(data, m))
+        if environmental:
+            self.slot_by_session(data, m)
+        else:
+            m.pop('sessionGoneSince', None)
+            m['slotReleased'] = True
 
     def watch_session(self, data, m):
         """An active member with a PR or a resumed loop holds a slot (#61) that refresh_stale never
-        reclaims: it skips members with a PR, and an open issue without one stays active. Re-decided
-        every tick: once its issue session has been missing for SESSION_GRACE seconds the slot is
-        released (one missed read of a restarting terminal is not enough), and it is taken back when
-        the session is seen again."""
+        reclaims: it skips members with a PR, and an open issue without one stays active."""
+        self.slot_by_session(data, m)
+
+    def slot_by_session(self, data, m):
+        """The slot follows the member's issue session, re-decided every tick (#61): once the session
+        has been missing for SESSION_GRACE seconds the slot is released - one missed read of a
+        restarting terminal is not enough - and it is taken back when the session is seen again."""
         if self.has_session(data, m):
             m.pop('sessionGoneSince', None)
             m['slotReleased'] = False
