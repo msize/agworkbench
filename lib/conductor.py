@@ -1005,15 +1005,17 @@ class Worker:
                         not re.fullmatch(r'issue-' + str(m['number']) + r'(?:-.*)?', branch)):
                     raise QueueError(f'cannot identify issue branch for #{m["number"]}: {branch!r}')
                 prs = self.gh('pr', 'list', '--repo', data['repo'], '--head', branch,
-                              '--state', 'all', '--json', 'number,state,url')
+                              '--state', 'all', '--json', 'number,state,url,isCrossRepository')
                 if not isinstance(prs, list) or any(not isinstance(p, dict) or
                     type(p.get('number')) is not int or p['number'] <= 0 or
-                    p.get('state') not in {'OPEN', 'CLOSED', 'MERGED'} for p in prs):
+                    p.get('state') not in {'OPEN', 'CLOSED', 'MERGED'} or
+                    type(p.get('isCrossRepository')) is not bool for p in prs):
                     raise QueueError('invalid PR list response')
-                merged = next((p for p in prs if p['state'] == 'MERGED'), None)
-                if not merged and any(p['state'] == 'OPEN' for p in prs):
+                local_prs = [p for p in prs if not p['isCrossRepository']]
+                if any(p['state'] == 'OPEN' for p in local_prs):
                     self.errors.pop(key, None)
                     continue
+                merged = next((p for p in local_prs if p['state'] == 'MERGED'), None)
                 issue = None if merged else self.gh('issue', 'view', str(m['number']),
                                                     '--repo', data['repo'], '--json', 'state')
                 if issue is not None and (not isinstance(issue, dict) or issue.get('state') not in {'OPEN', 'CLOSED'}):

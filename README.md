@@ -186,7 +186,8 @@ When a closed issue needs no change, `wb.py loop-state done --no-pr --reason "<w
 In queue mode, `wb.py loop-state done --pr N --sha S` also reports the PR to the conductor.
 The conductor can recover a PR from `loop-done.json` if that report fails. If a member's
 sessions disappear, it checks the branch PR and issue after a grace period and releases the
-slot when the PR merged or the issue closed. An operator can record a missing PR with
+slot when a branch PR merged or, with no open PR on the branch, the issue closed. An operator
+can record a missing PR with
 `python lib/conductor.py mark --file <queue.json> --number N --pr <url> --reason "<why>"`;
 the action is recorded in the queue and its `operator.log`.
 

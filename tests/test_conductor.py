@@ -652,7 +652,7 @@ class QueueCase(unittest.TestCase):
             worker.refresh_remote()
         self.assertEqual(self.now, self.member()['goneSince'])
         self.now += 1801
-        worker.gh = Mock(side_effect=lambda *args: ([{'number': 457, 'state': 'MERGED'}]
+        worker.gh = Mock(side_effect=lambda *args: ([{'number': 457, 'state': 'MERGED', 'isCrossRepository': False}]
                               if args[:2] == ('pr', 'list') else AssertionError(args)))
         branch = Mock(returncode=0, stdout='issue-1-fix\n')
         with patch.object(q.agw, 'tree', return_value={'workspaces': []}), \
@@ -685,7 +685,7 @@ class QueueCase(unittest.TestCase):
         self.assertEqual('active', self.member()['state'])
         self.assertIn('goneSince', self.member())
         gh.assert_not_called()
-        worker.gh = Mock(return_value={'unexpected': 'shape'})
+        worker.gh = Mock(return_value=[{'number': 5, 'state': 'MERGED'}])
         with patch.object(q.agw, 'tree', return_value={'workspaces': []}), \
                 patch.object(q.subprocess, 'run', return_value=Mock(returncode=0, stdout='issue-1-fix')):
             worker.next_pr = 0
@@ -706,6 +706,7 @@ class QueueCase(unittest.TestCase):
         self.now += 1801
         with patch.object(q.agw, 'tree', return_value={'workspaces': []}):
             worker.refresh_remote()
+        self.assertIn('goneSince', self.member())
         self.now += 301
         with patch.object(q.agw, 'tree', return_value={'workspaces': [
                 {'name': 'r', 'sessions': [{'name': '#1 review'}]}]}):
@@ -718,7 +719,7 @@ class QueueCase(unittest.TestCase):
         with self.store.transaction() as data:
             data['members'][0]['goneSince'] = self.now - 1801
         self.now += 1801
-        worker.gh = Mock(side_effect=lambda *args: [{'number': 12, 'state': 'OPEN'}]
+        worker.gh = Mock(side_effect=lambda *args: [{'number': 12, 'state': 'OPEN', 'isCrossRepository': False}]
                          if args[:2] == ('pr', 'list') else {'state': 'CLOSED'})
         with patch.object(q.agw, 'tree', return_value={'workspaces': []}), \
                 patch.object(q.subprocess, 'run', return_value=Mock(returncode=0, stdout='issue-1-fix')):
@@ -726,6 +727,45 @@ class QueueCase(unittest.TestCase):
         self.assertEqual(('active', None, False),
                          (self.member()['state'], self.member()['pr'], self.member()['slotReleased']))
         self.assertFalse(any(c.args[:2] == ('issue', 'view') for c in worker.gh.call_args_list))
+
+    def test_stale_open_pr_wins_over_older_merged_pr(self):
+        self.start('o/r#1')
+        worker = self.worker(); worker.tick(); worker.tick()
+        with self.store.transaction() as data:
+            data['members'][0]['goneSince'] = self.now - 1801
+        self.now += 1801
+        prs = [{'number': 1, 'state': 'MERGED', 'isCrossRepository': False},
+               {'number': 2, 'state': 'OPEN', 'isCrossRepository': False}]
+        worker.gh = Mock(return_value=prs)
+        with patch.object(q.agw, 'tree', return_value={'workspaces': []}), \
+                patch.object(q.subprocess, 'run', return_value=Mock(returncode=0, stdout='issue-1-fix')):
+            worker.refresh_remote()
+        self.assertEqual(('active', None, False),
+                         (self.member()['state'], self.member()['pr'], self.member()['slotReleased']))
+
+    def test_stale_ignores_fork_prs_on_same_branch(self):
+        self.start('o/r#1,2')
+        worker = self.worker(); worker.tick(); worker.tick()
+        with self.store.transaction() as data:
+            data['parallel'] = 2
+        worker.tick(); worker.tick()
+        with self.store.transaction() as data:
+            for member in data['members']:
+                member['goneSince'] = self.now - 1801
+        self.now += 1801
+        def gh(*args):
+            if args[:2] == ('pr', 'list'):
+                return [{'number': 12, 'state': 'OPEN', 'isCrossRepository': True}] if 'issue-1-fix' in args else [
+                    {'number': 22, 'state': 'MERGED', 'isCrossRepository': True}]
+            return {'state': 'CLOSED' if args[2] == '1' else 'OPEN'}
+        worker.gh = Mock(side_effect=gh)
+        def branch(args, **kwargs):
+            return Mock(returncode=0, stdout='issue-1-fix' if 'r-issue-1' in args[2] else 'issue-2-fix')
+        with patch.object(q.agw, 'tree', return_value={'workspaces': []}), \
+                patch.object(q.subprocess, 'run', side_effect=branch):
+            worker.refresh_remote()
+        self.assertEqual(('closed', None), (self.member(1)['state'], self.member(1)['pr']))
+        self.assertEqual(('active', None), (self.member(2)['state'], self.member(2)['pr']))
 
     def test_stale_uses_relay_issue_branch_after_checkout_switches_to_main(self):
         self.start('o/r#1')
@@ -735,7 +775,7 @@ class QueueCase(unittest.TestCase):
         state = Path(self.member()['checkout']) / '.workbench/state'
         q.atomic_json(state / 'relay.json', {'branch': 'issue-1-fix'})
         self.now += 1801
-        worker.gh = Mock(return_value=[{'number': 5, 'state': 'MERGED'}])
+        worker.gh = Mock(return_value=[{'number': 5, 'state': 'MERGED', 'isCrossRepository': False}])
         with patch.object(q.agw, 'tree', return_value={'workspaces': []}), \
                 patch.object(q.subprocess, 'run', return_value=Mock(returncode=0, stdout='main')) as git:
             worker.refresh_remote()
@@ -763,7 +803,7 @@ class QueueCase(unittest.TestCase):
         with self.store.transaction() as data:
             data['members'][0]['goneSince'] = self.now - 1801
         self.now += 1801
-        worker.gh = Mock(return_value=[{'number': 5, 'state': 'MERGED'}])
+        worker.gh = Mock(return_value=[{'number': 5, 'state': 'MERGED', 'isCrossRepository': False}])
         empty = {'workspaces': []}
         live = {'workspaces': [{'name': 'r', 'sessions': [{'name': '#1 review'}]}]}
         with patch.object(q.agw, 'tree', side_effect=[empty, live]), \

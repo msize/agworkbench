@@ -150,6 +150,19 @@ class QueueReports(unittest.TestCase):
         self.assertEqual(0, wb.loop_done(self.folder, '457', 'sha'))
         self.assertEqual(1, self.q.read_json(self.state / 'loop.json')['rev'])
 
+    def test_done_refuses_a_foreign_pr_url_before_writing(self):
+        self.assertEqual(2, wb.loop_done(self.folder, 'https://github.com/other/repo/pull/457', 'sha'))
+        self.assertFalse((self.state / 'loop.json').exists())
+        self.assertFalse((self.state / 'loop-done.json').exists())
+
+    def test_done_replaces_an_invalid_previous_pr_report(self):
+        previous = self.q.write_loop_state(self.folder, 'pr-open', 'https://github.com/o/r/pull/5')
+        previous['pr'] = 'garbage'
+        self.q.atomic_json(self.state / 'loop.json', previous)
+        self.assertEqual(0, wb.loop_done(self.folder, '457', 'sha'))
+        report = self.q.read_json(self.state / 'loop.json')
+        self.assertEqual((2, 'https://github.com/o/r/pull/457'), (report['rev'], report['pr']))
+
     def test_no_pr_refusals_leave_no_done_record(self):
         run = patch.object(wb.subprocess, 'run', return_value=type('Done', (), {'stdout': 'issue-1-fix'})())
         with run:

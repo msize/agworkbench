@@ -885,17 +885,27 @@ def loop_done(root: Path, pr: str | None, sha: str | None) -> int:
     record = {"pr": int(str(pr).rsplit("/", 1)[-1]), "sha": sha,
               "followUps": [item["url"] for item in items], "at": time.time()}
     path = root / ".workbench" / "state" / "loop-done.json"
-    from conductor import Lock, atomic_json, read_json, write_loop_state, repo_name, pr_number, pr_url
+    from conductor import Lock, atomic_json, read_json, write_loop_state, repo_name, pr_number, pr_url, QueueError
     member_path = path.with_name('queue-member.json')
     if member_path.exists():
         try:
             member = read_json(member_path)
-            url = f"https://github.com/{repo_name(member['repo'])}/pull/{record['pr']}"
+            repo = repo_name(member['repo'])
+            if not re.fullmatch(r'\d+', str(pr)):
+                try:
+                    pr_url(pr, repo)
+                except QueueError as err:
+                    print(f'wb: loop-state done: invalid --pr: {err}', file=sys.stderr)
+                    return 2
+            url = f"https://github.com/{repo}/pull/{record['pr']}"
             loop_path = path.with_name('loop.json')
             previous = read_json(loop_path) if loop_path.exists() else {}
             identity = read_json(path.with_name('claude.json'))
             prior_pr = previous.get('pr')
-            prior_valid = bool(prior_pr and pr_url(prior_pr, repo_name(member['repo'])))
+            try:
+                prior_valid = bool(prior_pr and pr_url(prior_pr, repo))
+            except (ValueError, TypeError):
+                prior_valid = False
             if not (previous.get('state') == 'pr-open' and prior_valid and
                     pr_number(prior_pr) == record['pr'] and
                     previous.get('loopId') == identity['sessionId'] and
