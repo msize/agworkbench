@@ -115,18 +115,32 @@ def own_leftovers(issue: dict, source: int, pr: int) -> bool:
 
 
 def checklist_entries(body: str) -> list[tuple[str, str, str]]:
-    """Only the checklist block after the intro, before details or the Source trailer."""
+    """Only lines after the intro and before the first details block or final Source trailer."""
     text = (body or "").replace("\r\n", "\n")
-    block = text.partition("\n\n")[2]
-    block = re.split(r"\n\n(?=<details>|Source: #)", block, maxsplit=1)[0]
-    return CHECKLIST_RE.findall(block)
+    start, end = checklist_bounds(text)
+    return CHECKLIST_RE.findall(text[start:end])
+
+
+def checklist_bounds(text: str) -> tuple[int, int]:
+    intro = text.find("\n")
+    trailers = list(re.finditer(r"(?m)^Source: #", text))
+    if intro < 0 or not trailers:
+        raise ValueError("leftovers body has no intro or Source trailer")
+    trailer = trailers[-1].start()
+    details = re.search(r"(?m)^<details><summary>", text[intro + 1:trailer])
+    end = intro + 1 + details.start() if details else trailer
+    return intro + 1, end
 
 
 def leftovers_lines(issue: dict) -> list[tuple[str, str]]:
     if (closed_reason(issue) is not None or not trusted(issue.get("author_association"), issue.get("body"))
             or parse_leftovers(issue.get("body")) is None):
         return []
-    return [(key, title) for checked, key, title in checklist_entries(issue.get("body") or "")
+    try:
+        entries = checklist_entries(issue.get("body") or "")
+    except ValueError:
+        return []
+    return [(key, title) for checked, key, title in entries
             if checked == " "]
 
 
@@ -154,10 +168,10 @@ def leftovers_detail(item: dict) -> str:
             + "\n\n</details>") if content else ""
 
 
-def leftovers_body(items: list[dict], source: int, pr: int, checked: set[str] = frozenset()) -> str:
+def leftovers_body(items: list[dict], source: int, pr: int) -> str:
     lines = [f"Leftovers from #{source} (PR #{pr}): minor review findings and plan items deferred by the loop.", ""]
     for item in items:
-        lines.append(leftovers_line(item, item["key"] in checked))
+        lines.append(leftovers_line(item))
     for item in items:
         detail = leftovers_detail(item)
         if detail:
@@ -170,22 +184,27 @@ def leftovers_body(items: list[dict], source: int, pr: int, checked: set[str] = 
 
 
 def extend_leftovers_body(body: str, items: list[dict], severity: str) -> str:
-    """Preserve the current issue body and append only checklist keys that are missing."""
-    present = {key for _, key, _ in checklist_entries(body)}
-    missing = [item for item in items if item["key"] not in present]
-    if not missing:
-        return body
+    """Keep current details and checked state; add missing keys and refresh marked lines."""
     text = body.replace("\r\n", "\n")
-    boundary = re.search(r"\n\n(?=<details>|Source: #)", text)
-    if boundary is None:
-        raise ValueError("leftovers body has no checklist boundary")
-    lines = "\n" + "\n".join(leftovers_line(item) for item in missing)
-    text = text[:boundary.start()] + lines + text[boundary.start():]
+    start, end = checklist_bounds(text)
+    entries = checklist_entries(text)
+    if not entries:
+        raise ValueError("leftovers body has no recognisable checklist")
+    present = {key for _, key, _ in entries}
+    missing = [item for item in items if item["key"] not in present]
+    refresh = {item["key"]: item for item in items if item.get("refresh")}
+    if not missing and not refresh:
+        return body
+    block = CHECKLIST_RE.sub(lambda match: leftovers_line(refresh[match[2]], match[1].lower() == "x")
+                             if match[2] in refresh else match[0], text[start:end])
+    text = text[:start] + block.rstrip("\n") + ("\n" + "\n".join(leftovers_line(i) for i in missing)
+                                           if missing else "") + "\n\n" + text[end:]
     details = [detail for item in missing if (detail := leftovers_detail(item))]
     if details:
-        trailer = re.search(r"\n\n(?=Source: #)", text)
-        if trailer is None:
+        trailers = list(re.finditer(r"\n\n(?=Source: #)", text))
+        if not trailers:
             raise ValueError("leftovers body has no Source trailer")
+        trailer = trailers[-1]
         text = text[:trailer.start()] + "\n\n" + "\n\n".join(details) + text[trailer.start():]
     matches = list(re.finditer(r"(?m)^Severity: \w+", text))
     if not matches:

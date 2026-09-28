@@ -58,7 +58,8 @@ all stop you exactly as they do without autonomy.
   (`--pr is required` while `followUp.dedupe` is on, the default). It labels a new issue `follow-up`
   (`follow-up-nested` when this issue is itself a follow-up) and adds the planner marker. With dedupe on
   (#42) it first looks for an existing issue describing the same problem: the same normalised title
-  among the follow-up issues, then one restricted model call over the open follow-up and bug issues
+  among the follow-up issues, or an unchecked checklist line in an open, trusted leftovers issue,
+  then one restricted model call over the open follow-up and bug issues
   (only a high-confidence answer naming an issue opened by the owner, a member or a collaborator
   counts; anything else is linked as possibly related). On a match it records a duplicate there instead of filing:
   a comment with this PR, the round, the file and the finding, and the count. The reports then bump

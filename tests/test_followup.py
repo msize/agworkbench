@@ -661,6 +661,7 @@ class Leftovers(unittest.TestCase):
                     self.file(gh)
                 self.assertEqual(0, self.file(gh), self.err.getvalue())
                 self.assertEqual(1, len(gh.calls_of('issue', 'create')))
+                self.assertEqual([], gh.calls_of('issue', 'edit'))
                 self.assertEqual('https://github.com/o/r/issues/101', self.items()[0]['url'])
 
     def test_later_item_keeps_checked_line_and_raises_priority(self):
@@ -677,8 +678,6 @@ class Leftovers(unittest.TestCase):
         self.assertIn('- [ ] **b**', gh.issues[101]['body'])
         self.assertIn('Severity: minor', gh.issues[101]['body'])
         self.assertEqual(['follow-up', 'priority:P2'], gh.labels(101))
-        self.assertEqual(0, self.file(gh))
-        self.assertEqual(2, len(gh.calls_of('issue', 'edit')))
 
     def test_cross_pr_unchecked_line_dedupes_but_checked_does_not(self):
         body = followup.leftovers_body([{'key': 'old', 'title': 'Same problem', 'severity': 'minor',
@@ -823,8 +822,62 @@ class Leftovers(unittest.TestCase):
         gh.issues[101]['state'] = 'closed'
         self.add('b', title='New point', own_issue=False)
         self.assertEqual(0, self.file(gh))
+        self.assertEqual('https://github.com/o/r/issues/101', self.items()[0]['url'])
         self.assertEqual('https://github.com/o/r/issues/102', self.items()[1]['url'])
+        self.assertNotIn('**a**', gh.issues[102]['body'])
         self.assertEqual(2, len(gh.calls_of('issue', 'create')))
+
+    def test_appended_note_makes_a_new_container_for_only_new_items(self):
+        self.add('a', own_issue=False)
+        gh = FakeRepo()
+        self.assertEqual(0, self.file(gh))
+        gh.issues[101]['body'] += '\nMaintainer note after marker.'
+        self.add('b', title='New point', own_issue=False)
+        self.assertEqual(0, self.file(gh))
+        self.assertEqual('https://github.com/o/r/issues/101', self.items()[0]['url'])
+        self.assertEqual('https://github.com/o/r/issues/102', self.items()[1]['url'])
+        self.assertNotIn('**a**', gh.issues[102]['body'])
+
+    def test_quoted_source_in_details_does_not_split_new_details(self):
+        self.add('a', body='A quotation\n\nSource: #99, PR #98\nSeverity: minor', own_issue=False)
+        gh = FakeRepo()
+        self.assertEqual(0, self.file(gh))
+        self.add('b', body='Evidence for b', own_issue=False)
+        self.assertEqual(0, self.file(gh))
+        body = gh.issues[101]['body']
+        self.assertLess(body.index('</details>'), body.index('<details><summary>b</summary>'))
+        self.assertIn('Evidence for b', body)
+
+    def test_removed_intro_blank_line_keeps_checked_keys(self):
+        self.add('a', own_issue=False)
+        gh = FakeRepo()
+        self.assertEqual(0, self.file(gh))
+        gh.issues[101]['body'] = gh.issues[101]['body'].replace('\n\n- [ ] **a**', '\n- [x] **a**')
+        self.add('b', title='Second point', own_issue=False)
+        self.assertEqual(0, self.file(gh))
+        self.assertEqual(2, len(followup.checklist_entries(gh.issues[101]['body'])))
+        self.assertIn('- [x] **a**', gh.issues[101]['body'])
+
+    def test_dedupe_off_with_triage_leaves_priority_unset(self):
+        self.config(followUp={'dedupe': False}, triage={'o/r': {'specRepos': ['o/spec']}})
+        self.add('a', own_issue=False)
+        gh = FakeRepo()
+        self.assertEqual(0, self.file(gh))
+        self.assertEqual(['follow-up'], gh.labels(101))
+
+    def test_rerated_leftovers_refreshes_without_new_item(self):
+        self.add('a', severity='immaterial', own_issue=False)
+        gh = FakeRepo()
+        self.assertEqual(0, self.file(gh))
+        gh.issues[101]['body'] = gh.issues[101]['body'].replace('- [ ] **a**', '- [x] **a**')
+        self.add('a', severity='major', own_issue=False)
+        self.assertTrue(self.items()[0]['refresh'])
+        self.assertEqual(0, self.file(gh), self.err.getvalue())
+        self.assertEqual(1, len(gh.calls_of('issue', 'create')))
+        self.assertIn('- [x] **a** (major,', gh.issues[101]['body'])
+        self.assertIn('Severity: major', gh.issues[101]['body'])
+        self.assertEqual(['follow-up', 'priority:P1'], gh.labels(101))
+        self.assertNotIn('refresh', self.items()[0])
 
     def test_priority_label_failure_is_reported(self):
         self.add('a', own_issue=False)
