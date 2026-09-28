@@ -512,7 +512,8 @@ def merge_failures(pr: dict, inline: list[dict], head: str, root: Path, checks: 
 
 # --- follow-up issues (#27) ----------------------------------------------------------------------
 # One machine-readable list the planner fills as it defers findings or agrees a plan's out-of-scope
-# items; `follow-up file` turns every unfiled item into a GitHub issue and writes the url back.
+# items; `follow-up file` turns each unfiled item into its own issue or a line of the PR's shared
+# leftovers issue, and writes the URL back.
 
 SEVERITIES = ("blocker", "major", "minor", "immaterial", "plan")
 SEVERE = ("blocker", "major")
@@ -661,7 +662,7 @@ def file_without_dedupe(root: Path, args: argparse.Namespace, items: list[dict],
         try:
             repo = json.loads(gh_ok(root, "reading the repository", "repo", "view", "--json", "nameWithOwner")
                               .stdout)["nameWithOwner"]
-            file_leftovers(root, repo, args, items, [], label, source_title, False, False)
+            file_leftovers(root, repo, args, items, [], label, source_title, triaged=False)
         except (DedupeFailed, ValueError, KeyError, TypeError) as err:
             print(f"wb: follow-up: leftovers: {err}", file=sys.stderr)
             failed = 1
@@ -738,15 +739,16 @@ def find_own_unlabelled(root: Path, repo: str, item: dict, args: argparse.Namesp
 
 
 def find_leftovers(root: Path, repo: str, args: argparse.Namespace, items: list[dict],
-                   pool: list[dict], title: str, dedupe: bool) -> dict | None:
+                   pool: list[dict], title: str) -> dict | None:
     prior = next((i for i in items if i.get("leftovers") and i.get("url")), None)
     if prior:
         match = re.search(r"/issues/(\d+)$", prior["url"])
         if match:
             issue = read_issue(root, repo, int(match[1]))
-            if followup.own_leftovers(issue, args.source, args.pr):
+            if followup.closed_reason(issue) is None and followup.own_leftovers(issue, args.source, args.pr):
                 return issue
-    own = next((c for c in pool if followup.own_leftovers(c, args.source, args.pr)), None)
+    own = next((c for c in pool if followup.closed_reason(c) is None
+                and followup.own_leftovers(c, args.source, args.pr)), None)
     if own:
         return own
     phrase = '"' + title.replace('"', ' ').strip() + '"'
@@ -755,24 +757,26 @@ def find_leftovers(root: Path, repo: str, args: argparse.Namespace, items: list[
     for hit in json.loads(found.stdout or "[]"):
         if hit.get("title") == title and isinstance(hit.get("number"), int):
             issue = read_issue(root, repo, hit["number"])
-            if followup.own_leftovers(issue, args.source, args.pr) or not dedupe:
+            if followup.closed_reason(issue) is None and followup.own_leftovers(issue, args.source, args.pr):
                 return issue
     return None
 
 
 def file_leftovers(root: Path, repo: str, args: argparse.Namespace, items: list[dict],
-                   pool: list[dict], label: str | None, source_title: str, triaged: bool,
-                   dedupe: bool, excluded: set[str] = frozenset()) -> None:
-    listed = [i for i in items if not followup.own_issue(i) and not i.get("duplicateOf")
+                   pool: list[dict], label: str | None, source_title: str, *, triaged: bool,
+                   excluded: set[str] = frozenset()) -> None:
+    listed = [i for i in items if (i.get("leftovers") or (not i.get("url") and not followup.own_issue(i)))
+              and not i.get("duplicateOf")
               and i["key"] not in excluded]
     if not listed or not any(not i.get("url") for i in listed):
         return
     title = f"Leftovers from #{args.source}: {source_title}"
-    existing = find_leftovers(root, repo, args, items, pool, title, dedupe)
+    existing = find_leftovers(root, repo, args, items, pool, title)
     old_body = existing["body"] if existing else ""
-    checked = {key for state, key, _ in followup.CHECKLIST_RE.findall(old_body) if state.lower() == "x"}
-    present = {key for _, key, _ in followup.CHECKLIST_RE.findall(old_body)}
-    body = followup.leftovers_body(listed, args.source, args.pr, checked)
+    present = {key for _, key, _ in followup.checklist_entries(old_body)}
+    severity = followup.leftovers_severity(listed)
+    body = (followup.extend_leftovers_body(old_body, listed, severity) if existing else
+            followup.leftovers_body(listed, args.source, args.pr))
     body_file = root / ".workbench" / "state" / "follow-up-leftovers.md"
     body_file.write_text(body, encoding="utf-8")
     try:
@@ -791,6 +795,8 @@ def file_leftovers(root: Path, repo: str, args: argparse.Namespace, items: list[
                         if PRIORITY_LABEL.fullmatch(old.strip()) and old != name:
                             argv += ["--remove-label", old]
                     gh_ok(root, f"labelling leftovers #{existing['number']}", *argv)
+                else:
+                    print(f"wb: follow-up: cannot create label '{name}'; filing leftovers untriaged")
         else:
             argv = ["issue", "create", "--title", title, "--body-file", str(body_file)]
             names = [label] if label else []
@@ -798,6 +804,8 @@ def file_leftovers(root: Path, repo: str, args: argparse.Namespace, items: list[
                 priority = f"priority:{followup.severity_priority(followup.leftovers_severity(listed))}"
                 if ensure_label(root, priority):
                     names.append(priority)
+                else:
+                    print(f"wb: follow-up: cannot create label '{priority}'; filing leftovers untriaged")
             for name in names:
                 argv += ["--label", name]
             done = gh_ok(root, "creating leftovers", *argv)
@@ -930,6 +938,8 @@ def file_deduped(root: Path, args: argparse.Namespace, items: list[dict], pendin
                     continue
                 notes.append(message)
             if not followup.own_issue(item):
+                if notes:
+                    item["related"] = notes
                 continue
             filed = file_new(root, item, args, label, notes, triaged)
             pool.append(filed)
@@ -944,7 +954,7 @@ def file_deduped(root: Path, args: argparse.Namespace, items: list[dict], pendin
     if any(not followup.own_issue(i) and not i.get("url") for i in pending):
         try:
             file_leftovers(root, repo, args, items, list(candidates.values()), label, source_title,
-                           triaged, True, excluded)
+                           triaged=triaged, excluded=excluded)
         except (DedupeFailed, ValueError, KeyError, TypeError) as err:
             print(f"wb: follow-up: leftovers: {err}", file=sys.stderr)
             failed += 1

@@ -2,11 +2,12 @@
 priority of a problem that keeps being reported (#42). wb.py's `follow-up file` drives it; this module
 holds the rules, the marker grammar and the semantic matcher, and does no GitHub I/O of its own.
 
-- The exact stage: same normalised title among the `follow-up` / `follow-up-nested` issues (any state).
+- The exact stage: same normalised title among the `follow-up` / `follow-up-nested` issues (any state),
+  or an unchecked checklist line of an open trusted leftovers issue.
 - The semantic stage: one restricted `claude -p` call for every item the exact stage left, over the
   open follow-up and bug issues. Only a `high` answer naming a candidate opened by the repo's owner,
   a member or a collaborator is a duplicate (an outsider's issue text could steer the model); anything
-  else, or any failure, files a new issue (a false duplicate hides a finding).
+  else, or any failure, files it (its own issue, or a line in the PR's leftovers issue).
 - The count lives on the issue: N = distinct (source, pr, key) dup markers in trusted, planner-marked
   comments. It is derived every time, never read back, so a forged comment or two racing loops cannot
   skew it. Total reports = 1 + N; the priority label follows `bumpAt`, upward only.
@@ -19,7 +20,7 @@ import os
 import re
 import string
 import subprocess
-import uuid
+import tempfile
 import unicodedata
 from pathlib import Path
 from urllib.parse import quote, unquote
@@ -113,11 +114,19 @@ def own_leftovers(issue: dict, source: int, pr: int) -> bool:
     return (fields.get("source"), fields.get("pr")) == (str(source), str(pr))
 
 
+def checklist_entries(body: str) -> list[tuple[str, str, str]]:
+    """Only the checklist block after the intro, before details or the Source trailer."""
+    text = (body or "").replace("\r\n", "\n")
+    block = text.partition("\n\n")[2]
+    block = re.split(r"\n\n(?=<details>|Source: #)", block, maxsplit=1)[0]
+    return CHECKLIST_RE.findall(block)
+
+
 def leftovers_lines(issue: dict) -> list[tuple[str, str]]:
     if (closed_reason(issue) is not None or not trusted(issue.get("author_association"), issue.get("body"))
             or parse_leftovers(issue.get("body")) is None):
         return []
-    return [(key, title) for checked, key, title in CHECKLIST_RE.findall(issue.get("body") or "")
+    return [(key, title) for checked, key, title in checklist_entries(issue.get("body") or "")
             if checked == " "]
 
 
@@ -127,23 +136,62 @@ def own_issue(item: dict) -> bool:
 
 def leftovers_severity(items: list[dict]) -> str:
     return min((item.get("severity", "plan") for item in items),
-               key=lambda value: {"minor": 0, "immaterial": 1, "plan": 2}.get(value, 2))
+               key=lambda value: {"blocker": 0, "major": 1, "minor": 2,
+                                  "immaterial": 3, "plan": 4}.get(value, 4))
+
+
+def leftovers_line(item: dict, checked: bool = False) -> str:
+    where = f", `{item['file']}`" if item.get("file") else ""
+    mark = "x" if checked else " "
+    return (f"- [{mark}] **{item['key']}** ({item.get('severity')}, {item.get('origin')}{where}): "
+            f"{item.get('title')}")
+
+
+def leftovers_detail(item: dict) -> str:
+    content = [item.get("body", "").rstrip(), *(item.get("related") or [])]
+    content = [part for part in content if part]
+    return (f"<details><summary>{item['key']}</summary>\n\n" + "\n\n".join(content)
+            + "\n\n</details>") if content else ""
 
 
 def leftovers_body(items: list[dict], source: int, pr: int, checked: set[str] = frozenset()) -> str:
     lines = [f"Leftovers from #{source} (PR #{pr}): minor review findings and plan items deferred by the loop.", ""]
     for item in items:
-        where = f", `{item['file']}`" if item.get("file") else ""
-        mark = "x" if item["key"] in checked else " "
-        lines.append(f"- [{mark}] **{item['key']}** ({item.get('severity')}, {item.get('origin')}{where}): {item.get('title')}")
+        lines.append(leftovers_line(item, item["key"] in checked))
     for item in items:
-        if (item.get("body") or "").strip():
-            lines += ["", f"<details><summary>{item['key']}</summary>", "", item["body"].rstrip(), "", "</details>"]
+        detail = leftovers_detail(item)
+        if detail:
+            lines += ["", detail]
     lines += ["", f"Source: #{source}, PR #{pr}", f"Severity: {leftovers_severity(items)}",
               f"<!-- agworkbench:follow-up source=#{source} -->",
               "<!-- agworkbench:leftovers " + _fields(dict(source=source, pr=pr)) + " -->",
               PLANNER_MARKER]
     return "\n".join(lines) + "\n"
+
+
+def extend_leftovers_body(body: str, items: list[dict], severity: str) -> str:
+    """Preserve the current issue body and append only checklist keys that are missing."""
+    present = {key for _, key, _ in checklist_entries(body)}
+    missing = [item for item in items if item["key"] not in present]
+    if not missing:
+        return body
+    text = body.replace("\r\n", "\n")
+    boundary = re.search(r"\n\n(?=<details>|Source: #)", text)
+    if boundary is None:
+        raise ValueError("leftovers body has no checklist boundary")
+    lines = "\n" + "\n".join(leftovers_line(item) for item in missing)
+    text = text[:boundary.start()] + lines + text[boundary.start():]
+    details = [detail for item in missing if (detail := leftovers_detail(item))]
+    if details:
+        trailer = re.search(r"\n\n(?=Source: #)", text)
+        if trailer is None:
+            raise ValueError("leftovers body has no Source trailer")
+        text = text[:trailer.start()] + "\n\n" + "\n\n".join(details) + text[trailer.start():]
+    matches = list(re.finditer(r"(?m)^Severity: \w+", text))
+    if not matches:
+        raise ValueError("leftovers body has no Severity trailer")
+    last = matches[-1]
+    return text[:last.start()] + f"Severity: {severity}" + text[last.end():]
 
 
 def trusted_author(association: str | None) -> bool:
@@ -351,8 +399,7 @@ def semantic_matches(items: list[dict], candidates: list[dict], note) -> dict[st
                            "file": normalise_file(i.get("file")) or None} for i in items],
              "candidates": [{"number": c["number"], "title": c["title"], "body": c["body"][:BODY_CAP],
                              "labels": c["labels"]} for c in candidates]}
-    folder = Path(os.environ.get("AI_HUB") or Path.cwd()) / f"agworkbench-followup-{uuid.uuid4().hex}"
-    folder.mkdir()
+    folder = Path(tempfile.mkdtemp(prefix="agworkbench-followup-"))
     try:
         facts_file = folder / "facts.json"
         facts_file.write_text(json.dumps(facts, indent=2), encoding="utf-8")
