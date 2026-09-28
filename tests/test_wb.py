@@ -128,6 +128,41 @@ class QueueReports(unittest.TestCase):
         self.assertEqual('closed', self.q.read_json(self.state / 'loop.json')['state'])
         self.assertFalse((self.state / 'waiting.json').exists())
 
+    def test_done_publishes_pr_once_and_keeps_completion_on_report_failure(self):
+        self.assertEqual(0, wb.loop_done(self.folder, '457', 'sha'))
+        report = self.q.read_json(self.state / 'loop.json')
+        self.assertEqual(('pr-open', 'https://github.com/o/r/pull/457', 1),
+                         (report['state'], report['pr'], report['rev']))
+        self.assertEqual(0, wb.loop_done(self.folder, '457', 'sha'))
+        self.assertEqual(1, self.q.read_json(self.state / 'loop.json')['rev'])
+        with patch.dict(os.environ, CLAUDE_CODE_SESSION_ID=str(uuid.uuid4())):
+            self.assertEqual(0, wb.loop_done(self.folder, '458', 'sha2'))
+        self.assertEqual(458, self.q.read_json(self.state / 'loop-done.json')['pr'])
+        self.assertIn('queue report failed', sys.stderr.getvalue())
+
+    def test_done_outside_queue_does_not_publish_loop_report(self):
+        (self.state / 'queue-member.json').unlink()
+        self.assertEqual(0, wb.loop_done(self.folder, '457', 'sha'))
+        self.assertFalse((self.state / 'loop.json').exists())
+
+    def test_done_does_not_increment_a_canonical_case_pr_report(self):
+        self.q.write_loop_state(self.folder, 'pr-open', 'https://github.com/O/R/pull/457')
+        self.assertEqual(0, wb.loop_done(self.folder, '457', 'sha'))
+        self.assertEqual(1, self.q.read_json(self.state / 'loop.json')['rev'])
+
+    def test_done_refuses_a_foreign_pr_url_before_writing(self):
+        self.assertEqual(2, wb.loop_done(self.folder, 'https://github.com/other/repo/pull/457', 'sha'))
+        self.assertFalse((self.state / 'loop.json').exists())
+        self.assertFalse((self.state / 'loop-done.json').exists())
+
+    def test_done_replaces_an_invalid_previous_pr_report(self):
+        previous = self.q.write_loop_state(self.folder, 'pr-open', 'https://github.com/o/r/pull/5')
+        previous['pr'] = 'garbage'
+        self.q.atomic_json(self.state / 'loop.json', previous)
+        self.assertEqual(0, wb.loop_done(self.folder, '457', 'sha'))
+        report = self.q.read_json(self.state / 'loop.json')
+        self.assertEqual((2, 'https://github.com/o/r/pull/457'), (report['rev'], report['pr']))
+
     def test_no_pr_refusals_leave_no_done_record(self):
         run = patch.object(wb.subprocess, 'run', return_value=type('Done', (), {'stdout': 'issue-1-fix'})())
         with run:

@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT / 'lib'))
 import conductor as q
 import closer
 import cleanup
+import wb
 
 REAL_FREE_BYTES = q.free_bytes          # QueueCase patches it; the real one is tested on its own
 
@@ -582,6 +583,268 @@ class QueueCase(unittest.TestCase):
         self.now += 301
         worker.tick()
         self.assertEqual('merged', self.member()['state'])
+
+    def test_done_without_pr_open_is_adopted_and_merged(self):
+        self.start('o/r#1')
+        worker = self.worker(); worker.tick(); worker.tick()
+        state = Path(self.member()['checkout']) / '.workbench/state'
+        q.atomic_json(state / 'loop-done.json', {'pr': 457, 'at': self.now})
+        self.pr_state = 'MERGED'
+        worker.tick()
+        self.assertEqual(('merged', 'MERGED', True),
+                         (self.member()['state'], self.member()['prState'], self.member()['slotReleased']))
+        self.assertEqual('https://github.com/o/r/pull/457', self.member()['pr'])
+
+    def test_adopt_done_ignores_old_no_pr_and_malformed_records(self):
+        self.start('o/r#1')
+        worker = self.worker(); worker.tick(); worker.tick()
+        state = Path(self.member()['checkout']) / '.workbench/state'
+        for record in ({'pr': 2, 'at': self.now - 1}, {'pr': 2, 'at': True},
+                       {'pr': True, 'at': self.now}, {'pr': 0, 'at': self.now},
+                       {'pr': 2, 'at': float('nan')}, {'pr': 2, 'at': self.now, 'noPr': True},
+                       {'pr': '2', 'at': self.now}, []):
+            with self.subTest(record=record):
+                q.atomic_json(state / 'loop-done.json', record)
+                worker.tick()
+                self.assertEqual(('active', None), (self.member()['state'], self.member()['pr']))
+        with self.store.transaction() as data:
+            data['members'][0].pop('startedAt')
+        q.atomic_json(state / 'loop-done.json', {'pr': 2, 'at': self.now})
+        worker.tick()
+        self.assertEqual('active', self.member()['state'])
+
+    def test_late_pr_open_report_cannot_demote_merged_member(self):
+        self.start('o/r#1')
+        worker = self.worker(); worker.tick(); worker.tick()
+        self.report(1)
+        worker.tick()
+        with self.store.transaction() as data:
+            data['members'][0].update(state='merged', prState='MERGED', slotReleased=True)
+        report = self.report(1)
+        with self.store.transaction() as data:
+            self.assertTrue(q.apply_loop(data, data['members'][0], self.store.path))
+        m = self.member()
+        self.assertEqual(('merged', 'MERGED', True, report['rev']),
+                         (m['state'], m['prState'], m['slotReleased'], m['consumedRev']))
+
+    def test_done_report_after_merge_stays_merged_through_tick(self):
+        self.start('o/r#1')
+        worker = self.worker(); worker.tick(); worker.tick()
+        with self.store.transaction() as data:
+            data['members'][0].update(state='merged', pr='https://github.com/O/R/pull/5',
+                                      prState='MERGED', slotReleased=True)
+        checkout = Path(self.member()['checkout'])
+        identity = q.read_json(checkout / '.workbench/state/claude.json')
+        with patch.dict(os.environ, CLAUDE_CODE_SESSION_ID=identity['sessionId']):
+            self.assertEqual(0, wb.loop_done(checkout, '5', 'sha'))
+        worker.tick()
+        self.assertEqual(('merged', 'MERGED', True),
+                         (self.member()['state'], self.member()['prState'], self.member()['slotReleased']))
+        with self.store.transaction() as data:
+            self.assertTrue(q.apply_loop(data, data['members'][0], self.store.path))
+        self.assertEqual('merged', self.member()['state'])
+
+    def test_stale_active_merged_pr_wins_and_releases_slot(self):
+        self.start('o/r#1')
+        worker = self.worker(); worker.tick(); worker.tick()
+        self.now += 1801
+        with patch.object(q.agw, 'tree', return_value={'workspaces': []}):
+            worker.refresh_remote()
+        self.assertEqual(self.now, self.member()['goneSince'])
+        self.now += 1801
+        worker.gh = Mock(side_effect=lambda *args: ([{'number': 457, 'state': 'MERGED', 'isCrossRepository': False}]
+                              if args[:2] == ('pr', 'list') else AssertionError(args)))
+        branch = Mock(returncode=0, stdout='issue-1-fix\n')
+        with patch.object(q.agw, 'tree', return_value={'workspaces': []}), \
+                patch.object(q.subprocess, 'run', return_value=branch):
+            worker.refresh_remote()
+        self.assertEqual(('merged', 'MERGED', True),
+                         (self.member()['state'], self.member()['prState'], self.member()['slotReleased']))
+        self.assertEqual('https://github.com/o/r/pull/457', self.member()['pr'])
+        self.assertFalse(any(c.args[:2] == ('issue', 'view') for c in worker.gh.call_args_list))
+
+    def test_stale_active_checks_sessions_branch_and_closed_issue(self):
+        self.start('o/r#1')
+        worker = self.worker(); worker.tick(); worker.tick()
+        self.now += 1801
+        live = {'workspaces': [{'name': 'r', 'sessions': [{'name': '#1 helper'}]}]}
+        with patch.object(q.agw, 'tree', return_value=live):
+            worker.refresh_remote()
+        self.assertNotIn('goneSince', self.member())
+        self.now += 301
+        with patch.object(q.agw, 'tree', return_value={'workspaces': []}):
+            worker.refresh_remote()
+        self.assertIn('goneSince', self.member())
+        self.now += 1801
+        branch = Mock(returncode=1, stdout='')
+        gh = Mock(side_effect=AssertionError('empty branch must not query GitHub'))
+        worker.gh = gh
+        with patch.object(q.agw, 'tree', return_value={'workspaces': []}), \
+                patch.object(q.subprocess, 'run', return_value=branch):
+            worker.refresh_remote()
+        self.assertEqual('active', self.member()['state'])
+        self.assertIn('goneSince', self.member())
+        gh.assert_not_called()
+        worker.gh = Mock(return_value=[{'number': 5, 'state': 'MERGED'}])
+        with patch.object(q.agw, 'tree', return_value={'workspaces': []}), \
+                patch.object(q.subprocess, 'run', return_value=Mock(returncode=0, stdout='issue-1-fix')):
+            worker.next_pr = 0
+            worker.refresh_remote()
+        self.assertEqual('active', self.member()['state'])
+        self.assertIn('goneSince', self.member())
+        worker.gh = Mock(side_effect=lambda *args: [] if args[:2] == ('pr', 'list') else {'state': 'CLOSED'})
+        with patch.object(q.agw, 'tree', return_value={'workspaces': []}), \
+                patch.object(q.subprocess, 'run', return_value=Mock(returncode=0, stdout='issue-1-fix')):
+            worker.next_pr = 0
+            worker.refresh_remote()
+        self.assertEqual(('closed', True), (self.member()['state'], self.member()['slotReleased']))
+        self.assertTrue(self.member()['reason'].startswith('stale:'))
+
+    def test_stale_session_reappearing_clears_gone_since(self):
+        self.start('o/r#1')
+        worker = self.worker(); worker.tick(); worker.tick()
+        self.now += 1801
+        with patch.object(q.agw, 'tree', return_value={'workspaces': []}):
+            worker.refresh_remote()
+        self.assertIn('goneSince', self.member())
+        self.now += 301
+        with patch.object(q.agw, 'tree', return_value={'workspaces': [
+                {'name': 'r', 'sessions': [{'name': '#1 review'}]}]}):
+            worker.refresh_remote()
+        self.assertNotIn('goneSince', self.member())
+
+    def test_stale_open_pr_keeps_active_even_if_issue_closed(self):
+        self.start('o/r#1')
+        worker = self.worker(); worker.tick(); worker.tick()
+        with self.store.transaction() as data:
+            data['members'][0]['goneSince'] = self.now - 1801
+        self.now += 1801
+        worker.gh = Mock(side_effect=lambda *args: [{'number': 12, 'state': 'OPEN', 'isCrossRepository': False}]
+                         if args[:2] == ('pr', 'list') else {'state': 'CLOSED'})
+        with patch.object(q.agw, 'tree', return_value={'workspaces': []}), \
+                patch.object(q.subprocess, 'run', return_value=Mock(returncode=0, stdout='issue-1-fix')):
+            worker.refresh_remote()
+        self.assertEqual(('active', None, False),
+                         (self.member()['state'], self.member()['pr'], self.member()['slotReleased']))
+        self.assertFalse(any(c.args[:2] == ('issue', 'view') for c in worker.gh.call_args_list))
+
+    def test_stale_open_pr_wins_over_older_merged_pr(self):
+        self.start('o/r#1')
+        worker = self.worker(); worker.tick(); worker.tick()
+        with self.store.transaction() as data:
+            data['members'][0]['goneSince'] = self.now - 1801
+        self.now += 1801
+        prs = [{'number': 1, 'state': 'MERGED', 'isCrossRepository': False},
+               {'number': 2, 'state': 'OPEN', 'isCrossRepository': False}]
+        worker.gh = Mock(return_value=prs)
+        with patch.object(q.agw, 'tree', return_value={'workspaces': []}), \
+                patch.object(q.subprocess, 'run', return_value=Mock(returncode=0, stdout='issue-1-fix')):
+            worker.refresh_remote()
+        self.assertEqual(('active', None, False),
+                         (self.member()['state'], self.member()['pr'], self.member()['slotReleased']))
+
+    def test_stale_ignores_fork_prs_on_same_branch(self):
+        self.start('o/r#1,2')
+        worker = self.worker(); worker.tick(); worker.tick()
+        with self.store.transaction() as data:
+            data['parallel'] = 2
+        worker.tick(); worker.tick()
+        with self.store.transaction() as data:
+            for member in data['members']:
+                member['goneSince'] = self.now - 1801
+        self.now += 1801
+        def gh(*args):
+            if args[:2] == ('pr', 'list'):
+                return [{'number': 12, 'state': 'OPEN', 'isCrossRepository': True}] if 'issue-1-fix' in args else [
+                    {'number': 22, 'state': 'MERGED', 'isCrossRepository': True}]
+            return {'state': 'CLOSED' if args[2] == '1' else 'OPEN'}
+        worker.gh = Mock(side_effect=gh)
+        def branch(args, **kwargs):
+            return Mock(returncode=0, stdout='issue-1-fix' if 'r-issue-1' in args[2] else 'issue-2-fix')
+        with patch.object(q.agw, 'tree', return_value={'workspaces': []}), \
+                patch.object(q.subprocess, 'run', side_effect=branch):
+            worker.refresh_remote()
+        self.assertEqual(('closed', None), (self.member(1)['state'], self.member(1)['pr']))
+        self.assertEqual(('active', None), (self.member(2)['state'], self.member(2)['pr']))
+
+    def test_stale_uses_relay_issue_branch_after_checkout_switches_to_main(self):
+        self.start('o/r#1')
+        worker = self.worker(); worker.tick(); worker.tick()
+        with self.store.transaction() as data:
+            data['members'][0]['goneSince'] = self.now - 1801
+        state = Path(self.member()['checkout']) / '.workbench/state'
+        q.atomic_json(state / 'relay.json', {'branch': 'issue-1-fix'})
+        self.now += 1801
+        worker.gh = Mock(return_value=[{'number': 5, 'state': 'MERGED', 'isCrossRepository': False}])
+        with patch.object(q.agw, 'tree', return_value={'workspaces': []}), \
+                patch.object(q.subprocess, 'run', return_value=Mock(returncode=0, stdout='main')) as git:
+            worker.refresh_remote()
+        git.assert_not_called()
+        self.assertEqual('merged', self.member()['state'])
+        self.assertIn('issue-1-fix', worker.gh.call_args.args)
+
+    def test_stale_refuses_non_issue_branch(self):
+        self.start('o/r#1')
+        worker = self.worker(); worker.tick(); worker.tick()
+        with self.store.transaction() as data:
+            data['members'][0]['goneSince'] = self.now - 1801
+        self.now += 1801
+        worker.gh = Mock(side_effect=AssertionError('wrong branch queried'))
+        with patch.object(q.agw, 'tree', return_value={'workspaces': []}), \
+                patch.object(q.subprocess, 'run', return_value=Mock(returncode=0, stdout='main')):
+            worker.refresh_remote()
+        worker.gh.assert_not_called()
+        self.assertEqual('active', self.member()['state'])
+        self.assertIn('goneSince', self.member())
+
+    def test_stale_rechecks_sessions_before_resolving(self):
+        self.start('o/r#1')
+        worker = self.worker(); worker.tick(); worker.tick()
+        with self.store.transaction() as data:
+            data['members'][0]['goneSince'] = self.now - 1801
+        self.now += 1801
+        worker.gh = Mock(return_value=[{'number': 5, 'state': 'MERGED', 'isCrossRepository': False}])
+        empty = {'workspaces': []}
+        live = {'workspaces': [{'name': 'r', 'sessions': [{'name': '#1 review'}]}]}
+        with patch.object(q.agw, 'tree', side_effect=[empty, live]), \
+                patch.object(q.subprocess, 'run', return_value=Mock(returncode=0, stdout='issue-1-fix')):
+            worker.refresh_remote()
+        self.assertEqual('active', self.member()['state'])
+        self.assertNotIn('goneSince', self.member())
+
+    def test_mark_cli_records_audit_and_refuses_invalid_targets(self):
+        self.start('o/r#1,2')
+        worker = self.worker(); worker.tick(); worker.tick()
+        url = 'https://github.com/o/r/pull/457'
+        with patch.dict(os.environ):
+            os.environ.pop('CLAUDE_CODE_SESSION_ID', None)
+            self.assertEqual(0, q.main(['mark', '--file', str(self.store.path), '--number', '1',
+                                        '--pr', url, '--reason', 'planner gone']))
+        member = self.member()
+        audit = member['operatorMark']
+        self.assertEqual((url, 'planner gone', 'pr-open', True),
+                         (audit['pr'], audit['reason'], member['state'], member['slotReleased']))
+        line = json.loads((self.store.directory / 'operator.log').read_text().splitlines()[0])
+        self.assertEqual(dict(number=1, **audit), line)
+        for number, pr in [(1, 'https://github.com/other/repo/pull/1'), (99, url), (2, url)]:
+            with self.subTest(number=number, pr=pr):
+                self.assertEqual(2, q.main(['mark', '--file', str(self.store.path),
+                                            '--number', str(number), '--pr', pr]))
+        self.assertEqual(1, len((self.store.directory / 'operator.log').read_text().splitlines()))
+
+    def test_failed_mark_commit_does_not_write_operator_log(self):
+        self.start('o/r#1')
+        worker = self.worker(); worker.tick(); worker.tick()
+        original = q.atomic_json
+        def fail_queue(path, data):
+            if Path(path) == self.store.path:
+                raise OSError('queue commit failed')
+            return original(path, data)
+        with patch.object(q, 'atomic_json', side_effect=fail_queue):
+            self.assertEqual(1, q.main(['mark', '--file', str(self.store.path), '--number', '1',
+                                        '--pr', 'https://github.com/o/r/pull/5']))
+        self.assertFalse((self.store.directory / 'operator.log').exists())
+        self.assertEqual('active', self.member()['state'])
 
     def test_gh_uses_a_deadline_and_never_modifies_a_pr(self):
         with patch.object(q.subprocess, 'Popen') as spawn, patch.object(q.shutil, 'which', return_value='gh'):
