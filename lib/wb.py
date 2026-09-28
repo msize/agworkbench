@@ -731,39 +731,37 @@ def read_issue(root: Path, repo: str, number: int) -> dict:
 def find_own_unlabelled(root: Path, repo: str, item: dict, args: argparse.Namespace) -> dict | None:
     """Without the follow-up label, an issue an earlier run filed for this item is no candidate; the
     #27 exact-title search finds it, and its trusted finding marker proves it is this item's (r1 M1)."""
-    phrase = '"' + item["title"].replace('"', " ").strip() + '"'
-    found = gh_ok(root, f"searching for '{item['key']}'", "issue", "list", "--state", "open", "--search",
+    return find_by_title(root, repo, item["title"], f"searching for '{item['key']}'",
+                         lambda issue: followup.is_own(issue, item, args.source, args.pr))
+
+
+def find_by_title(root: Path, repo: str, title: str, what: str, accept) -> dict | None:
+    phrase = '"' + title.replace('"', " ").strip() + '"'
+    found = gh_ok(root, what, "issue", "list", "--state", "open", "--search",
                   f"{phrase} in:title", "--json", "number,title", "--limit", "200")
     for hit in json.loads(found.stdout or "[]"):
-        if hit.get("title") == item["title"] and isinstance(hit.get("number"), int):
+        if hit.get("title") == title and isinstance(hit.get("number"), int):
             issue = read_issue(root, repo, hit["number"])
-            if followup.is_own(issue, item, args.source, args.pr):
+            if accept(issue):
                 return issue
     return None
 
 
 def find_leftovers(root: Path, repo: str, args: argparse.Namespace, items: list[dict],
                    pool: list[dict], title: str) -> dict | None:
+    accept = lambda issue: (followup.closed_reason(issue) is None
+                            and followup.own_leftovers(issue, args.source, args.pr))
     prior = next((i for i in items if i.get("leftovers") and i.get("url")), None)
     if prior:
         match = re.search(r"/issues/(\d+)$", prior["url"])
         if match:
             issue = read_issue(root, repo, int(match[1]))
-            if followup.closed_reason(issue) is None and followup.own_leftovers(issue, args.source, args.pr):
+            if accept(issue):
                 return issue
-    own = next((c for c in pool if followup.closed_reason(c) is None
-                and followup.own_leftovers(c, args.source, args.pr)), None)
+    own = next((c for c in pool if accept(c)), None)
     if own:
         return own
-    phrase = '"' + title.replace('"', ' ').strip() + '"'
-    found = gh_ok(root, "searching for leftovers", "issue", "list", "--state", "open", "--search",
-                  f"{phrase} in:title", "--json", "number,title", "--limit", "200")
-    for hit in json.loads(found.stdout or "[]"):
-        if hit.get("title") == title and isinstance(hit.get("number"), int):
-            issue = read_issue(root, repo, hit["number"])
-            if followup.closed_reason(issue) is None and followup.own_leftovers(issue, args.source, args.pr):
-                return issue
-    return None
+    return find_by_title(root, repo, title, "searching for leftovers", accept)
 
 
 def file_leftovers(root: Path, repo: str, args: argparse.Namespace, items: list[dict],
@@ -777,6 +775,14 @@ def file_leftovers(root: Path, repo: str, args: argparse.Namespace, items: list[
     title = f"Leftovers from #{args.source}: {source_title}"
     existing = find_leftovers(root, repo, args, items, pool, title)
     active = [i for i in listed if not i.get("url") or (existing and i.get("url") == existing["url"])]
+    orphaned = [i for i in listed if i.get("refresh") and i not in active]
+    for item in orphaned:
+        number = (re.search(r"/issues/(\d+)$", item["url"] or "") or [None, "?"])[1]
+        print(f"wb: follow-up: leftovers #{number} is closed or no longer recognised; "
+              f"re-rating of '{item['key']}' to {item.get('severity')} not written there - update it by hand")
+        item.pop("refresh", None)
+    if orphaned:
+        save_follow_ups(root, items)
     if not active or not any(not i.get("url") or i.get("refresh") for i in active):
         return
     old_body = existing["body"] if existing else ""
@@ -798,7 +804,8 @@ def file_leftovers(root: Path, repo: str, args: argparse.Namespace, items: list[
                     set_priority(root, existing["number"], existing["labels"], target,
                                  f"labelling leftovers #{existing['number']}")
                 except DedupeFailed as err:
-                    print(f"wb: follow-up: {err}; filing leftovers untriaged")
+                    print(f"wb: follow-up: {err}; leftovers #{existing['number']} keeps "
+                          f"{f'priority:{current}' if current else 'no priority label'}")
         else:
             argv = ["issue", "create", "--title", title, "--body-file", str(body_file)]
             names = [label] if label else []

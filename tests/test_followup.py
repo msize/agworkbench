@@ -879,6 +879,42 @@ class Leftovers(unittest.TestCase):
         self.assertEqual(['follow-up', 'priority:P1'], gh.labels(101))
         self.assertNotIn('refresh', self.items()[0])
 
+    def test_unadoptable_leftovers_refresh_warns_once(self):
+        for change in ('closed', 'appended note'):
+            with self.subTest(change=change):
+                self.out.seek(0)
+                self.out.truncate(0)
+                (self.state / 'follow-ups.json').unlink(missing_ok=True)
+                self.add('a', severity='immaterial', own_issue=False)
+                gh = FakeRepo()
+                self.assertEqual(0, self.file(gh))
+                original = gh.issues[101]['body']
+                if change == 'closed':
+                    gh.issues[101]['state'] = 'closed'
+                else:
+                    gh.issues[101]['body'] += '\nMaintainer note after marker.'
+                self.add('a', severity='major', own_issue=False)
+                self.assertEqual(0, self.file(gh))
+                self.assertIn("leftovers #101 is closed or no longer recognised; re-rating of 'a' to major not written there",
+                              self.out.getvalue())
+                self.assertNotIn('refresh', self.items()[0])
+                self.assertEqual('https://github.com/o/r/issues/101', self.items()[0]['url'])
+                self.assertEqual(original, gh.issues[101]['body'] if change == 'closed'
+                                 else gh.issues[101]['body'].removesuffix('\nMaintainer note after marker.'))
+                before = len(gh.calls)
+                self.assertEqual(0, self.file(gh))
+                self.assertEqual(before, len(gh.calls))
+
+    def test_failed_priority_raise_reports_the_label_it_keeps(self):
+        self.add('a', severity='immaterial', own_issue=False)
+        gh = FakeRepo()
+        self.assertEqual(0, self.file(gh))
+        gh.fail.add(('label', 'priority:P2'))
+        self.add('b', title='Minor point', own_issue=False)
+        self.assertEqual(0, self.file(gh))
+        self.assertIn('leftovers #101 keeps priority:P3', self.out.getvalue())
+        self.assertEqual(['follow-up', 'priority:P3'], gh.labels(101))
+
     def test_priority_label_failure_is_reported(self):
         self.add('a', own_issue=False)
         gh = FakeRepo(fail={('label', 'priority:P2')})
