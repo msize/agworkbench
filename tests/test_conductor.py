@@ -64,6 +64,8 @@ class QueueCase(unittest.TestCase):
     def gh(self, *args):
         if args[:2] == ('issue', 'list'):          # the priority labels (#34); none unless a test sets them
             return self.issues
+        if args[:2] == ('pr', 'list'):
+            return []
         self.assertEqual(('pr', 'view'), args[:2])
         return {'state': self.pr_state}
 
@@ -130,6 +132,17 @@ class QueueCase(unittest.TestCase):
         self.assertIn('merged 0', q.summary(self.store.load()))
         self.assertIn(2, [item[0] for item in self.launches])
         self.assertTrue(q.finished(dict(self.store.load(), members=[member])))
+
+    def test_closed_member_accepts_a_resumed_report_after_reopen(self):
+        self.start('o/r#1')
+        worker = self.worker()
+        worker.tick(); worker.tick()
+        self.report(1, 'closed', reason='duplicate')
+        worker.tick()
+        self.assertEqual('closed', self.member(1)['state'])
+        self.report(1, 'resumed')
+        worker.tick()
+        self.assertEqual('active', self.member(1)['state'])
 
     def test_parallel_blocked_resumed_and_failed_members_release_slots(self):
         self.start(parallel=2)
@@ -918,7 +931,7 @@ class CloseBackstop(unittest.TestCase):
             self.checkout = Path(m['checkout'])
         self.state = self.checkout / '.workbench' / 'state'
         self.state.mkdir(parents=True)
-        for name, value in (('relay.json', {'close_pending': 42}), ('implementer.json', {'autonomous': True}),
+        for name, value in (('relay.json', {'close_pending': 42, 'branch': 'issue-7'}), ('implementer.json', {'autonomous': True}),
                             ('loop-done.json', {'pr': 42}),
                             ('agents.json', {'agents': {'claude': {'pane': self.PLANNER, 'tool': 'claude'},
                                                         'codex': {'pane': self.IMPLEMENTER, 'tool': 'claude'}}})):
@@ -982,7 +995,7 @@ class CloseBackstop(unittest.TestCase):
     def test_closed_no_pr_backstop_checks_issue_before_sessions(self):
         with self.store.transaction() as data:
             data['members'][0].update(state='closed', phase='closed', pr=None, reason='duplicate')
-        q.atomic_json(self.state / 'relay.json', {'close_pending': 'no-pr'})
+        q.atomic_json(self.state / 'relay.json', {'close_pending': 'no-pr', 'branch': 'issue-7'})
         q.atomic_json(self.state / 'loop-done.json', {'pr': None, 'noPr': True, 'issue': 7})
         self.relay_gone()
         self.finished_helper()
@@ -998,7 +1011,7 @@ class CloseBackstop(unittest.TestCase):
     def test_closed_no_pr_backstop_closes_and_starts_cleanup(self):
         with self.store.transaction() as data:
             data['members'][0].update(state='closed', phase='closed', pr=None, reason='duplicate')
-        q.atomic_json(self.state / 'relay.json', {'close_pending': 'no-pr'})
+        q.atomic_json(self.state / 'relay.json', {'close_pending': 'no-pr', 'branch': 'issue-7'})
         q.atomic_json(self.state / 'loop-done.json', {'pr': None, 'noPr': True, 'issue': 7})
         self.relay_gone()
         self.w.gh = lambda *args: {'state': 'CLOSED'} if args[:2] == ('issue', 'view') else self.gh(*args)
@@ -1007,10 +1020,76 @@ class CloseBackstop(unittest.TestCase):
         self.assertEqual([None], [a[3] for a in self.cleanups])
         self.assertNotIn('close_pending', q.read_json(self.state / 'relay.json'))
 
+    def test_ready_helper_stays_open_if_issue_reopens_during_cached_closed_window(self):
+        with self.store.transaction() as data:
+            data['members'][0].update(state='closed', phase='closed', pr=None, reason='duplicate')
+        q.atomic_json(self.state / 'relay.json', {'close_pending': 'no-pr', 'branch': 'issue-7'})
+        q.atomic_json(self.state / 'loop-done.json', {'pr': None, 'noPr': True, 'issue': 7})
+        self.relay_gone()
+        self.finished_helper()
+        issue_calls = [0]
+        def gh(*args):
+            if args[:2] == ('issue', 'view'):
+                issue_calls[0] += 1
+                return {'state': 'CLOSED' if issue_calls[0] == 1 else 'OPEN'}
+            return self.gh(*args)
+        self.w.gh = gh
+        self.run_for(950)
+        self.assertEqual([], self.actions)
+        self.assertIn('helper #7 revmux r1 (helper-pane) stays open: issue not verified CLOSED',
+                      (self.state / 'relay-close.log').read_text(encoding='utf-8'))
+
+    def test_preclose_unknown_result_replaces_cached_closed_result(self):
+        with self.store.transaction() as data:
+            data['members'][0].update(state='closed', phase='closed', pr=None, reason='duplicate')
+        q.atomic_json(self.state / 'relay.json', {'close_pending': 'no-pr', 'branch': 'issue-7'})
+        q.atomic_json(self.state / 'loop-done.json', {'pr': None, 'noPr': True, 'issue': 7})
+        self.relay_gone()
+        issue_calls = [0]
+        def gh(*args):
+            if args[:2] == ('issue', 'view'):
+                issue_calls[0] += 1
+                return {'state': 'CLOSED'} if issue_calls[0] == 1 else None
+            return self.gh(*args)
+        self.w.gh = gh
+        self.run_for(950)
+        self.assertEqual(2, issue_calls[0])
+        self.assertEqual((None, 'invalid issue state'), self.w.closes[7]['issue_result'])
+        self.assertEqual([], self.actions)
+
+    def test_open_pr_at_final_gate_refuses_no_pr_backstop(self):
+        with self.store.transaction() as data:
+            data['members'][0].update(state='closed', phase='closed', pr=None, reason='duplicate')
+        q.atomic_json(self.state / 'relay.json', {'close_pending': 'no-pr', 'branch': 'issue-7'})
+        q.atomic_json(self.state / 'loop-done.json', {'pr': None, 'noPr': True, 'issue': 7})
+        self.relay_gone()
+        self.w.gh = lambda *args: ({'state': 'CLOSED'} if args[:2] == ('issue', 'view') else
+                                   [{'number': 8}] if args[:2] == ('pr', 'list') else self.gh(*args))
+        self.run_for(950)
+        self.assertEqual([], self.actions)
+        self.assertIn('an open PR exists', self.member(7)['closeStuck'])
+
+    def test_unreadable_final_open_pr_list_blocks_no_pr_backstop(self):
+        with self.store.transaction() as data:
+            data['members'][0].update(state='closed', phase='closed', pr=None, reason='duplicate')
+        q.atomic_json(self.state / 'relay.json', {'close_pending': 'no-pr', 'branch': 'issue-7'})
+        q.atomic_json(self.state / 'loop-done.json', {'pr': None, 'noPr': True, 'issue': 7})
+        self.relay_gone()
+        def gh(*args):
+            if args[:2] == ('issue', 'view'):
+                return {'state': 'CLOSED'}
+            if args[:2] == ('pr', 'list'):
+                raise OSError('offline')
+            return self.gh(*args)
+        self.w.gh = gh
+        self.run_for(900 + closer.CLOSE_WAIT + 80)
+        self.assertEqual([], self.actions)
+        self.assertIn('open PR list unavailable', self.member(7)['closeStuck'])
+
     def test_closed_no_pr_backstop_keeps_sessions_on_lookup_failure(self):
         with self.store.transaction() as data:
             data['members'][0].update(state='closed', phase='closed', pr=None, reason='duplicate')
-        q.atomic_json(self.state / 'relay.json', {'close_pending': 'no-pr'})
+        q.atomic_json(self.state / 'relay.json', {'close_pending': 'no-pr', 'branch': 'issue-7'})
         q.atomic_json(self.state / 'loop-done.json', {'pr': None, 'noPr': True, 'issue': 7})
         self.relay_gone()
         self.finished_helper()
@@ -1023,7 +1102,7 @@ class CloseBackstop(unittest.TestCase):
     def test_closed_no_pr_backstop_lookup_failure_is_logged_and_notified_at_timeout(self):
         with self.store.transaction() as data:
             data['members'][0].update(state='closed', phase='closed', pr=None, reason='duplicate')
-        q.atomic_json(self.state / 'relay.json', {'close_pending': 'no-pr'})
+        q.atomic_json(self.state / 'relay.json', {'close_pending': 'no-pr', 'branch': 'issue-7'})
         q.atomic_json(self.state / 'loop-done.json', {'pr': None, 'noPr': True, 'issue': 7})
         self.relay_gone()
         self.finished_helper()
@@ -1039,7 +1118,7 @@ class CloseBackstop(unittest.TestCase):
         with self.store.transaction() as data:
             data['members'][0].update(state='closed', phase='closed', pr=None, reason='duplicate')
         q.atomic_json(self.state / 'relay.json',
-                      {'close_pending': 'no-pr', 'close_handoff': {'pr': 'no-pr', 'reasons': ['mail']}})
+                      {'close_pending': 'no-pr', 'branch': 'issue-7', 'close_handoff': {'pr': 'no-pr', 'reasons': ['mail']}})
         self.assertTrue(q.handed_off(self.member(7)))
         self.assertFalse(q.finished(self.store.load()))
 

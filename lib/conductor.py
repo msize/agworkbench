@@ -997,7 +997,7 @@ class Worker:
                 continue
             number = m['number']
             key = close_key(m)
-            pr = None if key == 'no-pr' else key
+            pr = closer.pending_number(key)
             hub_dir = Path(m['checkout']) / '.workbench'
             try:
                 relay_state = read_json(hub_dir / 'state' / 'relay.json') if (hub_dir / 'state' / 'relay.json').exists() else {}
@@ -1033,6 +1033,8 @@ class Worker:
                 self.mark(number, closeStuck=RELAY_ALIVE)
             return
         if watch['attempt'] is None:
+            watch.pop('issue_result', None)
+            watch.pop('next_issue_check', None)
             registry = read_json(hub_dir / 'state' / 'agents.json')['agents']
             peers = [types.SimpleNamespace(box=box, tool=registry[box].get('tool', box), pane=registry[box]['pane'])
                      for box in ('claude', 'codex')]
@@ -1066,17 +1068,39 @@ class Worker:
                 if attempt.timed_out():
                     refuse(f'issue state unknown: {detail}')
                 return
-        attempt.step_helpers()
+        attempt.step_helpers(gate=(lambda: attempt.issue_closed(self.gh)[0] is True) if pr is None else None)
         reasons = attempt.agent_blockers(pr)
         if not reasons or attempt.overdue_ok():
             if attempt.autonomous():
                 if pr is None:
                     closed, detail = attempt.issue_closed(self.gh)
+                    watch['issue_result'] = (closed, detail)
+                    watch['next_issue_check'] = self.clock() + CLOSE_ISSUE_CHECK_INTERVAL
                     if closed is not True:
                         if closed is False:
                             refuse(f'issue #{number} was reopened')
                         elif attempt.timed_out():
                             refuse(f'issue state unknown: {detail}')
+                        return
+                    relay_state = read_json(hub_dir / 'state' / 'relay.json')
+                    branch = relay_state.get('branch')
+                    if not isinstance(branch, str) or closer.issue_from_branch(branch) != str(number):
+                        detail = 'issue branch unavailable'
+                        prs = None
+                    else:
+                        try:
+                            prs = self.gh('pr', 'list', '--repo', data['repo'], '--head', branch,
+                                          '--state', 'open', '--json', 'number')
+                            detail = 'open PR list unavailable'
+                        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as err:
+                            prs, detail = None, f'open PR list unavailable: {err}'
+                    if isinstance(prs, list) and prs:
+                        refuse(f'an open PR exists for {branch}')
+                        return
+                    if not isinstance(prs, list):
+                        watch['issue_result'] = (None, detail)
+                        if attempt.timed_out():
+                            refuse(detail)
                         return
                 attempt.close_issue_session()
                 attempt.start_cleanup(pr)
@@ -1091,7 +1115,7 @@ class Worker:
     def end_close(self, m, pr, hub_dir, stuck):
         path = hub_dir / 'state' / 'relay.json'
         state = read_json(path)
-        if state.get('close_pending') == ('no-pr' if pr is None else pr):
+        if state.get('close_pending') == closer.pending_key(pr):
             # Only the close this attempt ran: a relay may have rewritten the file since.
             state.pop('close_pending')
             state.pop('close_merged_at', None)
@@ -1138,7 +1162,7 @@ class Worker:
                         defer_launch(data, m, reason, self.clock())
                     else:
                         m['slotReleased'] = True
-                if m['state'] in {'active', 'pr-open', 'blocked'}:
+                if m['state'] in {'active', 'pr-open', 'blocked', 'closed'}:
                     try:
                         if apply_loop(data, m, self.store.path):
                             self.next_pr = 0
@@ -1311,7 +1335,7 @@ def file_locked(path):
 
 
 def close_key(m):
-    return 'no-pr' if m['state'] == 'closed' else pr_number(m.get('pr'))
+    return closer.NO_PR if m['state'] == 'closed' else pr_number(m.get('pr'))
 
 
 def handed_off(m):

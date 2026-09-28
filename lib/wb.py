@@ -44,7 +44,6 @@ sys.path.insert(0, str(HERE))
 import agw  # noqa: E402
 import followup  # noqa: E402
 import hub  # noqa: E402
-import closer  # noqa: E402
 import triage  # noqa: E402
 
 
@@ -55,9 +54,13 @@ def checkout() -> Path:
     return Path(hub).resolve().parent
 
 
-def issue_number(root: Path) -> str:
-    branch = subprocess.run(["git", "-C", str(root), "branch", "--show-current"],
-                            capture_output=True, text=True).stdout.strip()
+def current_branch(root: Path) -> str:
+    return subprocess.run(["git", "-C", str(root), "branch", "--show-current"],
+                          capture_output=True, text=True).stdout.strip()
+
+
+def issue_number(root: Path, branch: str | None = None) -> str:
+    branch = current_branch(root) if branch is None else branch
     match = re.match(r"issue-(\d+)", branch)
     return match.group(1) if match else "?"
 
@@ -891,9 +894,8 @@ def loop_done_no_pr(root: Path, reason: str | None, pr: str | None = None) -> in
     if pr is not None or not isinstance(reason, str) or not reason.strip():
         print('wb: loop-state done --no-pr requires --reason and cannot use --pr', file=sys.stderr)
         return 2
-    branch = subprocess.run(['git', '-C', str(root), 'branch', '--show-current'],
-                            capture_output=True, text=True).stdout.strip()
-    number = closer.issue_from_branch(branch)
+    branch = current_branch(root)
+    number = issue_number(root, branch)
     member_path = root / '.workbench/state/queue-member.json'
     if member_path.exists():
         try:
@@ -902,7 +904,7 @@ def loop_done_no_pr(root: Path, reason: str | None, pr: str | None = None) -> in
         except (OSError, ValueError, KeyError, TypeError) as err:
             print(f'wb: loop-state done --no-pr: invalid queue member: {err}', file=sys.stderr)
             return 2
-    if not number or not branch:
+    if number == '?' or not branch:
         print('wb: loop-state done --no-pr: cannot identify issue or branch', file=sys.stderr)
         return 2
     try:

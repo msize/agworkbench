@@ -2154,7 +2154,7 @@ class AutonomousClose(unittest.TestCase):
 
     def test_no_pr_close_uses_the_same_gates_and_cleanup(self):
         self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 1})
-        with patch.object(relay, 'gh_json', return_value={'state': 'CLOSED'}):
+        with patch.object(relay, 'gh_json', side_effect=lambda args: [] if args[:2] == ['pr', 'list'] else {'state': 'CLOSED'}):
             self.r.close_after_merge(None)
         self.assertEqual([self.REVMUX, self.PLANNER, self.RELAY], self.closes())
         self.assertIn(('cleanup', (self.folder, 'o/repo', '7', None, 'merged')), self.actions)
@@ -2197,10 +2197,57 @@ class AutonomousClose(unittest.TestCase):
     def test_final_issue_lookup_retries_a_transient_failure(self):
         self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 1})
         lookups = iter([{'state': 'CLOSED'}, None, {'state': 'CLOSED'}, {'state': 'CLOSED'}])
-        with patch.object(relay, 'gh_json', side_effect=lambda args: next(lookups)) as gh:
+        def lookup(args):
+            return [] if args[:2] == ['pr', 'list'] else next(lookups, {'state': 'CLOSED'})
+        with patch.object(relay, 'gh_json', side_effect=lookup) as gh:
             self.r.close_after_merge(None)
         self.assertIn(self.PLANNER, self.closes())
         self.assertGreaterEqual(gh.call_count, 4)
+
+    def test_ready_helper_stays_open_if_issue_reopens_before_its_close(self):
+        self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 1})
+        self.r.pr_interval = 60
+        issue_calls = [0]
+        def lookup(args):
+            if args[:2] == ['issue', 'view']:
+                issue_calls[0] += 1
+                return {'state': 'CLOSED' if issue_calls[0] == 1 else 'OPEN'}
+            return []
+        with patch.object(relay, 'gh_json', side_effect=lookup):
+            self.assertFalse(self.r.close_after_merge(None))
+        self.assertNotIn(self.REVMUX, self.closes())
+        self.assertNotIn(self.PLANNER, self.closes())
+        self.assertIn('helper #7 revmux r1 (a1) stays open: issue not verified CLOSED', self.log())
+
+    def test_new_open_pr_at_final_gate_keeps_relay_watching(self):
+        self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 1})
+        pr_calls = [0]
+        def lookup(args):
+            if args[:2] == ['pr', 'list']:
+                pr_calls[0] += 1
+                return [] if pr_calls[0] == 1 else [{'number': 8}]
+            return {'state': 'CLOSED'}
+        def stop_after_watch():
+            self.r.stop_file.write_text('stop', encoding='utf-8')
+            return False
+        with patch.object(relay, 'gh_json', side_effect=lookup), \
+                patch.object(self.r, 'flush_outbox', return_value=True), \
+                patch.object(self.r, 'deliver_mail'), patch.object(self.r, 'watch_pr', side_effect=stop_after_watch) as watch, \
+                patch.object(self.r, 'read_panes', return_value={}), \
+                patch.object(self.r, 'check_limits'), patch.object(self.r.stall, 'tick'):
+            self.assertEqual(0, self.r.run())
+        watch.assert_called()
+        self.assertNotIn(self.PLANNER, self.closes())
+        self.assertNotIn('close_pending', self.r.state)
+
+    def test_unreadable_final_open_pr_list_blocks_issue_close(self):
+        self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 1})
+        with patch.object(relay, 'gh_json', side_effect=lambda args: None if args[:2] == ['pr', 'list']
+                          else {'state': 'CLOSED'}):
+            self.assertTrue(self.r.close_after_merge(None))
+        self.assertNotIn(self.PLANNER, self.closes())
+        self.assertGreaterEqual(self.t, closer.CLOSE_WAIT)
+        self.assertIn('open PR list unavailable', self.log())
 
     def test_failed_handoff_during_no_pr_refusal_is_caught(self):
         self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 1})
@@ -2217,7 +2264,7 @@ class AutonomousClose(unittest.TestCase):
         def stop_after_poll():
             self.r.stop_file.write_text('stop', encoding='utf-8')
             return False
-        with patch.object(relay, 'gh_json', return_value={'state': 'OPEN'}), \
+        with patch.object(relay, 'gh_json', side_effect=lambda args: [] if args[:2] == ['pr', 'list'] else {'state': 'OPEN'}) as gh, \
                 patch.object(self.r, 'flush_outbox', return_value=True), \
                 patch.object(self.r, 'deliver_mail'), patch.object(self.r, 'watch_pr', side_effect=stop_after_poll), \
                 patch.object(self.r, 'read_panes', return_value={}), \
@@ -2225,6 +2272,7 @@ class AutonomousClose(unittest.TestCase):
                 patch.object(self.r, 'close_after_merge') as close:
             self.assertEqual(0, self.r.run())
         close.assert_not_called()
+        self.assertTrue(any(call.args[0][:2] == ['issue', 'view'] for call in gh.call_args_list))
         self.assertEqual([], self.closes())
 
     def test_reopened_or_unknown_issue_closes_no_helper_or_issue_session(self):
@@ -2245,8 +2293,11 @@ class AutonomousClose(unittest.TestCase):
         self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 1})
         self.r.state['close_pending'] = 'no-pr'
         self.write('relay.json', self.r.state)
-        with patch.object(relay, 'gh_json', return_value={'state': 'OPEN'}):
+        self.r.stop_file = SimpleNamespace(exists=lambda: self.t >= 5)
+        with patch.object(relay, 'gh_json', return_value={'state': 'OPEN'}), \
+                patch.object(self.r, 'watch_pr', return_value=False) as watch:
             self.assertEqual(0, self.r.run())
+        watch.assert_called()
         self.assertEqual([], self.closes())
         self.assertNotIn('close_pending', self.r.state)
 

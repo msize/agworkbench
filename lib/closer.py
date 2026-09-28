@@ -45,6 +45,7 @@ import limits
 
 CLOSE_WAIT = 600.0       # how long a close waits for the loop to be provably over (#27)
 CLOSE_SETTLE = 30.0      # a pane must be unchanged this long before it may be closed
+NO_PR = 'no-pr'
 # The helper sessions wb.py opens, after the `#N `: a revmux round, the human's revdiff, a suite (#45).
 HELPER_NAMES = r'revmux r\d+|your review|suite [A-Za-z0-9._-]+'
 
@@ -64,6 +65,14 @@ def parse_time(value) -> datetime | None:
 def issue_from_branch(branch: str) -> str | None:
     match = re.match(r'issue-(\d+)', branch or '')
     return match.group(1) if match else None
+
+
+def pending_key(number: int | None) -> int | str:
+    return NO_PR if number is None else number
+
+
+def pending_number(key: int | str) -> int | None:
+    return None if key == NO_PR else key
 
 
 def filled_rows(text: str) -> list[str]:
@@ -162,17 +171,14 @@ class Closer:
             state = json.loads((self.hub_dir / 'state' / 'relay.json').read_text(encoding='utf-8-sig'))
         except (OSError, ValueError):
             return None
-        if not isinstance(state, dict) or state.get('close_pending') != ('no-pr' if number is None else number):
+        if not isinstance(state, dict) or state.get('close_pending') != pending_key(number):
             return None
         return parse_time(state.get('close_merged_at'))
 
-    def issue_closed(self, gh=None) -> tuple[bool | None, str]:
+    def issue_closed(self, gh) -> tuple[bool | None, str]:
         """A fresh, fail-closed GitHub check shared by relay and conductor."""
         if not self.issue:
             return None, 'issue number unknown'
-        if gh is None:
-            import conductor
-            gh = conductor.gh_json
         try:
             issue = gh('issue', 'view', str(self.issue), '--repo', self.repo, '--json', 'state')
             if not isinstance(issue, dict) or issue.get('state') not in ('OPEN', 'CLOSED'):
@@ -204,7 +210,7 @@ class Closer:
     def marker_path(self, pane: str) -> Path:
         return self.hub_dir / 'state' / 'helpers' / f'{pane}.done'
 
-    def step_helpers(self) -> list[str]:
+    def step_helpers(self, gate: Callable[[], bool] | None = None) -> list[str]:
         """One look at every helper; closes those proven done and untouched. Returns what stays open."""
         left_open = []
         snapshot = agw.tree()
@@ -224,6 +230,10 @@ class Closer:
                 continue
             if self.dry_run:
                 self.log(f"[dry-run] would close helper {label}")
+                continue
+            if gate is not None and not gate():
+                self.log(f"helper {label} stays open: issue not verified CLOSED")
+                left_open.append(f"{session.get('name')} (issue not verified CLOSED)")
                 continue
             self.log(f"closing helper {label}: done and untouched")
             for pane in panes:
