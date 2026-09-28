@@ -354,6 +354,9 @@ def checkout_root(config):
 
 
 GIB = 1024 ** 3                 # minFreeGB counts what Explorer labels "GB" (#41)
+CEILING_EXTRA = 2               # live members beyond -Parallel the conductor tolerates (#61)
+LIVE_STATES = {'active', 'blocked', 'pr-open'}
+_UNREAD = object()
 
 
 def min_free_gb(config):
@@ -367,12 +370,126 @@ def min_free_gb(config):
     return value
 
 
+def min_free_ram_gb(config):
+    """`minFreeRamGB` from the config (#61): default 3, 0 turns the guard off. Anything else is an error."""
+    settings = read_json(config) if Path(config).exists() else {}
+    value = settings.get('minFreeRamGB', 3)
+    if value is None:
+        return 3
+    if type(value) not in (int, float) or value < 0:
+        raise QueueError(f'minFreeRamGB in {config} must be a number >= 0 (got {value!r})')
+    return value
+
+
+def free_ram():
+    """Available physical memory in bytes, or None where this platform has no way to say (#61)."""
+    if os.name == 'nt':
+        import ctypes
+
+        class MemoryStatus(ctypes.Structure):
+            _fields_ = [('dwLength', ctypes.c_ulong), ('dwMemoryLoad', ctypes.c_ulong),
+                        ('ullTotalPhys', ctypes.c_ulonglong), ('ullAvailPhys', ctypes.c_ulonglong),
+                        ('ullTotalPageFile', ctypes.c_ulonglong), ('ullAvailPageFile', ctypes.c_ulonglong),
+                        ('ullTotalVirtual', ctypes.c_ulonglong), ('ullAvailVirtual', ctypes.c_ulonglong),
+                        ('ullAvailExtendedVirtual', ctypes.c_ulonglong)]
+        status = MemoryStatus()
+        status.dwLength = ctypes.sizeof(MemoryStatus)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            raise OSError('GlobalMemoryStatusEx failed')
+        return status.ullAvailPhys
+    try:
+        with open('/proc/meminfo', encoding='ascii') as stream:
+            for line in stream:
+                if line.startswith('MemAvailable:'):
+                    return int(line.split()[1]) * 1024
+    except FileNotFoundError:
+        return None
+    raise OSError('no MemAvailable in /proc/meminfo')
+
+
 def free_bytes(path):
     """(free bytes, drive) for the drive holding `path`, from its nearest existing ancestor."""
     path = Path(path)
     while not path.exists() and path.parent != path:
         path = path.parent
     return shutil.disk_usage(path).free, path.anchor or str(path)
+
+
+def valid_tool_limits(data):
+    """toolLimits (#61): tool -> {at, line, kind, member}; toolLimitsClearedAt: tool -> epoch seconds."""
+    limits, cleared = data.get('toolLimits', {}), data.get('toolLimitsClearedAt', {})
+    if not isinstance(limits, dict) or not isinstance(cleared, dict):
+        return False
+    for tool, entry in limits.items():
+        if (tool not in ('codex', 'claude') or not isinstance(entry, dict) or
+                type(entry.get('at')) not in (int, float) or not isinstance(entry.get('line'), str) or
+                entry.get('kind') not in ('limited', 'warning') or type(entry.get('member')) is not int):
+            return False
+    return all(tool in ('codex', 'claude') and type(at) in (int, float) for tool, at in cleared.items())
+
+
+def epoch(value):
+    """An ISO time (the launcher's `o` format or the relay's) as epoch seconds; None when unreadable."""
+    try:
+        moment = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.timestamp()
+
+
+def member_limits(m):
+    """The usage limits a member's checkout recorded (#61): [(tool, at, line, kind)]. The launcher's
+    implementer.json `limits` (what -Failover switched away from) and the relay's announced episodes
+    (the tool comes from the episode, whichever box it is in)."""
+    directory = Path(m['checkout']) / '.workbench/state'
+    found = []
+    path = directory / 'implementer.json'
+    if path.exists():
+        for tool, entry in (read_json(path).get('limits') or {}).items():
+            if tool in ('codex', 'claude') and isinstance(entry, dict):
+                found.append((tool, epoch(entry.get('at')), str(entry.get('line') or ''),
+                              'warning' if entry.get('kind') == 'warning' else 'limited'))
+    path = directory / 'relay.json'
+    if path.exists():
+        for episode in (read_json(path).get('limits') or {}).values():
+            if (isinstance(episode, dict) and episode.get('announced') and
+                    episode.get('tool') in ('codex', 'claude') and episode.get('kind') in ('limited', 'warning')):
+                found.append((episode['tool'], epoch(episode.get('firstSeen')), str(episode.get('line') or ''),
+                              episode['kind']))
+    return [item for item in found if item[1] is not None]
+
+
+def relay_limited(m):
+    """Whether the member's relay has announced a usage-limit episode (#61): its block is environmental."""
+    path = Path(m['checkout']) / '.workbench/state/relay.json'
+    if not path.exists():
+        return False
+    episodes = read_json(path).get('limits') or {}
+    return any(isinstance(e, dict) and e.get('announced') for e in episodes.values())
+
+
+def tool_route(data):
+    """(implementer for the next launch, pause reason) from the queue's recorded tool limits (#61).
+    (None, None) launches with the queue's own settings."""
+    limits = data.get('toolLimits') or {}
+    if not limits:
+        return None, None
+    said = ', '.join(f"{tool} {entry['kind']} (#{entry['member']}: {entry['line']})"
+                     for tool, entry in sorted(limits.items()))
+    if 'claude' in limits:
+        return None, f'tool limits: {said}; the planner is always Claude, so no member can run'
+    try:
+        settings = read_json(data['config']) if Path(data['config']).exists() else {}
+    except (OSError, ValueError) as err:
+        return None, f'tool limits: {said}; cannot read {data["config"]}: {err}'
+    wanted = data.get('implementer') or settings.get('implementer') or 'codex'
+    if wanted not in limits:
+        return None, None
+    if settings.get('failover') is False:
+        return None, f'tool limits: {said}; failover is off'
+    return 'claude', None
 
 
 class Store:
@@ -401,8 +518,11 @@ class Store:
                 raise ValueError('invalid autoMerge')
             if data.get('triage') is not None and type(data['triage']) is not bool:
                 raise ValueError('invalid triage')
-            if data.get('diskPaused') is not None and not isinstance(data['diskPaused'], str):
-                raise ValueError('invalid diskPaused')
+            for key in ('diskPaused', 'ramPaused', 'toolsPaused'):
+                if data.get(key) is not None and not isinstance(data[key], str):
+                    raise ValueError(f'invalid {key}')
+            if not valid_tool_limits(data):
+                raise ValueError('invalid toolLimits')
             backoff = data.get('launchBackoff')
             if backoff is not None and (not isinstance(backoff, dict) or
                     type(backoff.get('member')) is not int or backoff['member'] <= 0 or
@@ -425,6 +545,7 @@ class Store:
                         m['consumedRev'] < 0 or m['phase'] not in {'active', 'pr-open', 'blocked', 'closed'} or
                         (m['attempt'] > 0 and not valid_uuid(m.get('token'))) or
                         m.get('priority') not in (None, *triage.PRIORITIES) or
+                        m.get('cause') not in (None, 'environment') or
                         not isinstance(m.get('createdAt') or '', str)):
                     raise ValueError('invalid member')
                 seen.add(m['number'])
@@ -591,6 +712,14 @@ def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=Fa
         changes = settings_changes(data, parallel, yes, implementer, auto_merge, autonomous, watch, label, triage_on)
         for key, (_, new) in changes.items():
             data[key] = new
+        cleared = None
+        if implementer:
+            # The human says this tool is usable (#61), even when it is already the queue's: records
+            # of it from before now are ignored, so a member's old failover never brings it back.
+            data.setdefault('toolLimitsClearedAt', {})[implementer] = time.time()
+            cleared = (data.get('toolLimits') or {}).pop(implementer, None)
+            if not data.get('toolLimits'):
+                data.pop('toolLimits', None)
         pruned = [m['number'] for m in data['members']
                   if m['state'] == 'pending' and m['number'] not in matched] if prune else []
         if pruned:
@@ -624,6 +753,8 @@ def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=Fa
     for key, (old, new) in changes.items():
         suffix = '' if key in ('label', 'query') else ' (for every member launched from now on)'
         print(f'settings: {key} {json.dumps(old)} -> {json.dumps(new)}{suffix}')
+    if cleared:
+        print(f'settings: cleared the recorded usage limit for {implementer} ({cleared["line"]})')
     if token is None:
         if owner.get('session') and not owner.get('pinned'):
             pin_conductor(store, owner)
@@ -679,11 +810,15 @@ def member_result(path, number, attempt, token, result):
     return True
 
 
-def write_loop_state(root, state, pr=None, reason=None, *, loop_id=None):
+def write_loop_state(root, state, pr=None, reason=None, *, loop_id=None, cause=None):
     """A loop report from the planner's Claude runtime, or - with `loop_id` - from the relay, which is
-    not a Claude runtime and passes the id claude.json holds (#45: a stall it escalates)."""
+    not a Claude runtime and passes the id claude.json holds (#45: a stall it escalates). `cause`
+    "environment" marks a block the human cannot answer (a limited tool, low disk or memory, #61):
+    that member keeps its slot."""
     if state not in {'pr-open', 'blocked', 'resumed', 'closed'}:
         raise QueueError('invalid loop state')
+    if cause not in (None, 'environment') or (cause and state != 'blocked'):
+        raise QueueError('only a blocked report can have an environmental cause')
     root = Path(root)
     directory = root / '.workbench/state'
     member = read_json(directory / 'queue-member.json')
@@ -705,6 +840,8 @@ def write_loop_state(root, state, pr=None, reason=None, *, loop_id=None):
                       rev=previous.get('rev', 0) + 1 if same else 1, state=state,
                       pr=None if state == 'closed' else pr or (previous.get('pr') if same else None),
                       reason=reason, at=time.time())
+        if cause:
+            record['cause'] = cause
         atomic_json(path, record)
     return record
 
@@ -728,6 +865,8 @@ def apply_loop(data, member, path):
         pr_url(report.get('pr'), data['repo'])
     if report['state'] in {'blocked', 'closed'} and (not isinstance(report.get('reason'), str) or not report['reason'].strip()):
         raise QueueError(f"{report['state']} loop report requires a reason")
+    if report.get('cause') not in (None, 'environment') or (report.get('cause') and report['state'] != 'blocked'):
+        raise QueueError('invalid loop report cause')
     if report.get('pr'):
         pr_url(report['pr'], data['repo'])
     # Defensive for direct callers: tick normally skips reports on merged members.
@@ -749,10 +888,15 @@ def apply_loop(data, member, path):
         member.pop('closePending', None)
         member.pop('closeStuck', None)
     member.update(phase=state, state=state, reason=report.get('reason'), consumedLoop=loop, consumedRev=report['rev'])
+    member.pop('cause', None)
     if state == 'closed':
         member.update(pr=None, prState=None)
-    if state in {'pr-open', 'blocked', 'closed'}:
+    if state == 'blocked' and report.get('cause'):
+        member['cause'] = report['cause']      # environmental: the slot stays taken (#61)
+    elif state in {'pr-open', 'blocked', 'closed'}:
         member['slotReleased'] = True
+    elif state == 'active':
+        member['slotReleased'] = False         # resumed: live work again, counted again (#61)
     return True
 
 
@@ -791,10 +935,15 @@ def summary(data):
 
 
 class Worker:
-    def __init__(self, store, token, *, gh=gh_json, clock=time.time, spawn=None, spawn_triage=None, disk_free=None):
+    def __init__(self, store, token, *, gh=gh_json, clock=time.time, spawn=None, spawn_triage=None, disk_free=None,
+                 ram_free=None):
         self.store, self.token, self.gh, self.clock = store, token, gh, clock
         self.disk_free = disk_free or free_bytes
+        self.ram_free = ram_free or free_ram
         self.disk_announced = False   # whether this worker has announced a disk pause (#41)
+        self.ram_announced = False    # ... a memory pause (#61)
+        self.tools_announced = False  # ... a tool-limits pause (#61)
+        self.tick_sessions = _UNREAD  # issue numbers with a live session, read at most once per tick
         self.launch_announced = False
         self.spawn = spawn or self.spawn_launcher
         self.spawn_triage = spawn_triage or self.spawn_triage_run
@@ -1332,7 +1481,78 @@ class Worker:
             return f'low disk: {free / GIB:.1f} GB free < {minimum:g} GB on {drive}'
         return None
 
+    def ram_pause(self, config):
+        """Why admissions are paused for memory (#61), or None. Like the disk guard, it fails nothing."""
+        try:
+            minimum = min_free_ram_gb(config)
+            if not minimum:
+                return None
+            free = self.ram_free()
+        except (OSError, ValueError) as err:
+            return f'memory check failed: {err}'
+        if free is not None and free < minimum * GIB:
+            return f'low memory: {free / GIB:.1f} GB free < {minimum:g} GB'
+        return None
+
+    def live_numbers(self, repo):
+        """Issue numbers with a live issue session, read once per tick and only when needed; None when
+        the terminal cannot be read (then every member counts as live)."""
+        if self.tick_sessions is _UNREAD:
+            try:
+                self.tick_sessions = session_numbers(repo, agw.tree())
+            except (OSError, ValueError, KeyError, TypeError, agw.CtlError) as err:
+                self.error('live sessions', err)
+                self.tick_sessions = None
+        return self.tick_sessions
+
+    def has_session(self, data, m):
+        live = self.live_numbers(data['repo'])
+        return live is None or m['number'] in live
+
+    def hold_environment(self, data, m):
+        """A blocked member keeps its slot while the cause is environmental - its report says so, or
+        its relay announced a usage limit - and its issue session is still in the terminal (#61)."""
+        try:
+            environmental = m.get('cause') == 'environment' or relay_limited(m)
+        except (OSError, ValueError) as err:
+            self.error(f'limits #{m["number"]}', err)
+            environmental = m.get('cause') == 'environment'
+        m['slotReleased'] = not (environmental and self.has_session(data, m))
+
+    def collect_tool_limits(self, data):
+        """Merge live members' recorded usage limits into the queue's toolLimits (#61). A record not
+        newer than the human's last `-Implementer <tool>` is ignored; nothing here ever clears one."""
+        limits = data.get('toolLimits') or {}
+        cleared = data.get('toolLimitsClearedAt') or {}
+        for m in data['members']:
+            if m['state'] not in LIVE_STATES or not m['checkoutEstablished']:
+                continue
+            try:
+                found = member_limits(m)
+            except (OSError, ValueError, AttributeError) as err:
+                self.error(f'limits #{m["number"]}', err)
+                continue
+            for tool, at, line, kind in found:
+                if at > cleared.get(tool, 0) and tool not in limits:
+                    limits[tool] = dict(at=at, line=line, kind=kind, member=m['number'])
+                    self.alerts.append(f'#{m["number"]}: {tool} {kind}: new members avoid it until '
+                                       f'-Queue ... -Implementer {tool} clears it')
+        if limits:
+            data['toolLimits'] = limits
+
+    def live_count(self, data):
+        """Members with running agent sessions (#61): launching and active ones always, blocked, pr-open
+        and close-pending ones while their issue session is in the terminal."""
+        count = 0
+        for m in data['members']:
+            if m['state'] in {'launching', 'active'}:
+                count += 1
+            elif (m['state'] in {'blocked', 'pr-open'} or m.get('closePending')) and self.has_session(data, m):
+                count += 1
+        return count
+
     def tick(self):
+        self.tick_sessions = _UNREAD
         self.poll_jobs()
         with self.store.transaction() as data:
             for m in data['members']:
@@ -1364,6 +1584,8 @@ class Worker:
                     except (OSError, ValueError, KeyError, TypeError) as err:
                         # A partial/unrelated report never turns into an admission signal.
                         self.error(f'loop #{m["number"]}', err)
+                if m['state'] == 'blocked':
+                    self.hold_environment(data, m)
                 if m['state'] in {'active', 'blocked'} and not m.get('pr'):
                     try:
                         if adopt_done(data, m):
@@ -1377,16 +1599,25 @@ class Worker:
         self.close_backstop()
         launches = []
         orphan_timeouts = []
-        disk = self.disk_pause(self.store.load()['config'])
+        config = self.store.load()['config']
+        disk, ram = self.disk_pause(config), self.ram_pause(config)
         with self.store.transaction() as data:
+            self.collect_tool_limits(data)
+            route, tools = tool_route(data)
             # Announced on pause and on resume, by this worker (a restarted conductor announces a pause it
-            # finds); the free-space figure in the text is refreshed silently.
-            disk_changed = bool(disk) != self.disk_announced
-            if disk:
-                data['diskPaused'] = disk
-            else:
-                data.pop('diskPaused', None)
-            count = sum(m['state'] in {'launching', 'active'} and not m['slotReleased'] for m in data['members'])
+            # finds); the figures in the text are refreshed silently.
+            for key, reason in (('diskPaused', disk), ('ramPaused', ram), ('toolsPaused', tools)):
+                if reason:
+                    data[key] = reason
+                else:
+                    data.pop(key, None)
+            # Low disk or memory, or no usable tool, never fails a member (#41, #61): one gate for all.
+            pause = disk or ram or tools
+            count = sum(m['state'] in {'launching', 'active', 'blocked'} and not m['slotReleased']
+                        for m in data['members'])
+            live = sum(m['state'] == 'launching' or m['state'] in LIVE_STATES or bool(m.get('closePending'))
+                       for m in data['members'])
+            ceiling = data['parallel'] + CEILING_EXTRA
             # While triage is paused (a usage limit, or facts it could not read) nobody waits for it.
             paused = self.clock() < self.triage_paused_until
             backoff = data.get('launchBackoff')
@@ -1398,10 +1629,13 @@ class Worker:
                     pending.insert(0, preferred)
             for m in pending:
                 launch_in_flight = any(other['state'] == 'launching' for other in data['members'])
-                if disk or (backoff and (self.clock() < backoff['until'] or launch_in_flight)):
-                    break                  # disk/back-off/probe gate: keep other members pending
+                if pause or (backoff and (self.clock() < backoff['until'] or launch_in_flight)):
+                    break                  # disk/memory/tools/back-off/probe gate: keep other members pending
                 if count >= data['parallel'] or (awaits_triage(data, m) and not paused):
                     break                  # strictly in order: nothing behind a member still being triaged
+                # The ceiling (#61): the terminal is read only when the members could reach it.
+                if live >= ceiling and self.live_count(data) >= ceiling:
+                    break
                 if m['checkoutEstablished'] and not Path(m['checkout']).is_dir():
                     m.update(state='failed', slotReleased=True, reason=f'checkout moved or deleted: {m["checkout"]}; restore it or remove the member')
                     continue
@@ -1409,14 +1643,15 @@ class Worker:
                          result=None, startedAt=self.clock(), slotReleased=False)
                 launches.append(dict(m))
                 count += 1
+                live += 1
             admitted = {m['number'] for m in launches}
             for m in data['members']:
                 if m['state'] == 'launching' and m['number'] not in self.jobs and not m.get('result') and m['number'] not in admitted:
                     # A predecessor may still be running after its conductor died. The
                     # checkout lock or fresh durable start intent gives it time to report.
-                    if disk:
-                        # Low disk never fails a member (#41): no re-spawn, and its window restarts,
-                        # so it is re-spawned, not timed out, once space returns.
+                    if pause:
+                        # Low disk or memory never fails a member (#41, #61): no re-spawn, and its window
+                        # restarts, so it is re-spawned, not timed out, once the pause ends.
                         m['startedAt'] = self.clock()
                     elif self.clock() - m['startedAt'] >= 600:
                         unlocked = (not file_locked(self.store.directory / f'member-{m["number"]}.lock') and
@@ -1426,6 +1661,8 @@ class Worker:
                     elif not file_locked(self.store.directory / f'member-{m["number"]}.lock') and not checkout_locked(Path(m['checkout'])):
                         launches.append(dict(m))
             settings = dict(data)
+            if route:
+                settings['implementer'] = route     # this launch only; the queue's setting is the human's
         for number, attempt, token, checkout, cleanup in orphan_timeouts:
             if cleanup:
                 self.cleanup_launch(checkout, token)
@@ -1447,20 +1684,20 @@ class Worker:
                               dict(result='failed', infra=isinstance(err, OSError),
                                    stage='launcher', detail=str(err)))
         current = self.store.load()
-        if disk_changed:
-            self.disk_announced = bool(disk)
-            message = f'queue paused: {disk}' if disk else 'queue resumed: disk space is back'
-            print(message, flush=True)
-            self.notify(message)
-            self.status('blocked' if disk or current.get('launchPaused') else 'active')
         launch_paused = bool(current.get('launchPaused'))
-        if launch_paused != self.launch_announced:
-            self.launch_announced = launch_paused
-            message = ('queue paused: ' + current['launchPaused'] if launch_paused
-                       else 'queue resumed: launches succeeding')
-            print(message, flush=True)
-            self.notify(message)
-            self.status('blocked' if launch_paused or disk else 'active')
+        changed = False
+        for attribute, reason, resumed in (('disk_announced', disk, 'disk space is back'),
+                                           ('ram_announced', ram, 'memory is back'),
+                                           ('tools_announced', tools, 'a usable tool is back'),
+                                           ('launch_announced', current.get('launchPaused'), 'launches succeeding')):
+            if bool(reason) != getattr(self, attribute):
+                setattr(self, attribute, bool(reason))
+                message = f'queue paused: {reason}' if reason else f'queue resumed: {resumed}'
+                print(message, flush=True)
+                self.notify(message)
+                changed = True
+        if changed:
+            self.status('blocked' if pause or launch_paused else 'active')
         for m in current['members']:
             display = (m['state'], m.get('prState'), m.get('reason'))
             if self.last_display.get(m['number']) != display:
@@ -1560,7 +1797,7 @@ def finished(data):
     if any(m.get('closePending') and not m.get('closeStuck') for m in data['members']):
         return False
     if data['watch'] or any(m['state'] == 'pending' or m['state'] == 'launching' or
-                            (m['state'] == 'active' and not m['slotReleased']) for m in data['members']):
+                            (m['state'] in {'active', 'blocked'} and not m['slotReleased']) for m in data['members']):
         return False
     # A close handed over by its relay (#44) keeps it up too, before the member is even seen merged.
     # Read only when it would otherwise finish: every relay.json, under the queue's state lock.

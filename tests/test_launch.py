@@ -3102,7 +3102,8 @@ class AutoMergeLaunch(LauncherFixtures):
         for key, value, ok in (('cleanup', 'merged', True), ('cleanup', 'off', True), ('cleanup', 'Merged', False),
                                ('cleanup', 'all', False), ('cleanup', 1, False), ('minFreeGB', 0, True),
                                ('minFreeGB', 20.5, True), ('minFreeGB', -1, False), ('minFreeGB', '20', False),
-                               ('minFreeGB', True, False), ('stallMinutes', 0, True), ('stallMinutes', 7.5, True),
+                               ('minFreeGB', True, False), ('minFreeRamGB', 0, True), ('minFreeRamGB', 1.5, True),
+                               ('minFreeRamGB', -1, False), ('minFreeRamGB', '3', False), ('stallMinutes', 0, True), ('stallMinutes', 7.5, True),
                                ('stallMinutes', -1, False), ('stallMinutes', '15', False), ('stallMinutes', True, False)):
             with self.subTest(key=key, value=value):
                 self.config_path.write_text(json.dumps({'checkoutRoot': str(self.temp), key: value}), encoding='utf-8')

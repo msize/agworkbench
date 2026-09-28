@@ -121,16 +121,18 @@ function Get-WorkbenchConfig {
                         deletes only its build outputs, off keeps it
          minFreeGB      the queue admits no member while the checkout drive has less free (GiB; default
                         20, 0 turns the guard off)
+         minFreeRamGB   the queue admits no member while less memory is free (GiB; default 3, 0 turns
+                        the guard off; #61)
          stallMinutes   the relay's stall watch (#45): minutes a loop may sit idle with nothing to wake
                         it before the planner gets a stall pointer (default 15, 0 turns it off) #>
     $path = Join-Path $HOME '.agworkbench.json'
     if ($env:AGWORKBENCH_CONFIG) { $path = $env:AGWORKBENCH_CONFIG }   # tests point this elsewhere
     $config = @{ claudeArgs = @(); codexArgs = @(); checkoutRoot = (Join-Path $HOME 'source\workbench'); allowNetwork = $false;
                  implementer = 'codex'; revmuxProfile = $null; autoMerge = $false; failover = $true; autonomous = $false;
-                 cleanup = 'merged'; minFreeGB = 20; stallMinutes = 15 }
+                 cleanup = 'merged'; minFreeGB = 20; minFreeRamGB = 3; stallMinutes = 15 }
     if (Test-Path -LiteralPath $path) {
         $loaded = Get-Content -Raw -LiteralPath $path | ConvertFrom-Json
-        foreach ($key in @('claudeArgs', 'codexArgs', 'checkoutRoot', 'allowNetwork', 'implementer', 'revmuxProfile', 'autoMerge', 'failover', 'autonomous', 'cleanup', 'minFreeGB', 'stallMinutes')) {
+        foreach ($key in @('claudeArgs', 'codexArgs', 'checkoutRoot', 'allowNetwork', 'implementer', 'revmuxProfile', 'autoMerge', 'failover', 'autonomous', 'cleanup', 'minFreeGB', 'minFreeRamGB', 'stallMinutes')) {
             if ($null -ne $loaded.$key) { $config[$key] = $loaded.$key }
         }
     }
@@ -146,9 +148,12 @@ function Get-WorkbenchConfig {
     if ($config.cleanup -isnot [string] -or $config.cleanup -cnotin @('merged', 'build', 'off')) {
         throw "cleanup in '$path' must be merged, build or off (got '$($config.cleanup)')"
     }
-    $free = $config.minFreeGB
-    if (-not ($free -is [int] -or $free -is [long] -or $free -is [double] -or $free -is [decimal]) -or $free -lt 0) {
-        throw "minFreeGB in '$path' must be a number >= 0 (got '$free')"
+    foreach ($key in @('minFreeGB', 'minFreeRamGB')) {
+        # The conductor reads both itself; a bad value fails here too, at launch.
+        $free = $config[$key]
+        if (-not ($free -is [int] -or $free -is [long] -or $free -is [double] -or $free -is [decimal]) -or $free -lt 0) {
+            throw "$key in '$path' must be a number >= 0 (got '$free')"
+        }
     }
     # The relay reads stallMinutes itself (relay.stall_setting); a bad value fails here, at launch.
     $stall = $config.stallMinutes

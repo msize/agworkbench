@@ -80,6 +80,19 @@ class QueueReports(unittest.TestCase):
             self.assertEqual(2, self.report('blocked', reason='x'))
         self.assertFalse((self.state / 'loop.json').exists())
 
+    def test_an_environmental_block_is_recorded_and_only_for_blocked(self):
+        # #61: a block the human cannot answer (a limited tool, low disk or memory) keeps its slot.
+        with patch.object(sys, 'argv', ['wb.py', 'loop-state', 'blocked', '--environmental', '--reason', 'codex limited']):
+            self.assertEqual(0, wb.main())
+        report = self.q.read_json(self.state / 'loop.json')
+        self.assertEqual(('blocked', 'environment'), (report['state'], report['cause']))
+        self.assertEqual(0, self.report('blocked', reason='a question'))
+        self.assertNotIn('cause', self.q.read_json(self.state / 'loop.json'))
+        with patch.object(sys, 'argv', ['wb.py', 'loop-state', 'resumed', '--environmental']):
+            self.assertEqual(2, wb.main())
+        with self.assertRaises(self.q.QueueError):
+            self.q.write_loop_state(self.folder, 'pr-open', 'https://github.com/o/r/pull/2', cause='environment')
+
     def test_the_relay_reports_with_the_workbench_loop_id_not_a_runtime(self):
         # #45: the relay is not a Claude runtime; it passes the id claude.json holds, and only that id.
         with patch.dict(os.environ):

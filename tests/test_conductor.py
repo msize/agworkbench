@@ -9,6 +9,7 @@ import sys
 import threading
 import unittest
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -20,6 +21,7 @@ import cleanup
 import wb
 
 REAL_FREE_BYTES = q.free_bytes          # QueueCase patches it; the real one is tested on its own
+REAL_FREE_RAM = q.free_ram
 
 
 class QueueCase(unittest.TestCase):
@@ -42,6 +44,9 @@ class QueueCase(unittest.TestCase):
         # #41: the disk guard reads this; a test machine's real free space must not pause the queue.
         self.free = 500 * q.GIB
         self.enterContext(patch.object(q, 'free_bytes', lambda path: (self.free, 'X:')))
+        # #61: and the memory guard this; the test machine's real free memory must not either.
+        self.ram = 32 * q.GIB
+        self.enterContext(patch.object(q, 'free_ram', lambda: self.ram))
         self.cleanups = []
         self.enterContext(patch.object(cleanup, 'start_after_close',
                                        side_effect=lambda *args: self.cleanups.append(args) or (1, 'wmi')))
@@ -57,6 +62,10 @@ class QueueCase(unittest.TestCase):
             return str(uuid.uuid4())
         if command == 'session.restore':
             return dict(action='pinned', pane=kwargs['target'], command=kwargs['args']['command'])
+        if command == 'tree':
+            # #61: the ceiling reads the terminal; these members' sessions are gone unless a test says so.
+            return {'workspaces': [{'name': 'r', 'sessions': [{'id': str(uuid.uuid4()), 'name': f'#{n} issue'}
+                                                              for n in getattr(self, 'sessions', ())]}]}
         raise AssertionError(command)
 
     def start(self, spec='o/r#1,2,3', **kwargs):
@@ -150,7 +159,9 @@ class QueueCase(unittest.TestCase):
         self.assertNotIn('closePending', self.member(1))
         self.assertNotIn('closeStuck', self.member(1))
         self.assertNotIn(1, worker.closes)
-        self.assertTrue(q.finished(self.store.load()))
+        # #61 M5: a resumed loop is live work again and holds a slot, so the queue is not finished.
+        self.assertFalse(self.member(1)['slotReleased'])
+        self.assertFalse(q.finished(self.store.load()))
 
     def test_parallel_blocked_resumed_and_failed_members_release_slots(self):
         self.start(parallel=2)
@@ -162,7 +173,7 @@ class QueueCase(unittest.TestCase):
         self.assertEqual([1, 2, 3], [x[0] for x in self.launches])
         self.report(1, 'resumed')
         worker.tick()
-        self.assertTrue(self.member(1)['slotReleased'])
+        self.assertFalse(self.member(1)['slotReleased'])       # #61 M5: resumed work takes a slot again
         self.assertEqual('active', self.member(1)['state'])
         self.report(1)
         worker.tick()
@@ -1841,6 +1852,297 @@ class DiskGuard(unittest.TestCase):
         free, drive = REAL_FREE_BYTES(self.root / 'clones' / 'not' / 'yet')     # the root does not exist yet
         self.assertEqual(shutil.disk_usage(self.root).free // q.GIB, free // q.GIB)
         self.assertEqual(Path(self.root).anchor, drive)
+
+
+class EnvironmentalBlocks(unittest.TestCase):
+    """#61: a member blocked by its environment keeps its slot while its session lives; the number
+    of live members is capped at parallel + 2, whatever state the slots are in."""
+    terminal, start, gh, spawn, worker, member, report = (QueueCase.terminal, QueueCase.start, QueueCase.gh,
+                                                          QueueCase.spawn, QueueCase.worker, QueueCase.member,
+                                                          QueueCase.report)
+
+    def setUp(self):
+        QueueCase.setUp(self)
+        self.sessions = set()
+
+    def launched(self):
+        return [n for n, _, _ in self.launches]
+
+    def relay_episode(self, n, tool='codex', kind='warning', box='codex'):
+        path = Path(self.member(n)['checkout']) / '.workbench/state/relay.json'
+        q.atomic_json(path, {'limits': {box: {'kind': kind, 'tool': tool, 'line': 'Approaching rate limits',
+                                              'firstSeen': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                                              'announced': True}}})
+
+    def test_an_environmental_block_keeps_the_slot_while_its_session_lives(self):
+        self.start('o/r#1,2', parallel=1)
+        w = self.worker()
+        w.tick(); w.tick()
+        self.sessions = {1}
+        self.report(1, 'blocked', reason='codex limited, failover off', cause='environment')
+        w.tick(); w.tick()
+        self.assertEqual(('blocked', False, 'environment'),
+                         (self.member(1)['state'], self.member(1)['slotReleased'], self.member(1)['cause']))
+        self.assertEqual([1], self.launched())
+        self.assertFalse(q.finished(self.store.load()))
+        self.sessions = set()                       # the human closed it: the slot goes with it
+        w.tick()
+        self.assertTrue(self.member(1)['slotReleased'])
+        self.assertEqual([1, 2], self.launched())
+
+    def test_three_members_blocked_on_a_tool_limit_launch_nothing(self):
+        self.start('o/r#1,2,3,4', parallel=3)
+        w = self.worker()
+        w.tick(); w.tick()
+        self.assertEqual([1, 2, 3], self.launched())
+        with self.store.transaction() as data:
+            data['parallel'] = 1
+        self.sessions = {1, 2, 3}
+        for n in (1, 2, 3):
+            self.report(n, 'blocked', reason='codex limited', cause='environment')
+        for _ in range(3):
+            w.tick()
+        self.assertEqual([1, 2, 3], self.launched())
+        self.assertEqual('pending', self.member(4)['state'])
+
+    def test_a_plain_block_under_an_announced_relay_limit_keeps_the_slot(self):
+        # The incident's shape: the planner reported a plain `blocked`, the relay had announced a limit.
+        self.start('o/r#1,2', parallel=1)
+        w = self.worker()
+        w.tick(); w.tick()
+        self.sessions = {1}
+        self.relay_episode(1)
+        self.report(1, 'blocked', reason='codex shows the chooser; human must answer it')
+        w.tick(); w.tick()
+        self.assertFalse(self.member(1)['slotReleased'])
+        self.assertEqual([1], self.launched())
+
+    def test_a_question_still_releases_the_slot_and_resumed_takes_it_back(self):
+        self.start('o/r#1,2,3', parallel=1)
+        w = self.worker()
+        w.tick(); w.tick()
+        self.sessions = {1}
+        self.report(1, 'blocked', reason='which API?')
+        w.tick()
+        self.assertTrue(self.member(1)['slotReleased'])
+        self.assertEqual([1, 2], self.launched())
+        self.report(1, 'resumed')
+        w.tick()
+        self.assertFalse(self.member(1)['slotReleased'])
+        self.assertNotIn('cause', self.member(1))
+        self.report(2, 'pr-open')
+        w.tick()
+        self.assertEqual([1, 2], self.launched())   # #1 holds the only slot again
+
+    def test_the_live_ceiling_holds_in_a_cascade(self):
+        self.start('o/r#' + ','.join(map(str, range(1, 9))), parallel=1)
+        w = self.worker()
+        peak = 0
+        for _ in range(12):
+            w.tick()
+            for m in self.store.load()['members']:
+                if m['state'] == 'active' and not m['slotReleased']:
+                    self.sessions.add(m['number'])
+                    self.report(m['number'], 'blocked', reason='a question for the human')
+            w.tick()
+            live = sum(m['state'] in {'launching', 'active', 'blocked', 'pr-open'} and m['number'] in self.sessions
+                       for m in self.store.load()['members'])
+            peak = max(peak, live)
+        self.assertEqual([1, 2, 3], self.launched())
+        self.assertEqual(3, peak)
+        self.sessions.discard(1)                    # one member's sessions close: one more may start
+        w.tick()
+        self.assertEqual([1, 2, 3, 4], self.launched())
+
+    def test_an_unreadable_terminal_counts_every_member_as_live(self):
+        self.start('o/r#1,2,3,4', parallel=1)
+        w = self.worker()
+        w.tick(); w.tick()
+        with self.store.transaction() as data:
+            for m in data['members'][1:3]:
+                m.update(state='pr-open', phase='pr-open', slotReleased=True, attempt=1, token=str(uuid.uuid4()))
+            data['members'][0]['state'] = 'blocked'
+            data['members'][0]['slotReleased'] = True
+        with patch.object(q.agw, 'tree', side_effect=q.agw.CtlError('no pipe')):
+            w.tick()
+        self.assertEqual([1], self.launched())
+        w.tick()                                    # readable, and none of them has a session
+        self.assertEqual([1, 4], self.launched())
+
+
+class ToolLimits(unittest.TestCase):
+    """#61: a usage limit recorded by any live member steers new members to the other tool, or pauses
+    the queue when no tool is usable; only the human's -Implementer clears it."""
+    terminal, start, gh, worker, member, report = (QueueCase.terminal, QueueCase.start, QueueCase.gh,
+                                                   QueueCase.worker, QueueCase.member, QueueCase.report)
+
+    def setUp(self):
+        QueueCase.setUp(self)
+        self.implementers = []
+        self.start('o/r#1,2,3', parallel=1)
+        self.w = self.worker()
+        self.w.notify, self.w.status = Mock(), Mock()
+        self.w.tick(); self.w.tick()               # #1 active
+        self.implementers.clear()
+
+    def spawn(self, data, m):
+        self.implementers.append((m['number'], data.get('implementer')))
+        return QueueCase.spawn(self, data, m)
+
+    def record(self, n, tool='codex', at=None, kind='warning', relay=False):
+        at = datetime.now(timezone.utc) if at is None else at
+        state = Path(self.member(n)['checkout']) / '.workbench/state'
+        if relay:
+            q.atomic_json(state / 'relay.json', {'limits': {'codex': {
+                'kind': kind, 'tool': tool, 'line': f'{tool} {kind}', 'firstSeen': at.isoformat(timespec='seconds'),
+                'announced': True}}})
+        else:
+            q.atomic_json(state / 'implementer.json', {'tool': 'claude', 'limits': {tool: {
+                'at': at.isoformat(), 'line': f'{tool} {kind}', 'kind': kind}}})
+
+    def next_member(self):
+        self.report(1, 'pr-open')
+        self.w.tick()
+
+    def test_a_limited_codex_sends_new_members_to_claude(self):
+        self.record(1)
+        self.next_member()
+        self.assertEqual([(2, 'claude')], self.implementers)
+        limit = self.store.load()['toolLimits']['codex']
+        self.assertEqual(('warning', 1), (limit['kind'], limit['member']))
+        self.assertNotIn('implementer', self.store.load())          # the queue's setting stays the human's
+
+    def test_a_relay_episode_is_read_by_its_tool_not_its_box(self):
+        self.record(1, tool='claude', kind='limited', relay=True)   # a Claude implementer in the codex box
+        self.next_member()
+        self.assertEqual([], self.implementers)
+        self.assertIn('the planner is always Claude', self.store.load()['toolsPaused'])
+        self.w.notify.assert_any_call('queue paused: ' + self.store.load()['toolsPaused'])
+        self.w.status.assert_called_with('blocked')
+
+    def test_failover_off_pauses_instead_of_switching(self):
+        self.config.write_text(json.dumps({'checkoutRoot': str(self.root / 'clones'), 'failover': False}))
+        self.record(1)
+        self.next_member()
+        self.assertEqual([], self.implementers)
+        self.assertIn('failover is off', self.store.load()['toolsPaused'])
+
+    def test_a_claude_queue_is_not_rerouted_by_a_codex_limit(self):
+        self.start('o/r#1', implementer='claude')
+        self.record(1)
+        self.next_member()
+        self.assertEqual([(2, None)], [(n, None if tool == 'claude' else tool) for n, tool in self.implementers])
+
+    def test_the_humans_implementer_clears_it_and_old_records_stay_ignored(self):
+        self.record(1, at=datetime.now(timezone.utc) - timedelta(minutes=5))
+        self.w.tick()
+        self.assertIn('codex', self.store.load()['toolLimits'])
+        self.start('o/r#1', implementer='codex')                    # "codex has reset"
+        self.assertNotIn('toolLimits', self.store.load())
+        self.next_member()
+        self.assertEqual([(2, 'codex')], self.implementers)          # #1's old failover does not bring it back
+        self.assertNotIn('toolLimits', self.store.load())
+        self.record(2, at=datetime.now(timezone.utc) + timedelta(minutes=1), relay=True)
+        self.report(2, 'pr-open')
+        self.w.tick()
+        self.assertEqual([(2, 'codex'), (3, 'claude')], self.implementers)
+
+    def test_the_same_implementer_clears_even_without_a_settings_change(self):
+        with self.store.transaction() as data:
+            data['implementer'] = 'codex'
+        self.record(1, at=datetime.now(timezone.utc) - timedelta(minutes=5))
+        self.w.tick()
+        self.assertIn('codex', self.store.load()['toolLimits'])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.start('o/r#1', implementer='codex')                # already codex: no settings change
+        self.assertNotIn('toolLimits', self.store.load())
+        self.assertIn('cleared the recorded usage limit for codex', out.getvalue())
+
+    def test_malformed_tool_limits_are_refused(self):
+        for bad in ({'toolLimits': {'aider': {}}}, {'toolLimits': {'codex': {'at': 'x'}}},
+                    {'toolLimitsClearedAt': {'codex': 'yesterday'}}, {'toolsPaused': 3}, {'ramPaused': 3}):
+            with self.subTest(bad=bad):
+                data = q.read_json(self.store.path)
+                q.atomic_json(self.store.path, dict(data, **bad))
+                with self.assertRaises(q.StateError):
+                    self.store.load()
+                q.atomic_json(self.store.path, data)
+
+
+class MemoryGuard(unittest.TestCase):
+    """#61: below minFreeRamGB the conductor admits nothing and fails nothing, like the disk guard."""
+    terminal, start, gh, spawn, worker, member = (QueueCase.terminal, QueueCase.start, QueueCase.gh,
+                                                  QueueCase.spawn, QueueCase.worker, QueueCase.member)
+
+    def setUp(self):
+        QueueCase.setUp(self)
+        self.start('o/r#1,2,3', parallel=2)
+        self.w = self.worker()
+        self.w.notify = Mock()
+        self.w.status = Mock()
+
+    def test_low_memory_pauses_admission_and_resumes(self):
+        self.ram = 1.1 * q.GIB
+        for _ in range(3):
+            self.w.tick()
+        self.assertEqual([], self.launches)
+        self.assertEqual('low memory: 1.1 GB free < 3 GB', self.store.load()['ramPaused'])
+        self.w.notify.assert_called_once_with('queue paused: low memory: 1.1 GB free < 3 GB')
+        self.w.status.assert_called_once_with('blocked')
+        self.ram = 8 * q.GIB
+        self.w.tick()
+        self.assertEqual([1, 2], [n for n, _, _ in self.launches])
+        self.assertNotIn('ramPaused', self.store.load())
+        self.assertEqual('queue resumed: memory is back', self.w.notify.call_args.args[0])
+        self.w.status.assert_called_with('active')
+
+    def test_an_orphaned_launch_is_not_respawned_while_memory_is_low(self):
+        with self.store.transaction() as data:
+            data['members'][0].update(state='launching', attempt=1, token=str(uuid.uuid4()), result=None,
+                                      startedAt=self.now - 700, slotReleased=False)
+        self.ram = 1 * q.GIB
+        self.w.tick()
+        self.assertEqual([], self.launches)
+        self.assertEqual('launching', self.member(1)['state'])
+        self.ram = 8 * q.GIB
+        self.w.tick()
+        self.assertIn(1, [n for n, _, _ in self.launches])
+        self.assertNotEqual('failed', self.member(1)['state'])
+
+    def test_disk_and_memory_pauses_share_one_status(self):
+        self.ram, self.free = 1 * q.GIB, 5 * q.GIB
+        self.w.tick()
+        self.ram = 8 * q.GIB
+        self.w.tick()                                # memory is back, the disk is still low
+        self.assertEqual('blocked', self.w.status.call_args.args[0])
+        self.assertEqual([], self.launches)
+
+    def test_the_threshold_comes_from_the_config(self):
+        self.ram = 2 * q.GIB
+        for value, admitted in ((0, True), (1.5, True), (4, False)):
+            with self.subTest(value=value):
+                self.launches.clear()
+                with self.store.transaction() as data:
+                    for m in data['members']:
+                        m.update(state='pending', attempt=0, slotReleased=False)
+                self.config.write_text(json.dumps({'checkoutRoot': str(self.root / 'clones'), 'minFreeRamGB': value}))
+                self.w.tick()
+                self.assertEqual(admitted, bool(self.launches))
+
+    def test_an_invalid_threshold_pauses_rather_than_admits(self):
+        for value in (-1, 'x', True):
+            with self.subTest(value=value):
+                self.config.write_text(json.dumps({'checkoutRoot': str(self.root / 'clones'), 'minFreeRamGB': value}))
+                self.w.tick()
+                self.assertEqual([], self.launches)
+                self.assertIn('minFreeRamGB', self.store.load()['ramPaused'])
+
+    def test_free_ram_reads_this_machine(self):
+        free = REAL_FREE_RAM()
+        self.assertTrue(free is None or 0 < free < 1024 * q.GIB, free)
+        if os.name == 'nt':
+            self.assertIsNotNone(free)
 
 
 class LaunchBackoff(unittest.TestCase):
