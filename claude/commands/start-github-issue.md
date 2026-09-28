@@ -141,10 +141,14 @@ desktop notification. It stops ringing a limited implementer: mail to it waits.
   `wb.py loop-state blocked --environmental --reason "<the refusal line>"`). Exit 2 means nothing was stopped
   and nothing changed. A tool with a recorded limit is never switched back to automatically: the
   human clears it with `github-workbench <issue> -Implementer <tool>` once its limit has reset.
+  In queue mode, tell them that this clears only the checkout's record. For new members to use
+  that tool again, the queue's record needs `github-workbench -Queue <spec> -ClearLimit <tool>` too.
 - **`-Failover` stopped the agent but did not switch** (exit 3, `Failover incomplete: ...`): the
   limited agent may be gone, and its limit is recorded. Tell the human the line and set blocked
   (in queue mode, with `--environmental`). They
   relaunch with `github-workbench <issue> -Implementer <other tool>` once the pane is a clean shell.
+  In queue mode, also tell them that the queue keeps its own record of the limit, which
+  `github-workbench -Queue <spec> -ClearLimit <tool>` clears once the limit has reset.
 - **`failover=false`**: tell the human and set blocked. In queue mode, first report
   `wb.py loop-state blocked --environmental --reason "<tool> limited; failover is off"`.
 - **Box `claude`** (you): this mail is only a record; the human was already notified. Carry on

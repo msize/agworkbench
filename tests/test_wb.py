@@ -128,6 +128,7 @@ class QueueReports(unittest.TestCase):
         self.assertIn('`limited` or `warning`', limits)
         self.assertNotIn('never answer it. Tell the human', limits)
         self.assertIn('loop-state blocked --environmental', limits)
+        self.assertEqual(2, limits.count('-Queue <spec> -ClearLimit <tool>'))    # r2 m3: the queue's own record
         self.assertIn('loop-state blocked --environmental', text.split('## Queue mode')[1].split('## The channel')[0])
 
     def test_no_pr_requires_a_closed_issue_and_publishes_queue_completion(self):

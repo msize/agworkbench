@@ -355,6 +355,7 @@ def checkout_root(config):
 
 GIB = 1024 ** 3                 # minFreeGB counts what Explorer labels "GB" (#41)
 CEILING_EXTRA = 2               # live members beyond -Parallel the conductor tolerates (#61)
+SESSION_GRACE = 120             # seconds a slot-holding member's session may be missing before its slot goes (#61)
 LIVE_STATES = {'active', 'blocked', 'pr-open'}
 _UNREAD = object()
 
@@ -887,6 +888,11 @@ def apply_loop(data, member, path):
         member.pop('closeStuck', None)
     member.update(phase=state, state=state, reason=report.get('reason'), consumedLoop=loop, consumedRev=report['rev'])
     member.pop('cause', None)
+    member.pop('sessionGoneSince', None)        # a fresh report: the session watch starts over
+    if report['state'] == 'resumed':
+        member['resumed'] = True               # its slot is watched like a PR member's (#61)
+    else:
+        member.pop('resumed', None)
     if state == 'closed':
         member.update(pr=None, prState=None)
     if state == 'blocked' and report.get('cause'):
@@ -1520,16 +1526,25 @@ class Worker:
             environmental = m.get('cause') == 'environment'
         m['slotReleased'] = not (environmental and self.has_session(data, m))
 
-    def release_orphaned_slot(self, data, m):
-        """A resumed member with a PR takes a slot (#61), and refresh_stale skips members with a PR:
-        once its issue session is gone, nothing runs there, so the slot is released - the same rule
-        as an environmental block."""
-        if not m['slotReleased'] and not self.has_session(data, m):
+    def watch_session(self, data, m):
+        """An active member with a PR or a resumed loop holds a slot (#61) that refresh_stale never
+        reclaims: it skips members with a PR, and an open issue without one stays active. Re-decided
+        every tick: once its issue session has been missing for SESSION_GRACE seconds the slot is
+        released (one missed read of a restarting terminal is not enough), and it is taken back when
+        the session is seen again."""
+        if self.has_session(data, m):
+            m.pop('sessionGoneSince', None)
+            m['slotReleased'] = False
+            return
+        since = m.get('sessionGoneSince')
+        if type(since) not in (int, float):
+            since = m['sessionGoneSince'] = self.clock()
+        if self.clock() - since >= SESSION_GRACE:
             m['slotReleased'] = True
 
     def collect_tool_limits(self, data):
         """Merge live members' recorded usage limits into the queue's toolLimits (#61). A record not
-        newer than the human's last `-Implementer <tool>` is ignored; nothing here ever clears one."""
+        newer than the human's last `-ClearLimit <tool>` is ignored; nothing here ever clears one."""
         limits = data.get('toolLimits') or {}
         cleared = data.get('toolLimitsClearedAt') or {}
         for m in data['members']:
@@ -1551,11 +1566,14 @@ class Worker:
             data['toolLimits'] = limits
 
     def live_count(self, data):
-        """Members with running agent sessions (#61): launching and active ones always, blocked, pr-open
-        and close-pending ones while their issue session is in the terminal."""
+        """Members with running agent sessions (#61): launching ones always, active ones that hold a
+        slot, and active, blocked, pr-open and close-pending ones while their issue session is in the
+        terminal."""
         count = 0
         for m in data['members']:
-            if m['state'] in {'launching', 'active'}:
+            if m['state'] == 'launching' or (m['state'] == 'active' and not m['slotReleased']):
+                count += 1
+            elif m['state'] == 'active' and self.has_session(data, m):
                 count += 1
             elif (m['state'] in {'blocked', 'pr-open'} or m.get('closePending')) and self.has_session(data, m):
                 count += 1
@@ -1596,8 +1614,8 @@ class Worker:
                         self.error(f'loop #{m["number"]}', err)
                 if m['state'] == 'blocked':
                     self.hold_environment(data, m)
-                elif m['state'] == 'active' and m.get('pr'):
-                    self.release_orphaned_slot(data, m)
+                elif m['state'] == 'active' and (m.get('pr') or m.get('resumed')):
+                    self.watch_session(data, m)
                 if m['state'] in {'active', 'blocked'} and not m.get('pr'):
                     try:
                         if adopt_done(data, m):

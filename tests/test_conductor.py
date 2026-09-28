@@ -1956,8 +1956,75 @@ class EnvironmentalBlocks(unittest.TestCase):
         self.assertEqual([1, 2], self.launched())
         self.sessions = {2}                           # #1's sessions die; its PR is never merged
         w.tick()
+        self.assertFalse(self.member(1)['slotReleased'])            # r2 m1: one missed read is not enough
+        self.assertEqual([1, 2], self.launched())
+        self.now += q.SESSION_GRACE
+        w.tick()
         self.assertTrue(self.member(1)['slotReleased'])
         self.assertEqual([1, 2, 3], self.launched())
+
+    def test_a_watched_slot_survives_a_missed_read_and_is_taken_back(self):
+        # r2 m1: re-decided every tick, with a grace; the session coming back takes the slot back.
+        self.start('o/r#1,2', parallel=1)
+        w = self.worker()
+        w.tick(); w.tick()
+        self.sessions = {1}
+        self.report(1, 'blocked', reason='a question')
+        w.tick()
+        self.report(1, 'resumed')
+        w.tick()
+        self.assertTrue(self.member(1)['resumed'])
+        self.sessions = set()                         # agwinterm restarting: the tree misses it once
+        w.tick()
+        self.assertFalse(self.member(1)['slotReleased'])
+        self.sessions = {1}
+        w.tick()
+        self.assertNotIn('sessionGoneSince', self.member(1))
+        self.sessions = set()
+        w.tick()
+        self.now += q.SESSION_GRACE
+        w.tick()
+        self.assertTrue(self.member(1)['slotReleased'])
+        self.sessions = {1, 2}                        # back after all: the slot is taken again
+        w.tick()
+        self.assertFalse(self.member(1)['slotReleased'])
+
+    def test_a_resumed_member_without_a_pr_frees_its_slot_when_its_session_is_gone(self):
+        # r2 m2: blocked before its PR, resumed, then its sessions died; refresh_stale keeps it active.
+        self.start('o/r#1,2', parallel=1)
+        w = self.worker()
+        w.tick(); w.tick()
+        self.sessions = {1}
+        self.report(1, 'blocked', reason='a question')
+        w.tick()
+        self.assertEqual([1, 2], self.launched())
+        self.report(2, 'closed', reason='duplicate')
+        self.report(1, 'resumed')
+        w.tick()
+        self.assertFalse(self.member(1)['slotReleased'])
+        self.assertFalse(q.finished(self.store.load()))
+        self.sessions = set()
+        w.tick()
+        self.now += q.SESSION_GRACE
+        w.tick()
+        self.assertEqual(('active', True), (self.member(1)['state'], self.member(1)['slotReleased']))
+        self.assertTrue(q.finished(self.store.load()))
+        self.report(1, 'pr-open')
+        w.tick()
+        self.assertNotIn('resumed', self.member(1))
+
+    def test_an_orphaned_active_member_does_not_count_against_the_ceiling(self):
+        # r2 M1: an active member whose session is gone and slot released is not live.
+        self.start('o/r#1,2,3,4', parallel=1)
+        with self.store.transaction() as data:
+            for m in data['members'][:3]:
+                m.update(attempt=1, token=str(uuid.uuid4()), pr=f'https://github.com/o/r/pull/{m["number"]}',
+                         state='pr-open', phase='pr-open', slotReleased=True)
+            data['members'][0].update(state='active', phase='active')
+        self.sessions = {2, 3}
+        w = self.worker()
+        w.tick()
+        self.assertEqual([4], self.launched())
 
     def test_the_live_ceiling_holds_in_a_cascade(self):
         self.start('o/r#' + ','.join(map(str, range(1, 9))), parallel=1)
@@ -1997,7 +2064,7 @@ class EnvironmentalBlocks(unittest.TestCase):
 
 class ToolLimits(unittest.TestCase):
     """#61: a usage limit recorded by any live member steers new members to the other tool, or pauses
-    the queue when no tool is usable; only the human's -Implementer clears it."""
+    the queue when no tool is usable; only the human's -ClearLimit clears it."""
     terminal, start, gh, worker, member, report = (QueueCase.terminal, QueueCase.start, QueueCase.gh,
                                                    QueueCase.worker, QueueCase.member, QueueCase.report)
 

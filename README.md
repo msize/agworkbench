@@ -550,7 +550,8 @@ resumes by itself.
 so the next issue starts. A member blocked by its environment keeps its slot while its issue
 session is open: a usage limit it could not fail over, low disk or low memory. The planner reports
 that with `wb.py loop-state blocked --environmental`, and a limit its relay announced counts too.
-A member that resumes takes a slot again. Whatever the slots say, the queue admits nothing while
+A member that resumes takes a slot again. It gives the slot back once its issue session has been
+gone for two minutes, and takes it again if the session comes back. Whatever the slots say, the queue admits nothing while
 `parallel + 2` members have live sessions: launching, active, blocked, and open-PR or
 close-pending members whose issue session is still in the terminal. So with `-Parallel 1`,
 three PRs waiting for your merge stop new launches until you merge one or close its sessions.
