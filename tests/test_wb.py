@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import stat
@@ -2030,7 +2031,7 @@ class ReviewRoundProse(unittest.TestCase):
         for needle in ['wb.py review-round --summary', 'leave it out when it exits 2',
                        "**A stop's deferred minors are filed now**, with or without auto-merge",
                        'wb.py" follow-up file --source <N> --pr <P>`, run `review-round --summary` again',
-                       'gh pr edit <P> --body-file .workbench/pr-body.md']:
+                       'gh pr edit <P> --repo <owner/repo> --body-file .workbench/pr-body.md']:
             self.assertIn(needle, phase5)
         self.assertLess(phase5.index('gh pr create'), phase5.index('gh pr edit <P>'))
         self.assertNotIn('filed at merge', text)
@@ -2242,6 +2243,18 @@ class ForkCheckout(unittest.TestCase):
                 self.assertEqual([], gh.unscoped)
         verbs = {tuple(c[1:3]) for c in gh.calls}
         self.assertEqual({('issue', 'view'), ('pr', 'list')}, verbs)
+
+    def test_every_gh_command_the_planner_is_told_to_type_names_the_repo(self):
+        text = (Path(__file__).resolve().parent.parent / 'claude/commands/start-github-issue.md').read_text(encoding='utf-8')
+        # A command with arguments, not a bare mention like `gh pr create` or the `gh issue ...` of the rule.
+        commands = [m[0] for m in re.finditer(r'gh (?:issue|pr|repo|label|run) [a-z-]+ [^`\n]+', text)
+                    if not m[0].rstrip().endswith('...')]
+        self.assertGreaterEqual(len(commands), 7)                            # view, close, create, edit, merge, comment...
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertTrue('--repo <owner/repo>' in command or command.startswith('gh repo view <owner/repo>'),
+                                command)
+        self.assertIn("In a fork's clone gh's own default is the fork's **parent**", text)
 
     def test_merge_check_refuses_a_pr_of_another_repo(self):
         gh = ForkGh()

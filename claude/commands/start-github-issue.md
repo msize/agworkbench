@@ -278,8 +278,14 @@ python "$AGWORKBENCH/lib/agmsg.py" doctor      # both panes registered, you are 
 python "$AGWORKBENCH/lib/wb.py" status active
 ```
 
-Parse `$ARGUMENTS` into owner/repo and number (a bare number means this clone's repo). Note the
-default branch: `gh repo view --json defaultBranchRef --jq .defaultBranchRef.name`.
+Parse `$ARGUMENTS` into owner/repo and number (a bare number means this clone's repo: its `origin`,
+`git remote get-url origin`). Note the default branch:
+`gh repo view <owner/repo> --json defaultBranchRef --jq .defaultBranchRef.name`.
+
+**Every `gh` command you type names the repo** - `--repo <owner/repo>`, or the repo in an `api` path.
+In a fork's clone gh's own default is the fork's **parent**, so a bare `gh issue ...` or `gh pr ...`
+reads and writes the upstream repo (#71). The launcher pins the default to this repo too; do not rely
+on it alone.
 
 ## Phase 1 - intake
 
@@ -299,7 +305,7 @@ If intake or the plan round shows the issue is a duplicate, already fixed on the
 or not planned, give Codex the evidence (duplicate issue, fixing commit, or passing check) and
 agree on the no-op verdict as `AGREED: no-op`. Post that evidence as an issue comment with the
 `<!-- agworkbench:planner -->` marker. With `autonomous=true`, close the issue with the matching
-GitHub reason (`gh issue close <N> --reason "not planned"` for a duplicate or declined work;
+GitHub reason (`gh issue close <N> --repo <owner/repo> --reason "not planned"` for a duplicate or declined work;
 `--reason "completed"` when already fixed). Without autonomy, report
 `loop-state blocked --reason "no-op: <evidence>; close the issue to finish"` in queue mode, then
 set `wb.py status blocked --sound` and wait for the human to decide and close it. Once GitHub
@@ -413,7 +419,7 @@ It ends with the planner marker line. The relay notices the PR on its next check
 when the human merges: right after `gh pr create`, run
 `python "$AGWORKBENCH/lib/wb.py" follow-up file --source <N> --pr <P>`, run `review-round --summary`
 again, put its line (now with the leftovers URL) in `.workbench/pr-body.md`, and
-`gh pr edit <P> --body-file .workbench/pr-body.md`.
+`gh pr edit <P> --repo <owner/repo> --body-file .workbench/pr-body.md`.
 
 ## Phase 6 - the human's review
 
@@ -493,8 +499,8 @@ on, you merge only when **all** of these hold:
 On `ok`, merge exactly that commit, then say so in the PR and in chat:
 
 ```bash
-gh pr merge <N> --merge --delete-branch --match-head-commit <full sha>
-gh pr comment <N> --body-file .workbench/merge-note.md
+gh pr merge <N> --repo <owner/repo> --merge --delete-branch --match-head-commit <full sha>
+gh pr comment <N> --repo <owner/repo> --body-file .workbench/merge-note.md
 ```
 
 The note states each condition as a checked fact: "Merged automatically (auto-merge is on for this
