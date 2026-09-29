@@ -38,6 +38,10 @@
 .EXAMPLE
   github-workbench -Queue bugs -Repo yeroo/docxy -Autonomous -Triage   # P0 first; untriaged triaged first
 .EXAMPLE
+  # A second, named queue of the same repo (#66): its own workspace (docxy-kimi), checkouts
+  # (docxy-kimi-issue-N) and settings; an issue one queue holds is skipped by the other.
+  github-workbench -Queue 'where: priority IN [P2]' -Repo yeroo/docxy -QueueName kimi -Implementer kimi -NoAutoMerge -Watch
+.EXAMPLE
   github-workbench -Queue 'where: bug AND priority IN [P0, P1] AND NOT wontfix' -Repo yeroo/docxy
   github-workbench -Queue "where: label IN [bug, regression] AND NOT 'needs design'" -Repo yeroo/docxy
 .EXAMPLE
@@ -67,6 +71,9 @@ param(
     [int] $QueueAttempt,
     [string] $QueueToken,
     [string] $Implementer,
+    [string] $QueueName,
+    [string] $Workspace,
+    [string] $RevmuxProfile,
     [string] $ClearLimit,
     [switch] $AutoMerge,
     [switch] $NoAutoMerge,
@@ -178,6 +185,24 @@ if ($PSBoundParameters.ContainsKey('ClearLimit') -and
     exit 2
 }
 
+if (($QueueName -or $Workspace) -and -not $PSBoundParameters.ContainsKey('Queue')) {
+    Write-Host '-QueueName and -Workspace belong to -Queue (a named queue of the repo, #66).' -ForegroundColor Yellow
+    exit 2
+}
+if ($Workspace -and -not $QueueName) {
+    Write-Host '-Workspace requires -QueueName: the main queue uses the workspace named after the repo.' -ForegroundColor Yellow
+    exit 2
+}
+if ($QueueName -and $Triage) {
+    Write-Host "a named queue does not triage; triage is the repo-wide github-workbench -Triage -Repo <owner/name> -Watch" -ForegroundColor Yellow
+    exit 2
+}
+if ($PSBoundParameters.ContainsKey('RevmuxProfile') -and
+    ($RevmuxProfile -notmatch '^[A-Za-z0-9._-]+$' -or -not ($PSBoundParameters.ContainsKey('Queue') -or $QueueMember))) {
+    Write-Host "-RevmuxProfile takes a revmux profile name and belongs to -Queue (got '$RevmuxProfile')" -ForegroundColor Yellow
+    exit 2
+}
+
 if ($Failover -and ($Implementer -or $PSBoundParameters.ContainsKey('Queue') -or $NewSession -or $QueueMember)) {
     Write-Host '-Failover picks the next tool in failoverOrder itself; it cannot be combined with -Implementer, -Queue, -NewSession or a queue member.' -ForegroundColor Yellow
     exit 2
@@ -224,6 +249,9 @@ if ($PSBoundParameters.ContainsKey('Queue')) {
     if ($Yes) { $queueArgs += '--yes' }
     if ($DryRun) { $queueArgs += '--dry-run' }
     if ($Implementer) { $queueArgs += @('--implementer', $Implementer) }
+    if ($QueueName) { $queueArgs += @('--name', $QueueName) }
+    if ($Workspace) { $queueArgs += @('--workspace', $Workspace) }
+    if ($RevmuxProfile) { $queueArgs += @('--revmux-profile', $RevmuxProfile) }
     if ($ClearLimit) { $queueArgs += @('--clear-limit', $ClearLimit) }
     if ($AutoMerge) { $queueArgs += '--auto-merge' }
     if ($NoAutoMerge) { $queueArgs += '--no-auto-merge' }
@@ -276,7 +304,7 @@ if (-not $Issue) {
     Write-Host "usage: github-workbench <issue> [-Repo owner/name] [-DryRun] [-Yes] [-NewSession] [-Implementer codex|claude|kimi] [-AutoMerge|-NoAutoMerge] [-Autonomous|-NoAutonomous] [-Failover]" -ForegroundColor Yellow
     Write-Host "       github-workbench -Version"
     Write-Host "       (<spec> is a list like 3,4,5, label:<name>, bugs = label:<bugLabel>, or where: <label query>)"
-    Write-Host "       github-workbench -Queue <spec> [-Repo owner/name] [-Parallel 1..8] [-Watch] [-Prune] [-Retry] [-Yes] [-DryRun] [-Implementer codex|claude|kimi] [-ClearLimit codex|claude|kimi] [-AutoMerge|-NoAutoMerge] [-Autonomous|-NoAutonomous] [-Triage]"
+    Write-Host "       github-workbench -Queue <spec> [-Repo owner/name] [-Parallel 1..8] [-Watch] [-Prune] [-Retry] [-Yes] [-DryRun] [-Implementer codex|claude|kimi] [-ClearLimit codex|claude|kimi] [-AutoMerge|-NoAutoMerge] [-Autonomous|-NoAutonomous] [-Triage] [-RevmuxProfile <profile>] [-QueueName <name> [-Workspace <ws>]]"
     Write-Host "       github-workbench -Triage|-Retriage -Repo owner/name [-Limit N] [-DryRun] [-FollowUps] [-Watch]"
     Write-Host "       github-workbench -Cleanup [-Repo owner/name] [-DryRun] [-BuildOnly]"
     Write-Host "  <issue> is 123, owner/repo#123, or https://github.com/owner/repo/issues/123"
@@ -313,7 +341,7 @@ if ($QueueMember) {
         Enable-LaunchLog
         $ok = Invoke-LaunchSafely {
             Invoke-LauncherBody -Issue $Issue -Repo $Repo -Yes:$Yes -NewSession -Implementer $Implementer -AutoMerge $autoMergeChoice `
-                -Autonomous $autonomousChoice
+                -Autonomous $autonomousChoice -RevmuxProfile $RevmuxProfile
         }
         $outcome = 'ok'
         if (-not $ok) { $outcome = 'failed' }
