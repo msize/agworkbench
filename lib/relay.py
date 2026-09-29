@@ -1036,7 +1036,13 @@ class Relay:
         queue conductor's backstop when there is a running one and the session is provably ours (#44).
         A reopened issue or new open PR leaves the relay watching and returns False."""
         import agw
-        close = self.closer()
+        try:
+            close = self.closer()
+        except ValueError as err:
+            # Which workspace holds the sessions is unknown (#66): nothing can be proven closed.
+            self.log(f"no autonomous close: {err}; the sessions stay open")
+            self.finish_close()
+            return True
         if not close.autonomous():
             self.log("autonomy is off for this checkout; the sessions stay open")
             self.finish_close()
@@ -1483,7 +1489,11 @@ class Relay:
     def no_pr_close_due(self) -> str | None:
         """Return a safe done time. An open PR or issue retires the stale record as a live loop."""
         import conductor
-        close = self.closer()
+        try:
+            close = self.closer()
+        except ValueError as err:
+            self.log(f"no-PR close cannot start: {err}")
+            return None
         if not close.no_pr_done():
             return None
         try:

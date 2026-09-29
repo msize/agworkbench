@@ -195,6 +195,27 @@ class Check(Clones):
         self.assertReason('no .git directory', self.check(plain, issue=8))
         self.assertReason('not a workbench checkout name', self.check(self.root, root=self.base))
 
+    def test_a_named_queue_checkout_is_ours_and_its_sessions_are_in_its_workspace(self):
+        # #66: `<repo>-<queue>-issue-N`, whose sessions live in the workspace its membership records.
+        checkout = self.clone(name='repo-kimi')
+        membership = checkout / '.workbench' / 'state' / 'queue-member.json'
+        conductor.atomic_json(membership, {'queue': str(self.base / 'gone.json'), 'repo': 'o/repo', 'number': 7,
+                                           'queueName': 'kimi', 'workspace': 'repo-kimi'})
+        self.assertEqual([], self.check(checkout))
+        named = {'workspaces': [{'name': 'Repo-Kimi', 'sessions': [{'id': 's', 'name': '#7 relay'}]}]}
+        self.assertReason('session open: #7 relay', self.check(checkout, named))
+        plain = {'workspaces': [{'name': 'repo', 'sessions': [{'id': 's', 'name': '#7 relay'}]}]}
+        self.assertEqual([], self.check(checkout, plain))            # a same-named session elsewhere is not its
+        membership.write_text('{broken', encoding='utf-8')
+        self.assertReason('sessions: unknown workspace', self.check(checkout, named))
+        self.assertReason('sessions: unknown workspace', self.check(checkout))
+        for name, origin in (('repo-Kimi_x', 'https://github.com/o/repo.git'), ('repo-kimi', 'https://github.com/o/other.git'),
+                             ('rep-kimi', 'https://github.com/o/repo.git')):
+            with self.subTest(name=name, origin=origin):
+                other = self.clone(8, name=name, origin=origin)
+                self.assertReason('does not match origin', self.check(other, issue=8))
+                triage.remove_tree(cleanup.long_path(other))
+
     def test_origin_spellings(self):
         for url in ('https://github.com/O/Repo.git', 'https://github.com/o/repo', 'https://x@github.com/o/repo.git/',
                     'git@github.com:o/repo.git', 'ssh://git@github.com/o/repo.git'):
@@ -381,6 +402,28 @@ class AfterClose(Clones):
         self.assertIn('kept: still open after 600s: #7 your review', self.root_log())
         self.assertIn('still open after 600s', self.relay_log(checkout))
         self.assertEqual([], self.gh_calls)
+
+    def test_a_named_queue_checkout_waits_on_its_own_workspace(self):
+        # #66: the sessions to wait for are in the workspace the membership records; an unreadable
+        # membership proves nothing gone, so the clone is kept.
+        checkout = self.clone(name='repo-kimi')
+        membership = checkout / '.workbench' / 'state' / 'queue-member.json'
+        conductor.atomic_json(membership, {'queue': str(self.base / 'gone.json'), 'repo': 'o/repo', 'number': 7,
+                                           'workspace': 'repo-kimi'})
+        self.trees = [{'workspaces': [{'name': 'repo-kimi', 'sessions': [{'id': 'r', 'name': '#7 your review'}]}]}]
+        self.assertEqual(1, self.after_close(checkout))
+        self.assertIn('kept: still open after 600s: #7 your review', self.root_log())
+        membership.write_text('{broken', encoding='utf-8')
+        self.trees = [EMPTY_TREE]
+        self.assertEqual(1, self.after_close(checkout))
+        self.assertIn('unreadable queue membership', self.relay_log(checkout))
+        self.assertTrue(checkout.exists())
+        conductor.atomic_json(membership, {'queue': str(self.base / 'gone.json'), 'repo': 'o/repo', 'number': 7,
+                                           'workspace': 'repo-kimi'})
+        self.trees = [{'workspaces': [{'name': 'repo', 'sessions': [{'id': 'r', 'name': '#7 your review'}]}]}]
+        self.head = run(checkout, 'rev-parse', 'HEAD')
+        self.assertEqual(0, self.after_close(checkout))         # a same-named session in the repo's is not its
+        self.assertFalse(checkout.exists())
 
     def test_build_mode_keeps_the_clone(self):
         checkout = self.clone()
@@ -589,6 +632,18 @@ class Sweep(Clones):
         self.assertEqual(2, self.sweep(repo='o/repo'))
         self.assertTrue(merged.exists())
         self.assertIn('GitHub lookup failed: gh: HTTP 502', self.output())
+
+    def test_a_named_queue_checkout_is_swept_with_its_repo(self):
+        # #66: -Cleanup recognises `<repo>-<queue>-issue-N`, and checks its sessions in its workspace.
+        checkout = self.clone(7, name='repo-kimi')
+        conductor.atomic_json(checkout / '.workbench' / 'state' / 'queue-member.json',
+                              {'queue': str(self.base / 'gone.json'), 'repo': 'o/repo', 'number': 7, 'workspace': 'repo-kimi'})
+        self.prs['issue-7-fix'] = [{'number': 40, 'state': 'MERGED', 'headRefOid': run(checkout, 'rev-parse', 'HEAD')}]
+        busy = {'workspaces': [{'name': 'repo-kimi', 'sessions': [{'id': 's', 'name': '#7 revmux r1'}]}]}
+        self.assertEqual(1, self.sweep(busy, repo='o/repo'))
+        self.assertIn(f'keep {checkout}: session open: #7 revmux r1', self.output())
+        self.assertEqual(0, self.sweep(repo='o/repo'))
+        self.assertFalse(checkout.exists())
 
     def test_nothing_to_do_is_exit_0(self):
         self.clone(8)

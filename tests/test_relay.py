@@ -2581,6 +2581,29 @@ class AutonomousClose(unittest.TestCase):
                                          'headRefName': 'issue-7-fix'}})
         self.assertEqual(self.MERGED_AT, restarted.state['close_merged_at'])
 
+    def test_a_named_queue_members_sessions_are_found_in_its_own_workspace(self):
+        # #66: the membership records the queue's workspace; a same-named helper in the repo's
+        # workspace belongs to another loop and is never touched.
+        self.write('queue-member.json', {'queue': str(self.folder / 'q.json'), 'repo': 'o/repo', 'number': 7,
+                                         'queueName': 'kimi', 'workspace': 'repo-kimi'})
+        self.tree['workspaces'][0]['name'] = 'Repo-Kimi'
+        self.tree['workspaces'][1]['name'] = 'repo'
+        self.assertTrue(closer.relay_alive('o/repo', '7', self.tree, 'repo-kimi'))
+        self.assertFalse(closer.relay_alive('o/repo', '7', self.tree))
+        self.r.close_after_merge(7)
+        self.assertEqual([self.REVMUX, self.PLANNER, self.RELAY], self.closes())
+        self.assertNotIn(self.OTHER, [t for _, t in self.actions])
+
+    def test_an_unreadable_membership_closes_nothing(self):
+        # #66: which workspace holds the sessions is unknown, so none is proven closable.
+        self.write('queue-member.json', {'queue': str(self.folder / 'q.json'), 'repo': 'o/repo', 'number': 7})
+        (self.state / 'queue-member.json').write_text('{broken', encoding='utf-8')
+        lines = []
+        self.r.log = lines.append
+        self.r.close_after_merge(7)
+        self.assertEqual([], self.actions)
+        self.assertTrue(any('unreadable queue membership' in line for line in lines), lines)
+
     # --- #44: in queue mode a refused close is handed to the conductor ----------------------------
     def queue_member(self, running=True):
         """A queue member whose conductor is running (or not); the real check is in test_conductor."""

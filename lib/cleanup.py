@@ -5,14 +5,15 @@ Every issue gets a full clone under checkoutRoot, and nothing else ever deletes 
 one set of safety checks (`check`), one way to delete (`remove`):
 
 - `after-close`: started detached by the autonomous close (relay or conductor backstop) once the
-  issue session is closed. It waits until no `#N ...` session is left in the repo's workspace, then
+  issue session is closed. It waits until no `#N ...` session is left in the checkout's workspace, then
   checks and deletes. It runs with its cwd outside the checkout: on Windows nothing can delete a
   directory that is some process's cwd.
 - `sweep` (`github-workbench -Cleanup`): every checkout under checkoutRoot whose branch has no open PR,
   and whose issue is closed or whose branch has a merged or closed PR.
 
 A checkout is deleted only when it is provably ours and provably finished with: the directory is
-`<root>/<name>-issue-<N>` with a `.git` whose origin is the repo, no session of the issue is open, no
+`<root>/<name>-issue-<N>` (or a named queue's `<name>-<queue>-issue-<N>`, #66) with a `.git` whose
+origin is the repo, no session of the issue is open, no
 launcher holds it, no queue still runs it, nothing is uncommitted or stashed, it has no linked
 worktree or submodule, and every local commit is on a remote-tracking ref or inside the merged PR's head. Anything
 else keeps it, with the reason logged. The delete renames the directory first (`.deleting-<ts>`):
@@ -35,6 +36,7 @@ from pathlib import Path
 from typing import Callable
 
 import agw
+import closer
 import conductor
 import triage
 
@@ -109,14 +111,16 @@ def checkout_identity(checkout: Path) -> dict:
     checkout = Path(checkout)
     match = CHECKOUT_NAME.fullmatch(checkout.name)
     if not match:
-        raise CleanupError(f'not a workbench checkout name (<repo>-issue-<N>): {checkout.name}')
+        raise CleanupError(f'not a workbench checkout name (<repo>[-<queue>]-issue-<N>): {checkout.name}')
     if not (checkout / '.git').is_dir():
         raise CleanupError('no .git directory')
     done = git(checkout, 'remote', 'get-url', 'origin')
     repo = origin_repo(done.stdout) if done.returncode == 0 else None
     if repo is None:
         raise CleanupError(f'origin is not a GitHub repository: {done.stdout.strip() or done.stderr.strip()}')
-    if repo.split('/')[1] != match['name'].casefold():
+    name, stem = repo.split('/')[1], match['name'].casefold()
+    # `<repo>-issue-N`, or a named queue's `<repo>-<queue>-issue-N` (#66); the origin says which repo.
+    if stem != name and not (stem.startswith(name + '-') and conductor.QUEUE_NAME.fullmatch(stem[len(name) + 1:])):
         raise CleanupError(f"directory name {checkout.name} does not match origin {repo}")
     return {'repo': repo, 'number': int(match['number'])}
 
@@ -136,11 +140,11 @@ def identity_reasons(checkout: Path, repo: str, issue: int, root: Path) -> list[
 
 # --- the safety checks -----------------------------------------------------------------------
 
-def live_sessions(repo: str, issue: int | str, tree) -> list[str]:
-    """Every session of issue N in the repo's workspace: the issue session and its helpers alike
-    (relay, revmux, your review). Unlike conductor.session_numbers, helpers count: one still open
-    means the loop is not over."""
-    workspace_name = repo.split('/')[-1].casefold()
+def live_sessions(repo: str, issue: int | str, tree, workspace: str | None = None) -> list[str]:
+    """Every session of issue N in its workspace (a named queue's own, #66; by default the repo's):
+    the issue session and its helpers alike (relay, revmux, your review). Unlike
+    conductor.session_numbers, helpers count: one still open means the loop is not over."""
+    workspace_name = (workspace or repo.split('/')[-1]).casefold()
     prefix = f'#{issue}'
     return [session.get('name') for workspace, session in agw.sessions(tree)
             if (workspace.get('name') or '').casefold() == workspace_name
@@ -199,10 +203,14 @@ def check(checkout: Path, *, repo: str, issue: int | str, root: Path, tree, pr_h
     reasons = identity_reasons(checkout, repo, int(issue), root)
     if reasons:
         return reasons                  # never run anything else on a directory that is not ours
+    try:
+        workspace = closer.workspace_of(checkout / '.workbench', repo)
+    except ValueError as err:
+        return reasons + [f'sessions: unknown workspace ({err})']
     if tree is None:
         reasons.append('sessions: unknown (the session tree could not be read)')
     else:
-        reasons += [f'session open: {name}' for name in live_sessions(repo, issue, tree)]
+        reasons += [f'session open: {name}' for name in live_sessions(repo, issue, tree, workspace)]
     if conductor.checkout_locked(checkout):
         reasons.append('a launcher holds its launch.lock')
     queued = queue_reason(checkout)
@@ -445,7 +453,13 @@ def after_close(checkout: Path, repo: str, issue: int, pr: int | None, mode: str
     while True:
         try:
             snapshot = read_tree()
-            live = live_sessions(repo, issue, snapshot)
+            live = live_sessions(repo, issue, snapshot, closer.workspace_of(checkout / '.workbench', repo))
+        except ValueError as err:
+            # An unreadable membership: which workspace to wait on is unknown, so nothing is proven gone.
+            reason = f'kept: {err}'
+            log(root, checkout, reason)
+            close_log(checkout, reason)
+            return 1
         except (agw.CtlError, OSError) as err:
             snapshot, live = None, [f'the session tree could not be read: {err}']
         if not live:

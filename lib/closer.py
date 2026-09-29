@@ -11,7 +11,7 @@ Stepwise on purpose: `step_helpers()` and `agent_blockers()` each look once and 
 their evidence (settled pane hashes) in the object, so the relay can loop on them while it keeps
 delivering mail, and the conductor can advance one check per tick without blocking its queue.
 
-- Helpers (`#N revmux rK`, `#N your review`, `#N suite <label>` in this repo's workspace) close on their own evidence,
+- Helpers (`#N revmux rK`, `#N your review`, `#N suite <label>` in the checkout's workspace, `workspace_of`) close on their own evidence,
   first and independently of the agents. wb.py launches them in agwinterm's DIRECT command mode: the
   pane runs the helper with no shell around it, and when it ends the pane stays on screen with its
   input closed - nothing can be typed into it and nothing more is printed. So a helper closes when
@@ -75,6 +75,24 @@ def pending_number(key: int | str) -> int | None:
     return None if key == NO_PR else key
 
 
+def workspace_of(hub_dir: Path, repo: str) -> str:
+    """The agwinterm workspace of this checkout's sessions (#66): the one its queue membership records
+    (a named queue's own), else the repo's name - no membership (a manual launch), or one written
+    before #66. An unreadable membership raises ValueError: a wrong guess would find no sessions, and
+    "nothing is live" is what lets a close or a cleanup go ahead."""
+    path = Path(hub_dir) / 'state' / 'queue-member.json'
+    if not path.exists():
+        return repo.split('/')[-1]
+    try:
+        membership = json.loads(path.read_text(encoding='utf-8-sig'))
+    except (OSError, ValueError) as err:
+        raise ValueError(f'unreadable queue membership {path}: {err}') from err
+    workspace = membership.get('workspace') if isinstance(membership, dict) else None
+    if not isinstance(membership, dict) or (workspace is not None and (not isinstance(workspace, str) or not workspace)):
+        raise ValueError(f'invalid queue membership {path}')
+    return workspace or repo.split('/')[-1]
+
+
 def filled_rows(text: str) -> list[str]:
     return [row.rstrip() for row in (text or '').splitlines() if row.strip()][-limits.WINDOW:]
 
@@ -88,11 +106,12 @@ def helper_untouched(marker_rows: list[str], current_rows: list[str]) -> bool:
 
 class Closer:
     def __init__(self, hub_dir: Path, repo: str, issue: str | int | None, peers, *, log: Callable[[str], None],
-                 clock: Callable[[], float] = time.monotonic, dry_run: bool = False):
+                 clock: Callable[[], float] = time.monotonic, dry_run: bool = False, workspace: str | None = None):
         self.hub_dir = Path(hub_dir)
         self.repo = repo
         self.issue = str(issue) if issue else None
-        self.workspace_name = repo.split('/')[-1]
+        # The conductor passes its queue's workspace; the relay reads its checkout's (#66).
+        self.workspace_name = workspace or workspace_of(self.hub_dir, repo)
         self.peers = peers
         self.echo = log
         self.clock = clock
@@ -376,8 +395,8 @@ def idle_blockers(peer, text: str) -> list[str]:
     return reasons
 
 
-def relay_alive(repo: str, issue: str, snapshot) -> bool:
-    """Is this issue's relay session (`#N relay` in the repo's workspace) in the tree?"""
-    workspace_name = repo.split('/')[-1].casefold()
+def relay_alive(repo: str, issue: str, snapshot, workspace: str | None = None) -> bool:
+    """Is this issue's relay session (`#N relay` in its workspace: the queue's, #66, else the repo's) in the tree?"""
+    workspace_name = (workspace or repo.split('/')[-1]).casefold()
     return any((workspace.get('name') or '').casefold() == workspace_name and session.get('name') == f'#{issue} relay'
                for workspace, session in agw.sessions(snapshot))
