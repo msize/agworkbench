@@ -95,10 +95,8 @@ def git(checkout: Path, *args: str) -> subprocess.CompletedProcess:
 
 def origin_repo(url: str | None) -> str | None:
     """`owner/name` (lowercase) of a GitHub remote URL in https, ssh or scp form, else None."""
-    match = re.fullmatch(r'(?:https?://(?:[^@/]+@)?github\.com/|ssh://git@github\.com/|git@github\.com:)'
-                         r'([A-Za-z0-9][A-Za-z0-9_.-]*)/([A-Za-z0-9][A-Za-z0-9_.-]*?)(?:\.git)?/?',
-                         (url or '').strip(), re.I)
-    return f"{match[1]}/{match[2]}".lower() if match else None
+    repo = triage.github_repo(url)
+    return repo.lower() if repo else None
 
 
 def same_path(a: Path, b: Path) -> bool:

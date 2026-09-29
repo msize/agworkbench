@@ -26,9 +26,12 @@ PLANNER = '<!-- agworkbench:planner -->'
 
 class FakeRepo:
     """GitHub for one repo (o/r) at the subprocess boundary: the REST issue shape through `gh api`,
-    and the writes through `gh issue ...` / `gh label create`."""
+    and the writes through `gh issue ...` / `gh label create`. Like gh in a fork's checkout (#71), a
+    call that does not name the repo is answered from another one (the upstream); run_wb fails on it."""
 
-    def __init__(self, issues=(), source_labels=(), fail=()):
+    def __init__(self, issues=(), source_labels=(), fail=(), repo='o/r'):
+        self.repo = repo
+        self.unscoped = []
         self.issues = {}
         self.comments = {}
         for issue in issues:
@@ -42,7 +45,7 @@ class FakeRepo:
     def put(self, number, title, body='', state='open', state_reason=None, closed_at=None, labels=('follow-up',),
             author_association='OWNER', comments=()):
         self.issues[number] = dict(number=number, title=title, body=body, state=state, state_reason=state_reason,
-                                   closed_at=closed_at, html_url=f'https://github.com/o/r/issues/{number}',
+                                   closed_at=closed_at, html_url=f'https://github.com/{self.repo}/issues/{number}',
                                    labels=[{'name': n} for n in labels], author_association=author_association)
         self.comments[number] = [dict(c) for c in comments]
 
@@ -52,10 +55,22 @@ class FakeRepo:
     def calls_of(self, *head):
         return [c for c in self.calls if c[1:1 + len(head)] == list(head)]
 
+    def names_repo(self, args):
+        if args[0] == 'api':
+            return any(a.startswith(f'repos/{self.repo}/') for a in args)
+        return '--repo' in args and args[args.index('--repo') + 1] == self.repo
+
     def __call__(self, argv, **kwargs):
+        done = lambda out='', code=0, err='': subprocess.CompletedProcess(argv, code, out, err)
+        if argv[0] == 'git':
+            assert argv[-3:] == ['remote', 'get-url', 'origin'], argv
+            return done(f'https://github.com/{self.repo}.git\n')
         self.calls.append(argv)
         args = argv[1:]
-        done = lambda out='', code=0, err='': subprocess.CompletedProcess(argv, code, out, err)
+        if not self.names_repo(args):
+            self.unscoped.append(argv)
+            if args[:2] == ['issue', 'view']:
+                return done(json.dumps({'title': 'build(deps): an upstream pull request', 'labels': []}))
         if args[:2] == ['issue', 'view']:
             return done(json.dumps({'title': self.source_title,
                                     'labels': [{'name': n} for n in self.source_labels]}))
@@ -65,7 +80,7 @@ class FakeRepo:
             return done(json.dumps({'nameWithOwner': 'o/r'}))
         if args[0] == 'api':
             path = args[-1]
-            if path.startswith('repos/o/r/issues?'):
+            if path.startswith(f'repos/{self.repo}/issues?'):
                 query = dict(part.split('=', 1) for part in path.split('?', 1)[1].split('&'))
                 label, state = query['labels'].replace('%20', ' '), query['state']
                 found = [i for i in self.issues.values() if label in [n['name'] for n in i['labels']]
@@ -113,7 +128,7 @@ class FakeRepo:
             labels = [args[i + 1] for i, a in enumerate(args) if a == '--label']
             self.put(self.next, title, Path(args[args.index('--body-file') + 1]).read_text(encoding='utf-8'),
                      labels=labels)
-            return done(f'https://github.com/o/r/issues/{self.next}\n')
+            return done(f'https://github.com/{self.repo}/issues/{self.next}\n')
         raise AssertionError(argv)
 
 
@@ -164,7 +179,9 @@ class Dedupe(unittest.TestCase):
     def run_wb(self, *argv, gh=None):
         with patch.object(sys, 'argv', ['wb.py', *argv]), \
                 patch.object(wb.subprocess, 'run', side_effect=gh or AssertionError('gh called')):
-            return wb.main()
+            code = wb.main()
+        self.assertEqual([], getattr(gh, 'unscoped', []), 'a gh call left the repo to gh (#71)')
+        return code
 
     def add(self, key='r5-m1', title='Fix the relay drain', severity='minor', origin='review r5', file=None,
             body=None, own_issue=True):
@@ -256,6 +273,27 @@ class Dedupe(unittest.TestCase):
         self.assertEqual(['follow-up', 'priority:P2'], gh.labels(5))
         self.assertIn('duplicate of #5 (exact); 1 duplicate(s), priority P3 -> P2', self.out.getvalue())
 
+    def test_a_fork_checkout_reads_and_writes_only_the_fork(self):
+        # #71: in a fork's checkout gh's own base is the parent; run_wb fails on any call that leaves
+        # the repo to gh, and the fake answers such a source-issue read with the parent's title.
+        gh = FakeRepo([dict(number=5, title='Fix the relay drain', labels=('follow-up', 'priority:P3'),
+                            body='x\n<!-- agworkbench:finding source=20 pr=21 round=r5 key=r5-m1 -->\n' + PLANNER)],
+                      repo='fork/r')
+        self.add()                                                           # a duplicate of #5: comment + label
+        self.add('r5-m2', title='A new finding')                             # its own issue
+        self.add('r5-m3', title='A leftover', own_issue=False)
+        self.assertEqual(0, self.file(gh, pr=31), self.err.getvalue())
+        self.assertEqual(1, len(gh.comments[5]))
+        self.assertEqual(['follow-up', 'priority:P2'], gh.labels(5))
+        self.assertEqual(['A new finding', 'Leftovers from #27: The source issue'],
+                         [gh.issues[n]['title'] for n in (101, 102)])
+        self.add('r5-m4', title='Another leftover', own_issue=False)         # extends the leftovers issue
+        self.assertEqual(0, self.file(gh, pr=31), self.err.getvalue())
+        self.assertIn('Another leftover', gh.issues[102]['body'])
+        self.assertTrue(gh.calls_of('issue', 'edit'))
+        self.assertTrue(all(url.startswith('https://github.com/fork/r/issues/') for url in
+                            (item['url'] for item in self.items())))
+
     def test_reports_walk_p3_to_p0_on_fibonacci_totals_and_stop_at_p0(self):
         gh = FakeRepo([dict(number=5, title='Fix the relay drain', labels=('follow-up', 'priority:P3'),
                             body='<!-- agworkbench:finding source=20 pr=21 round=r5 key=r5-m1 -->\n' + PLANNER)])
@@ -316,7 +354,7 @@ class Dedupe(unittest.TestCase):
                        dict(number=7, title='Fix the relay drain', state='closed', state_reason=None,
                             closed_at='2026-05-01T00:00:00Z')])
         self.report(gh, 31, number=7)
-        self.assertEqual([['gh', 'issue', 'reopen', '7']], gh.calls_of('issue', 'reopen'))
+        self.assertEqual([['gh', 'issue', 'reopen', '7', '--repo', 'o/r']], gh.calls_of('issue', 'reopen'))
 
     def test_closed_as_completed_reopens_and_counts(self):
         gh = FakeRepo([dict(number=5, title='Fix the relay drain', state='closed', state_reason='completed',
@@ -324,7 +362,7 @@ class Dedupe(unittest.TestCase):
         self.report(gh, 31)
         self.assertEqual('open', gh.issues[5]['state'])
         self.assertEqual(['follow-up', 'priority:P2'], gh.labels(5))
-        reopen = gh.calls.index(['gh', 'issue', 'reopen', '5'])
+        reopen = gh.calls.index(['gh', 'issue', 'reopen', '5', '--repo', 'o/r'])
         self.assertLess(reopen, gh.calls.index(gh.calls_of('issue', 'comment')[0]))
 
     def test_closed_as_not_planned_or_duplicate_files_new_and_links_it(self):

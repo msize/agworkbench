@@ -584,6 +584,22 @@ def clean_pr(**changes):
     return pr
 
 
+def make_origin(folder, repo='o/r'):
+    """folder as the workbench's checkout of repo: gh calls name it from this origin (#71)."""
+    for argv in (['git', 'init', '-q', str(folder)],
+                 ['git', '-C', str(folder), 'remote', 'add', 'origin', f'https://github.com/{repo}.git']):
+        subprocess.run(argv, check=True, capture_output=True)
+
+
+def answers_origin(fake, repo='o/r'):
+    """A subprocess.run fake that also answers the workbench's origin lookup (#71)."""
+    def run(argv, **kwargs):
+        if argv[:1] == ['git'] and argv[-3:] == ['remote', 'get-url', 'origin']:
+            return subprocess.CompletedProcess(argv, 0, f'https://github.com/{repo}.git\n', '')
+        return fake(argv, **kwargs)
+    return run
+
+
 def comment(body, when, who='yeroo'):
     return {'body': body, 'createdAt': when, 'author': {'login': who}}
 
@@ -597,6 +613,7 @@ class MergeCheck(unittest.TestCase):
         self.state.mkdir(parents=True)
         self.addCleanup(shutil.rmtree, self.folder)
         self.addCleanup(hub.reload_paths)
+        make_origin(self.folder)
         self.enterContext(patch.dict(os.environ, {'AI_HUB': str(self.folder / '.workbench'), 'AI_BOX': 'claude'}))
         hub.reload_paths()
         self.seen([7])
@@ -789,9 +806,9 @@ class MergeCheck(unittest.TestCase):
             calls.append(argv)
             payload = clean_pr() if argv[1:3] == ['pr', 'view'] else [[{'body': 'a'}], [{'body': 'b'}]]
             return subprocess.CompletedProcess(argv, 0, json.dumps(payload), '')
-        with patch.object(wb.subprocess, 'run', side_effect=fake):
+        with patch.object(wb.subprocess, 'run', side_effect=answers_origin(fake)):
             pr, inline = wb.fetch_pr('7')
-        self.assertEqual(['gh', 'pr', 'view', '7', '--json', wb.PR_FIELDS], calls[0])
+        self.assertEqual(['gh', 'pr', 'view', '7', '--json', wb.PR_FIELDS, '--repo', 'o/r'], calls[0])
         self.assertEqual(['gh', 'api', 'repos/o/r/pulls/7/comments', '--paginate', '--slurp'], calls[1])
         self.assertEqual(2, len(calls))
         self.assertEqual([{'body': 'a'}, {'body': 'b'}], inline)
@@ -801,7 +818,7 @@ class MergeCheck(unittest.TestCase):
 
     def test_a_gh_failure_is_not_ok(self):
         failed = subprocess.CompletedProcess([], 1, '', 'HTTP 502')
-        with patch.object(wb.subprocess, 'run', return_value=failed), \
+        with patch.object(wb.subprocess, 'run', side_effect=answers_origin(lambda argv, **kwargs: failed)), \
                 patch.object(sys, 'argv', ['wb.py', 'merge-check', '--pr', '7', '--head', HEAD]):
             self.assertEqual(1, wb.main())
         self.assertIn('gh: ', self.out.getvalue())
@@ -841,6 +858,7 @@ class MergeReadiness(unittest.TestCase):
         self.folder = scratch(self, 'wb-ready-')
         self.state = self.folder / '.workbench/state'
         self.state.mkdir(parents=True)
+        make_origin(self.folder)
         self.addCleanup(hub.reload_paths)
         self.enterContext(patch.dict(os.environ, {'AI_HUB': str(self.folder / '.workbench'), 'AI_BOX': 'claude'}))
         hub.reload_paths()
@@ -922,11 +940,13 @@ class MergeReadiness(unittest.TestCase):
                                   ([subprocess.CompletedProcess([], 1, body, '')], 1),
                                   ([subprocess.CompletedProcess([], 1, '', 'no checks reported on the x branch')], 0),
                                   ([subprocess.CompletedProcess([], 1, '', "no required checks reported on the 'x' branch")], 0)):
-            with self.subTest(results=results), patch.object(wb.subprocess, 'run', side_effect=fake):
+            with self.subTest(results=results), patch.object(wb.subprocess, 'run', side_effect=answers_origin(fake)):
                 self.assertEqual(expected, len(wb.gh_checks('7', required='required' in results[0].stderr)))
-        self.assertEqual(['gh', 'pr', 'checks', '7', '--json', 'name,state,bucket,link,workflow'], calls[0])
-        self.assertEqual('--required', calls[-1][-1])
-        with patch.object(wb.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1, '', 'HTTP 502')):
+        self.assertEqual(['gh', 'pr', 'checks', '7', '--json', 'name,state,bucket,link,workflow', '--repo', 'o/r'],
+                         calls[0])
+        self.assertEqual(['--required', '--repo', 'o/r'], calls[-1][-3:])
+        failed = subprocess.CompletedProcess([], 1, '', 'HTTP 502')
+        with patch.object(wb.subprocess, 'run', side_effect=answers_origin(lambda argv, **kwargs: failed)):
             with self.assertRaises(RuntimeError):
                 wb.gh_checks('7')
 
@@ -997,7 +1017,7 @@ class MergeReadiness(unittest.TestCase):
 
     # --- ci-log and ci-rerun --------------------------------------------------------------------------
 
-    def gh_boundary(self, checks, rerun_fails=False, view_fails=False, requeue_after=0, checks_fail=False):
+    def gh_boundary(self, checks, rerun_fails=False, view_fails=False, requeue_after=0, checks_fail=False, repo='o/r'):
         """gh at the process boundary. After a rerun starts, its checks show as pending again after
         `requeue_after` polls (None: never). A fake clock drives ci-rerun's wait for that."""
         calls, reran, polls = [], set(), [0]
@@ -1027,7 +1047,7 @@ class MergeReadiness(unittest.TestCase):
                 reran.add(argv[3])
                 return subprocess.CompletedProcess(argv, 0, '', '')
             raise AssertionError(argv)
-        self.enterContext(patch.object(wb.subprocess, 'run', side_effect=fake))
+        self.enterContext(patch.object(wb.subprocess, 'run', side_effect=answers_origin(fake, repo)))
         return calls
 
     def test_ci_log_writes_the_tail_of_each_failed_job(self):
@@ -1037,7 +1057,7 @@ class MergeReadiness(unittest.TestCase):
             self.assertEqual(0, wb.main())
         path = self.folder / '.workbench/review/ci-r1.log'
         text = path.read_text(encoding='utf-8')
-        self.assertIn(['gh', 'run', 'view', '11', '--log-failed', '--job', '22'], calls)
+        self.assertIn(['gh', 'run', 'view', '11', '--log-failed', '--job', '22', '--repo', 'o/r'], calls)
         self.assertIn('line 399', text)
         self.assertNotIn('line 249\n', text)                                   # the last 150 lines only
         self.assertIn('ext ERROR - external CI, no log here: https://ci.example/b/1', text)
@@ -1062,7 +1082,7 @@ class MergeReadiness(unittest.TestCase):
             self.assertEqual(0, wb.main())
             self.assertIn('rerun started: 2 check(s) pending again - start wb.py wait-ci', self.out.getvalue())
             self.assertEqual(1, wb.main())                                     # the one rerun is used
-        self.assertEqual([['gh', 'run', 'rerun', '11', '--failed']], [c for c in calls if c[1:3] == ['run', 'rerun']])
+        self.assertEqual([['gh', 'run', 'rerun', '11', '--failed', '--repo', 'o/r']], [c for c in calls if c[1:3] == ['run', 'rerun']])
 
     def test_ci_rerun_counts_nothing_unless_a_rerun_started(self):
         # r22 M2: exit 2 is operational (retry), 1 is only a refusal; the round is spent only on a start.
@@ -1263,6 +1283,7 @@ class ReviewRound(unittest.TestCase):
         self.reviews.mkdir()
         self.addCleanup(shutil.rmtree, self.folder)
         self.addCleanup(hub.reload_paths)
+        make_origin(self.folder)
         self.config = self.folder / 'agworkbench.json'
         self.enterContext(patch.dict(os.environ, {'AI_HUB': str(self.folder / '.workbench'), 'AI_BOX': 'claude',
                                                  'AGWORKBENCH_CONFIG': str(self.config)}))
@@ -1701,9 +1722,12 @@ class UsageLimitProse(unittest.TestCase):
 
 
 class FakeGh:
-    """gh at the subprocess boundary for follow-up filing."""
+    """gh at the subprocess boundary for follow-up filing. Like gh in a fork's checkout (#71), a call
+    that does not name the repo is answered from the upstream: run_wb fails on it."""
 
-    def __init__(self, source_labels=(), open_issues=(), label_fails=False, create_fails=()):
+    def __init__(self, source_labels=(), open_issues=(), label_fails=False, create_fails=(), repo='o/r'):
+        self.repo = repo
+        self.unscoped = []
         self.source_labels = list(source_labels)
         self.open_issues = list(open_issues)
         self.label_fails = label_fails
@@ -1713,14 +1737,19 @@ class FakeGh:
         self.next = 100
 
     def __call__(self, argv, **kwargs):
+        done = lambda out='', code=0, err='': subprocess.CompletedProcess(argv, code, out, err)
+        if argv[0] == 'git':
+            assert argv[-3:] == ['remote', 'get-url', 'origin'], argv
+            return done(f'https://github.com/{self.repo}.git\n')
         self.calls.append(argv)
         args = argv[1:]
-        done = lambda out='', code=0, err='': subprocess.CompletedProcess(argv, code, out, err)
+        if '--repo' not in args or args[args.index('--repo') + 1] != self.repo:
+            self.unscoped.append(argv)
+            if args[:2] == ['issue', 'view']:
+                return done(json.dumps({'title': 'build(deps): an upstream pull request', 'labels': []}))
         if args[:2] == ['issue', 'view']:
             return done(json.dumps({'title': 'Source issue',
                                     'labels': [{'name': n} for n in self.source_labels]}))
-        if args[:2] == ['repo', 'view']:
-            return done(json.dumps({'nameWithOwner': 'o/r'}))
         if args[:2] == ['label', 'create']:
             return done(code=1, err='HTTP 403: Resource not accessible') if self.label_fails else done()
         if args[:2] == ['issue', 'list']:
@@ -1731,7 +1760,7 @@ class FakeGh:
                 return done(code=1, err='HTTP 502')
             self.bodies[title] = Path(args[args.index('--body-file') + 1]).read_text(encoding='utf-8')
             self.next += 1
-            return done(f'https://github.com/o/r/issues/{self.next}\n')
+            return done(f'https://github.com/{self.repo}/issues/{self.next}\n')
         raise AssertionError(argv)
 
 
@@ -1758,7 +1787,9 @@ class FollowUps(unittest.TestCase):
     def run_wb(self, *argv, gh=None):
         with patch.object(sys, 'argv', ['wb.py', *argv]), \
                 patch.object(wb.subprocess, 'run', side_effect=gh or AssertionError('gh called')):
-            return wb.main()
+            code = wb.main()
+        self.assertEqual([], getattr(gh, 'unscoped', []), 'a gh call left the repo to gh (#71)')
+        return code
 
     def add(self, key, severity='minor', disputed=False, title=None, own_issue=False):
         body = self.folder / f'{key}.md'
@@ -1798,18 +1829,21 @@ class FollowUps(unittest.TestCase):
         self.assertIn('no unfiled follow-ups', self.out.getvalue())
 
     def test_dedupe_off_makes_exactly_the_27_gh_calls(self):
-        # Without a PR, dedupe off preserves #27's per-item calls and body.
+        # Without a PR, dedupe off preserves #27's per-item calls and body - in a fork's checkout, each
+        # naming the fork (#71: gh's own resolution picks the parent there).
         self.add('r2-m1', title='Fix the relay')
-        gh = FakeGh()
+        gh = FakeGh(repo='fork/r')
         self.assertEqual(0, self.run_wb('follow-up', 'file', '--source', '27', gh=gh))
         body = str(self.state / 'follow-up-r2-m1.md')
-        self.assertEqual([['gh', 'issue', 'view', '27', '--json', 'title,labels'],
+        self.assertEqual([['gh', 'issue', 'view', '27', '--json', 'title,labels', '--repo', 'fork/r'],
                           ['gh', 'label', 'create', 'follow-up', '--color', 'BFD4F2',
-                           '--description', 'filed automatically by an agworkbench loop'],
+                           '--description', 'filed automatically by an agworkbench loop', '--repo', 'fork/r'],
                           ['gh', 'issue', 'list', '--state', 'open', '--search', '"Fix the relay" in:title',
-                           '--json', 'title,url', '--limit', '200'],
-                          ['gh', 'issue', 'create', '--title', 'Fix the relay', '--body-file', body, '--label', 'follow-up']],
+                           '--json', 'title,url', '--limit', '200', '--repo', 'fork/r'],
+                          ['gh', 'issue', 'create', '--title', 'Fix the relay', '--body-file', body, '--label', 'follow-up',
+                           '--repo', 'fork/r']],
                          gh.calls)
+        self.assertEqual('https://github.com/fork/r/issues/101', self.items()[0]['url'])
         self.assertEqual('evidence for r2-m1: lib/x.py:12 fails\n\nSource: #27\nSeverity: minor; origin: review r2\n\n'
                          '<!-- agworkbench:follow-up source=#27 -->\n<!-- agworkbench:planner -->\n',
                          gh.bodies['Fix the relay'])
@@ -1817,19 +1851,22 @@ class FollowUps(unittest.TestCase):
     def test_dedupe_off_with_pr_creates_one_leftovers_issue(self):
         self.add('r2-m1')
         self.add('plan-queue', severity='plan')
-        gh = FakeGh()
+        gh = FakeGh(repo='fork/r')
         self.assertEqual(0, self.run_wb('follow-up', 'file', '--source', '27', '--pr', '30', gh=gh))
-        self.assertEqual([['gh', 'issue', 'view', '27', '--json', 'title,labels'],
+        # #71: in a fork's checkout, the title is the fork's #27 and every call names the fork -
+        # no `gh repo view`, which there answers with the parent.
+        self.assertEqual([['gh', 'issue', 'view', '27', '--json', 'title,labels', '--repo', 'fork/r'],
                           ['gh', 'label', 'create', 'follow-up', '--color', 'BFD4F2',
-                           '--description', 'filed automatically by an agworkbench loop'],
-                          ['gh', 'repo', 'view', '--json', 'nameWithOwner'],
+                           '--description', 'filed automatically by an agworkbench loop', '--repo', 'fork/r'],
                           ['gh', 'issue', 'list', '--state', 'open', '--search',
-                           '"Leftovers from #27: Source issue" in:title', '--json', 'number,title', '--limit', '200'],
+                           '"Leftovers from #27: Source issue" in:title', '--json', 'number,title', '--limit', '200',
+                           '--repo', 'fork/r'],
                           ['gh', 'label', 'create', 'priority:P2', '--color', 'D93F0B',
-                           '--description', 'agworkbench priority (#34, #42)'],
+                           '--description', 'agworkbench priority (#34, #42)', '--repo', 'fork/r'],
                           ['gh', 'issue', 'create', '--title', 'Leftovers from #27: Source issue',
                            '--body-file', str(self.state / 'follow-up-leftovers.md'),
-                           '--label', 'follow-up', '--label', 'priority:P2']], gh.calls)
+                           '--label', 'follow-up', '--label', 'priority:P2', '--repo', 'fork/r']], gh.calls)
+        self.assertEqual('https://github.com/fork/r/issues/101', self.items()[0]['url'])
         body = gh.bodies['Leftovers from #27: Source issue']
         self.assertIn('- [ ] **r2-m1**', body)
         self.assertIn('- [ ] **plan-queue**', body)
@@ -2034,6 +2071,184 @@ class LoopEndProse(unittest.TestCase):
                 self.assertIn('When mail says the loop is complete, or the relay reports the PR MERGED or CLOSED', text)
                 self.assertIn('do not reply', text)
 
+
+class ForkGh:
+    """gh in a checkout of fork/r, a fork of up/r (#71): gh's own base resolution picks the parent, so
+    a call that does not name fork/r is recorded as unscoped (and answered as the parent would)."""
+
+    def __init__(self, repo='fork/r'):
+        self.repo = repo
+        self.calls, self.unscoped = [], []
+
+    def names_repo(self, args):
+        if args[0] == 'api':
+            return any(a.startswith(f'repos/{self.repo}/') for a in args)
+        return '--repo' in args and args[args.index('--repo') + 1] == self.repo
+
+    def __call__(self, argv, **kwargs):
+        done = lambda out='', code=0, err='': subprocess.CompletedProcess(argv, code, out, err)
+        if argv[0] == 'git':
+            if argv[-3:] == ['remote', 'get-url', 'origin']:
+                return done(f'git@github.com:{self.repo}.git\n')
+            if argv[-2:] == ['branch', '--show-current']:
+                return done('issue-1-fix\n')
+            raise AssertionError(argv)
+        self.calls.append(argv)
+        args = argv[1:]
+        if not self.names_repo(args):
+            self.unscoped.append(argv)
+        link = f'https://github.com/{self.repo}/actions/runs/11/job/22'
+        if args[:2] == ['pr', 'view']:
+            return done(json.dumps(clean_pr(url=f'https://github.com/{self.repo}/pull/7', mergeStateStatus='BLOCKED')))
+        if args[:1] == ['api']:
+            return done(json.dumps([[]]))
+        if args[:2] == ['pr', 'checks']:
+            return done(json.dumps([] if '--required' in args else [check('build', 'fail', link=link)]), code=1)
+        if args[:2] == ['run', 'view']:
+            return done('the failing line\n')
+        if args[:2] == ['run', 'rerun']:
+            return done()
+        if args[:2] == ['issue', 'view']:
+            return done(json.dumps({'state': 'CLOSED', 'stateReason': 'COMPLETED'}))
+        if args[:2] == ['pr', 'list']:
+            return done('[]')
+        raise AssertionError(argv)
+
+
+class ForkCheckout(unittest.TestCase):
+    """#71: in a fork's checkout gh resolves its base repository to the parent. Every workbench gh call
+    names the checkout's own repo, and a write to another repo is refused before gh runs."""
+
+    def setUp(self):
+        self.folder = scratch(self, 'wb-fork-')
+        self.state = self.folder / '.workbench/state'
+        self.state.mkdir(parents=True)
+        self.addCleanup(hub.reload_paths)
+        self.enterContext(patch.dict(os.environ, {'AI_HUB': str(self.folder / '.workbench'), 'AI_BOX': 'claude'}))
+        hub.reload_paths()
+        (self.state / 'relay.json').write_text(json.dumps({'seen_open': [7]}), encoding='utf-8')
+        self.out, self.err = io.StringIO(), io.StringIO()
+        self.enterContext(contextlib.redirect_stdout(self.out))
+        self.enterContext(contextlib.redirect_stderr(self.err))
+        clock = [0.0]
+        self.enterContext(patch.object(wb, 'now', lambda: clock[0]))
+        self.enterContext(patch.object(wb, 'pause', lambda seconds: clock.__setitem__(0, clock[0] + seconds)))
+
+    def run_wb(self, *argv, gh):
+        with patch.object(sys, 'argv', ['wb.py', *argv]), patch.object(wb.subprocess, 'run', side_effect=gh):
+            return wb.main()
+
+    # --- the scoping rule --------------------------------------------------------------------------
+
+    def test_a_call_without_a_repo_names_the_workbench_repo(self):
+        self.assertEqual(['issue', 'view', '5', '--json', 'title', '--repo', 'fork/r'],
+                         wb.scoped(['issue', 'view', '5', '--json', 'title'], 'fork/r'))
+        for verb in (['pr', 'checks', '7'], ['label', 'create', 'x'], ['run', 'rerun', '11', '--failed']):
+            with self.subTest(verb=verb):
+                self.assertEqual(verb + ['--repo', 'fork/r'], wb.scoped(verb, 'fork/r'))
+
+    def test_a_named_repo_or_url_is_left_alone(self):
+        for args in (['issue', 'view', '5', '--repo', 'up/r'], ['issue', 'view', '5', '-R', 'up/r'],
+                     ['issue', 'view', '5', '--repo=up/r'], ['issue', 'view', '5', '-Rup/r'],
+                     ['pr', 'view', 'https://github.com/up/r/pull/7'],
+                     ['issue', 'comment', '5', '--repo', 'github.com/Fork/R', '--body', 'x'],
+                     ['pr', 'merge', 'https://github.com/FORK/r/pull/7']):
+            with self.subTest(args=args):
+                self.assertEqual(args, wb.scoped(args, 'fork/r'))          # reads anywhere; writes here, any case
+
+    def test_a_write_to_another_repo_is_refused(self):
+        for args in (['issue', 'create', '--title', 't', '--repo', 'up/r'],
+                     ['issue', 'comment', 'https://github.com/up/r/issues/1', '--body-file', 'b'],
+                     ['issue', 'edit', '1', '-R', 'github.com/up/r'], ['label', 'create', 'x', '--repo=up/r'],
+                     ['pr', 'merge', 'https://github.com/up/r/pull/1'], ['pr', 'comment', '1', '-Rup/r'],
+                     ['run', 'rerun', 'https://github.com/up/r/actions/runs/11']):
+            with self.subTest(args=args), self.assertRaises(wb.ForeignRepo) as caught:
+                wb.scoped(args, 'fork/r')
+            self.assertIn('up/r', str(caught.exception))
+            self.assertIn('fork/r', str(caught.exception))
+
+    def test_api_writes_to_another_repo_are_refused(self):
+        for args in (['api', '-X', 'PATCH', 'repos/up/r/issues/1'], ['api', 'repos/up/r/issues/1/comments', '-f', 'body=x'],
+                     ['api', '--method=POST', '/repos/up/r/issues'], ['api', '-XDELETE', 'repos/up/r/labels/x'],
+                     ['api', 'repos/up/r/issues', '-F', 'title=t'], ['api', 'repos/up/r/issues', '--input', 'body.json'],
+                     ['api', '--method', 'PUT', 'repos/UP/r/pulls/1/merge']):
+            with self.subTest(args=args), self.assertRaises(wb.ForeignRepo) as caught:
+                wb.scoped(args, 'fork/r')
+            self.assertIn('fork/r', str(caught.exception))
+
+    def test_api_reads_and_own_writes_pass(self):
+        for args in (['api', 'repos/up/r/issues/1'], ['api', '--paginate', 'repos/up/r/issues?state=all'],
+                     ['api', '-X', 'GET', 'repos/up/r/issues', '-f', 'state=open'],
+                     ['api', '-X', 'PATCH', 'repos/Fork/R/issues/1', '-f', 'body=x'],
+                     ['api', 'graphql', '-f', 'query=x']):
+            with self.subTest(args=args):
+                self.assertEqual(args, wb.scoped(args, 'fork/r'))
+
+    def test_api_placeholders_are_the_workbench_repo(self):
+        # gh fills {owner}/{repo} from its own base resolution - the parent in a fork's checkout.
+        self.assertEqual(['api', 'repos/fork/r/issues', '-F', 'owner=fork', '-f', 'body={repo}'],
+                         wb.scoped(['api', 'repos/{owner}/{repo}/issues', '-F', 'owner={owner}', '-f', 'body={repo}'],
+                                   'fork/r'))
+
+    def test_a_refused_call_never_reaches_gh(self):
+        gh = ForkGh()
+        with patch.object(wb.subprocess, 'run', side_effect=gh):
+            done = wb.gh_run(self.folder, 'issue', 'create', '--title', 't', '--repo', 'up/r')
+        self.assertEqual(1, done.returncode)
+        self.assertIn("targets up/r, not this workbench's repo fork/r", done.stderr)
+        self.assertIn('wb: refused: gh issue create targets up/r', self.err.getvalue())
+        self.assertEqual([], gh.calls)
+        with patch.object(wb.subprocess, 'run', side_effect=gh), self.assertRaises(wb.ForeignRepo):
+            wb.gh_json('api', '-X', 'PATCH', 'repos/up/r/issues/1', cwd=self.folder)
+        self.assertEqual([], gh.calls)
+
+    # --- the workbench repo ------------------------------------------------------------------------
+
+    def test_the_repo_is_the_checkouts_origin_with_its_case(self):
+        for url in ('https://github.com/Fork/Re.po.git', 'https://x-token@github.com/Fork/Re.po', 'git@github.com:Fork/Re.po.git',
+                    'ssh://git@github.com/Fork/Re.po.git/'):
+            with self.subTest(url=url):
+                folder = scratch(self, 'wb-origin-')
+                make_origin(folder)
+                subprocess.run(['git', '-C', str(folder), 'remote', 'set-url', 'origin', url], check=True)
+                self.assertEqual('Fork/Re.po', wb.workbench_repo(folder))
+
+    def test_no_github_origin_is_exit_2_not_a_guess(self):
+        folder = scratch(self, 'wb-origin-')
+        make_origin(folder)
+        subprocess.run(['git', '-C', str(folder), 'remote', 'set-url', 'origin', 'https://gitlab.com/o/r.git'], check=True)
+        with self.assertRaises(SystemExit) as caught:
+            wb.workbench_repo(folder)
+        self.assertEqual(2, caught.exception.code)
+        self.assertIn('has no GitHub origin', self.err.getvalue())
+        # A folder inside another clone is not a checkout: git must not walk up to that clone's origin.
+        inside = Path(__file__).resolve().parent.parent / ('test wb fork ' + uuid.uuid4().hex)
+        inside.mkdir()
+        self.addCleanup(shutil.rmtree, inside)
+        with self.assertRaises(SystemExit) as caught:
+            wb.workbench_repo(inside)
+        self.assertEqual(2, caught.exception.code)
+
+    # --- the commands (AC3) ------------------------------------------------------------------------
+
+    def test_merge_check_wait_ci_ci_log_ci_rerun_and_no_pr_done_name_the_fork(self):
+        for argv in (['merge-check', '--pr', '7', '--head', HEAD], ['wait-ci', '--pr', '7', '--head', HEAD],
+                     ['ci-log', '--pr', '7'], ['ci-rerun', '--pr', '7'],
+                     ['loop-state', 'done', '--no-pr', '--reason', 'duplicate of #2']):
+            with self.subTest(command=argv[0]):
+                gh = ForkGh()
+                self.run_wb(*argv, gh=gh)
+                self.assertTrue(gh.calls)
+                self.assertEqual([], gh.unscoped)
+        verbs = {tuple(c[1:3]) for c in gh.calls}
+        self.assertEqual({('issue', 'view'), ('pr', 'list')}, verbs)
+
+    def test_merge_check_refuses_a_pr_of_another_repo(self):
+        gh = ForkGh()
+        with patch.object(wb, 'fetch_pr', return_value=(clean_pr(url='https://github.com/up/r/pull/1'), [])):
+            self.assertEqual(1, self.run_wb('merge-check', '--pr', 'https://github.com/up/r/pull/1', '--head', HEAD, gh=gh))
+        self.assertEqual("repo: PR https://github.com/up/r/pull/1 is in up/r, not this workbench's repo fork/r",
+                         self.out.getvalue().strip())
 
 if __name__ == '__main__':
     unittest.main()
