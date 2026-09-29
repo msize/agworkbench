@@ -39,34 +39,10 @@ issues, and let the relay close the sessions. The brakes are unchanged: a hold o
 `human` or `github`, a plan disagreement after four rounds, and a refused or incomplete failover
 all stop you exactly as they do without autonomy.
 
-- **Follow-ups are recorded as you go, and filed before the merge.** For every finding you defer, and
-  for every "Out of scope" or "Follow-up" item in the agreed plan, record one item:
-
-  ```bash
-  python "$AGWORKBENCH/lib/wb.py" follow-up add --key r2-m1 --title "<issue title>" --body-file <evidence.md> \
-      --severity minor --origin "review r2"          # add --disputed for a finding that ended disputed
-  ```
-
-  The severity is revmux's, as you verified it. You may raise it, but never lower it below revmux's
-  without saying so in the merge comment.
-  Add `--file <path:line>` when the finding names a place in the code.
-  Minor, Immaterial and plan items from one PR go into one checklist issue named
-  `Leftovers from #N: <issue title>`. Major and blocker items get their own issue. The planner must
-  explicitly add `--own-issue` for a planned out-of-scope feature the spec needs, regardless of
-  severity. A deferred review point is still recorded with `follow-up add` before filing.
-  Before merge-check, file them all with `python "$AGWORKBENCH/lib/wb.py" follow-up file --source <N> --pr <P>`
-  (`--pr is required` while `followUp.dedupe` is on, the default). It labels a new issue `follow-up`
-  (`follow-up-nested` when this issue is itself a follow-up) and adds the planner marker. With dedupe on
-  (#42) it first looks for an existing issue describing the same problem: the same normalised title
-  among the follow-up issues, or an unchecked checklist line in an open, trusted leftovers issue,
-  then one restricted model call over the open follow-up and bug issues
-  (only a high-confidence answer naming an issue opened by the owner, a member or a collaborator
-  counts; anything else is linked as possibly related). On a match it records a duplicate there instead of filing:
-  a comment with this PR, the round, the file and the finding, and the count. The reports then bump
-  the issue's priority label: priority:P2 at 2 reports, P1 at 3 and P0 at 5 (`followUp.bumpAt`),
-  never downward; an untriaged issue gets no label below P1. merge-check refuses while any item is unfiled; a duplicate counts as filed.
-- **What may be deferred.** After at most five rounds, a remaining Minor or Immaterial finding may
-  be deferred, but only as a filed follow-up. A Major or blocker **never** may, disputed or not: it
+- **Follow-ups are recorded as you go, and filed before the merge**, as "Follow-ups" below says.
+  Under autonomy that covers every deferred finding and every out-of-scope plan item.
+- **What may be deferred.** After a `stop` (Phase 4) or at most five rounds, a remaining Minor or
+  Immaterial finding may be deferred, but only as a filed follow-up. A Major or blocker **never** may, disputed or not: it
   stops as today. merge-check refuses any Major or blocker review item in follow-ups.json, so record
   it honestly (with `--disputed` when it ended disputed) and the human decides.
 - **The merge comment** lists the leftovers issue once with its checklist items, every separate
@@ -85,6 +61,39 @@ all stop you exactly as they do without autonomy.
 
   It logs every step to `.workbench/state/relay-close.log`, and never closes on a timeout alone:
   only unread implementer mail is overridden after the wait.
+
+## Follow-ups
+
+With or without autonomy: a review that stops at a round with no Major (Phase 4) defers that
+round's remaining minors, and full autonomy defers more (above). Either way:
+
+Follow-ups are recorded as you go, and filed before the merge. For every finding you defer, and
+(under autonomy) for every "Out of scope" or "Follow-up" item in the agreed plan, record one item:
+
+```bash
+python "$AGWORKBENCH/lib/wb.py" follow-up add --key r2-m1 --title "<issue title>" --body-file <evidence.md> \
+    --severity minor --origin "review r2"          # add --disputed for a finding that ended disputed
+```
+
+The severity is revmux's, as you verified it. You may raise it, but never lower it below revmux's
+without saying so in the merge comment.
+Add `--file <path:line>` when the finding names a place in the code.
+Minor, Immaterial and plan items from one PR go into one checklist issue named
+`Leftovers from #N: <issue title>`. Major and blocker items get their own issue. The planner must
+explicitly add `--own-issue` for a planned out-of-scope feature the spec needs, regardless of
+severity. A deferred review point is still recorded with `follow-up add` before filing.
+**File them as soon as the PR exists** - right after `gh pr create` (Phase 5), and again right after
+recording any later one - and in any case before merge-check, with
+`python "$AGWORKBENCH/lib/wb.py" follow-up file --source <N> --pr <P>` (`--pr is required` while `followUp.dedupe` is on, the default). It labels a new issue `follow-up`
+(`follow-up-nested` when this issue is itself a follow-up) and adds the planner marker. With dedupe on
+(#42) it first looks for an existing issue describing the same problem: the same normalised title
+among the follow-up issues, or an unchecked checklist line in an open, trusted leftovers issue,
+then one restricted model call over the open follow-up and bug issues
+(only a high-confidence answer naming an issue opened by the owner, a member or a collaborator
+counts; anything else is linked as possibly related). On a match it records a duplicate there instead of filing:
+a comment with this PR, the round, the file and the finding, and the count. The reports then bump
+the issue's priority label: priority:P2 at 2 reports, P1 at 3 and P0 at 5 (`followUp.bumpAt`),
+never downward; an untriaged issue gets no label below P1. merge-check refuses while any item is unfiled; a duplicate counts as filed.
 
 ## When the implementer is Claude
 
@@ -341,15 +350,38 @@ yourself before reviewing it: `git log --oneline origin/<default>..HEAD` and
    passing it on; a finding you cannot reproduce is dropped with the reason, not forwarded. On this
    machine, a finding that rests on *reading* a file rather than running it gets its bytes checked -
    two past review rounds reported the same non-existent defect by reading through a lossy console.
-4. Send the verified findings to Codex (kind `review`, subject `FIX r<K>`): one block per finding
-   with file:line, the failure it causes, and your evidence. Keep the background waiter and end
-   your turn.
-5. Codex answers `FIXED <sha>` with each finding marked fixed, disputed (with evidence), or deferred
-   (with a reason). Silence on a finding is not an answer. Check the fixes; argue the disputes.
+4. Record the round's decision (#64) before you send anything:
 
-Repeat until a round is clean, or what remains is minor and both of you agree to defer it. At most
-five revmux rounds; after that, what is left goes to the human with both positions. With full
-autonomy, a deferred finding is always a recorded and filed follow-up (see "Full autonomy").
+   ```bash
+   python "$AGWORKBENCH/lib/wb.py" review-round --round <K>
+   ```
+
+   It reads `.workbench/review/revmux-r<K>.md` and counts the Blocker, Critical and Major findings.
+   When one of them did not verify (you could not reproduce it, or it is really a Minor), pass the
+   verified count with the reason: `--severe <n> --reason "<why>"`. Never go below revmux's count
+   without a reason. The difference counts as Minor findings, so the round stops rather than reads
+   clean. Exit 2 means the report is incomplete or the config is invalid: look, do not guess.
+   It prints one decision:
+
+   | decision | when | next |
+   |---|---|---|
+   | `continue` | a verified Major+, a degraded run, or `review.stopWhenNoMajor` is false or `review.minRounds` is not reached | `FIX r<K>`, then round K+1 |
+   | `stop` | no verified Major+ (and at or past `minRounds`) | `FIX r<K> (final)`: no revmux round after it |
+   | `clean` | no findings at all | review is done |
+   | `cap` | round 5 or later still has a Major+ or is degraded | `FIX r5`, then the human (with `stopWhenNoMajor: false`, today's rule: the fixes verified, as condition 1 says) |
+
+5. Send the verified findings to Codex (kind `review`, subject `FIX r<K>`, or `FIX r<K> (final)`
+   after a `stop`): one block per finding with file:line, the failure it causes, and your evidence.
+   Keep the background waiter and end your turn.
+6. Codex answers `FIXED <sha>` with each finding marked fixed, disputed (with evidence), or deferred
+   (with a reason). Silence on a finding is not an answer. Check the fixes; argue the disputes.
+   After a final round, record each deferred Minor or Immaterial finding with
+   `follow-up add ... --origin "review r<K>"` (see "Follow-ups"). **Review stops once a round has no
+   Major**: its minors are fixed if cheap and recorded otherwise, and no further revmux round runs.
+
+A round with a Major gets another round after its fix. At most five revmux rounds; after that, what
+is left goes to the human with both positions. A deferred finding is always a recorded and filed
+follow-up (see "Follow-ups").
 In queue mode, report `wb.py loop-state blocked --reason "review rounds exhausted: <remaining issue>"`
 before ending the turn to wait for the human.
 
@@ -363,8 +395,15 @@ gh pr create --repo <owner/repo> --base <default> --title "<title>" --body-file 
 ```
 
 The body: what changed and why, `Closes #<N>`, how it was tested, and the review record - rounds
-run, findings fixed, findings disputed and why. It ends with the planner marker line. The relay notices the PR on its next check and
-watches it from then on.
+run, findings fixed, findings disputed and why, and the line `wb.py review-round --summary` prints
+(why review ended; leave it out when it exits 2, meaning no revmux round was recorded).
+It ends with the planner marker line. The relay notices the PR on its next check and watches it from then on.
+
+**A stop's deferred minors are filed now**, with or without auto-merge - nothing later files them
+when the human merges: right after `gh pr create`, run
+`python "$AGWORKBENCH/lib/wb.py" follow-up file --source <N> --pr <P>`, run `review-round --summary`
+again, put its line (now with the leftovers URL) in `.workbench/pr-body.md`, and
+`gh pr edit <P> --body-file .workbench/pr-body.md`.
 
 ## Phase 6 - the human's review
 
@@ -375,10 +414,15 @@ watches it from then on.
 on, you merge only when **all** of these hold:
 
 1. **The review is clean.** The last revmux round's findings are all fixed and verified, or disputed
-   with evidence. None is deferred, and it is within the five-round cap. With full autonomy, a
+   with evidence. None is deferred, and it is within the five-round cap. A review that **stopped**
+   (`review-round` decided `stop`: that round had no Major) is clean too, when each of its findings is
+   fixed or recorded as a follow-up; file the recorded ones (`follow-up file --source <N> --pr <P>`)
+   before merge-check, with or without autonomy. With full autonomy, a
    remaining Minor or Immaterial finding may also be deferred **with a filed follow-up issue**; a
    Major or blocker never may, disputed or not. A round that ended with open findings goes to the
-   human instead.
+   human instead. merge-check refuses a last round that decided `continue`; a `cap` (a Major or a
+   degraded run at round 5 or later) unless it was recorded with `stopWhenNoMajor: false`; and the
+   newest revmux report when it has no recorded decision.
 2. **The whole suite passed on the PR head.** Note that commit's full SHA (`git rev-parse HEAD`
    after the push) and the test count. Run it with `wb.py suite --label <sha7> -- <command>` (see
    Rules). The result arrives as mail from `helper`.
@@ -444,8 +488,9 @@ gh pr comment <N> --body-file .workbench/merge-note.md
 ```
 
 The note states each condition as a checked fact: "Merged automatically (auto-merge is on for this
-checkout): review clean after <K> revmux round(s); whole suite green on <sha> (<count> tests);
-merge-check ok." It ends with the planner marker line. The relay then reports the merge, and Phase 7
+checkout): <the `wb.py review-round --summary` line>; whole suite green on <sha> (<count> tests);
+merge-check ok." That line is `review clean after round K`, or `review stopped: round K had no Major;
+N minor finding(s) in <leftovers URL>` once the follow-ups are filed. It ends with the planner marker line. The relay then reports the merge, and Phase 7
 runs as for a human merge. In queue mode, report `loop-state pr-open` first, as below.
 
 If any condition fails, do not merge. Post merge-check's failure lines (or which of conditions 1-2
@@ -475,7 +520,8 @@ reviews, comments, line comments, the review decision). For each round of it:
 1. Interpret it; if an annotation is a question (`??`, "why", "explain"), answer it on the PR with
    `gh pr comment` rather than turning it into code.
 2. Send the change requests to Codex as a fix round. Review the fix - a direct diff read for small
-   changes, another revmux round for substantial ones.
+   changes, another revmux round for substantial ones (recorded with `review-round` like any
+   other, round 6 and later included, or merge-check refuses its report; a Major there is a `cap`).
 3. Push, and reply on the PR saying what changed for each point.
 
 ## Phase 7 - done

@@ -43,7 +43,7 @@ STRIP = string.punctuation + "‘’“”«»" + string.whitespace
 
 
 class SettingsError(Exception):
-    """An invalid followUp section: exit 2 before anything is written."""
+    """An invalid followUp or review section: exit 2 before anything is written."""
 
 
 # --- normalising ----------------------------------------------------------------------------------
@@ -296,6 +296,20 @@ def load_settings(config: dict) -> dict:
             or not bump_at["P2"] < bump_at["P1"] < bump_at["P0"]):
         raise SettingsError('followUp.bumpAt must be {"P2": a, "P1": b, "P0": c} with integers 2 <= a < b < c')
     return {"dedupe": dedupe, "bumpAt": dict(bump_at)}
+
+
+def review_settings(config: dict) -> dict:
+    """`review.stopWhenNoMajor` (default on) and `review.minRounds` (default 1, an int in 1..5) (#64)."""
+    section = config.get("review", {})
+    if not isinstance(section, dict):
+        raise SettingsError("review must be an object")
+    stop = section.get("stopWhenNoMajor", True)
+    if not isinstance(stop, bool):
+        raise SettingsError("review.stopWhenNoMajor must be true or false")
+    rounds = section.get("minRounds", 1)
+    if type(rounds) is not int or not 1 <= rounds <= 5:
+        raise SettingsError("review.minRounds must be an integer from 1 to 5")
+    return {"stopWhenNoMajor": stop, "minRounds": rounds}
 
 
 def triage_on(config: dict, repo: str) -> bool:
