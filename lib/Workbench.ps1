@@ -219,26 +219,52 @@ function Invoke-KimiDoctor([string] $Exe) {
     return @{ Code = $LASTEXITCODE; Output = (($output | ForEach-Object { "$_" }) -join "`n").Trim() }
 }
 
-function Get-KimiProblem($Config) {
-    <# Why Kimi cannot be the implementer here, or $null: the executable, `kimi doctor`, and - unless
-       allowNetwork - its web tools disabled in its own config (lib/kimi.py web-guard; Kimi 2.1.1
-       ignores --agent-file, so nothing else can turn them off). #>
+function Get-KimiArgsProblem($Config) {
+    <# kimiArgs that would re-decide the approval mode, the session, the agent or its directories:
+       long forms case-insensitively with or without =value, short flags case-sensitively and also
+       bundled (-yc), as commander takes them. -m (the model) passes. #>
+    foreach ($argument in @(@($Config.kimiArgs) | Where-Object { $null -ne $_ })) {
+        $text = [string]$argument
+        if ($text -match '^--(auto|yolo|yes|auto-approve|continue|session|agent|agent-file|skills-dir|add-dir|prompt|plan|output-format)(=|$)' -or
+            $text -cmatch '^-[^-]*[ycSp]') {
+            return "kimiArgs: '$text' would re-decide the Kimi implementer's approval mode, session or agent"
+        }
+    }
+    return $null
+}
+
+function Get-KimiProblem {
+    <# Why Kimi cannot be the implementer here, or $null - every refusal the pane would make, checked
+       before anything is recorded or stopped (#65): the executable, kimiArgs, `kimi doctor` (not with
+       -NoDoctor: the dry run runs nothing), its web tools disabled in its own config unless
+       allowNetwork (Kimi 2.1.1 ignores --agent-file, so nothing else can turn them off), and - given
+       the checkout - what the pane's `kimi.py prepare` would refuse (Git Bash, a tracked or foreign
+       .kimi-code/AGENTS.md), asked with --dry-run so nothing is written. #>
+    param($Config, [string] $Checkout, [switch] $NoDoctor)
     $exe = Find-KimiExe $Config
     if (-not $exe) {
         if ($Config.kimiPath) { return "kimi not found at kimiPath '$($Config.kimiPath)' (~/.agworkbench.json)" }
         return "kimi not found: set kimiPath in ~/.agworkbench.json, put kimi on PATH, or install it to ~\.kimi-code\bin\kimi.exe"
     }
-    $doctor = Invoke-KimiDoctor $exe
-    if ($doctor.Code -ne 0) { return "'$exe doctor' failed (exit $($doctor.Code)): $($doctor.Output)" }
+    $arguments = Get-KimiArgsProblem $Config
+    if ($arguments) { return $arguments }
+    if (-not $NoDoctor) {
+        $doctor = Invoke-KimiDoctor $exe
+        if ($doctor.Code -ne 0) { return "'$exe doctor' failed (exit $($doctor.Code)): $($doctor.Output)" }
+    }
     $guard = @('web-guard')
     if ($Config.allowNetwork) { $guard += '--allow-network' }
     $said = & python (Join-Path $script:Lib 'kimi.py') @guard 2>&1
     if ($LASTEXITCODE -ne 0) { return (($said | ForEach-Object { "$_" }) -join "`n").Trim() }
+    if ($Checkout) {
+        $said = & python (Join-Path $script:Lib 'kimi.py') prepare --checkout $Checkout --issue 'check' --dry-run 2>&1
+        if ($LASTEXITCODE -ne 0) { return (($said | ForEach-Object { "$_" }) -join "`n").Trim() }
+    }
     return $null
 }
 
-function Assert-KimiReady($Config) {
-    $problem = Get-KimiProblem $Config
+function Assert-KimiReady($Config, [string] $Checkout) {
+    $problem = Get-KimiProblem -Config $Config -Checkout $Checkout
     if ($problem) { throw [ImplementerConflict]::new("the Kimi implementer cannot start: $problem") }
 }
 
@@ -1240,8 +1266,8 @@ function Confirm-PaneStable([string] $Checkout, [string] $Pane, [string] $Tool, 
 
 function Get-FailoverTarget {
     <# The tool a -Failover switches to (#65): the first in failoverOrder that is not the limited one,
-       has no recorded limit, and - for kimi - is usable (Get-KimiProblem). -NoProbe (the dry run)
-       skips that last check. Returns @{ Target; Reasons }, Target $null when no tool qualifies. #>
+       has no recorded limit, and - for kimi - is usable (Get-KimiProblem, with the checkout). -NoProbe
+       (the dry run) leaves out only `kimi doctor`, which would run kimi. Returns @{ Target; Reasons }, Target $null when no tool qualifies. #>
     param([string] $Checkout, $Config, [string] $Saved, [switch] $NoProbe)
     $recorded = Get-ImplementerLimits $Checkout
     $reasons = @()
@@ -1251,8 +1277,8 @@ function Get-FailoverTarget {
             $reasons += "$tool was recorded limited at $($recorded[$tool].at) ('$($recorded[$tool].line)'). Once it has reset, the human clears that with: github-workbench <issue> -Implementer $tool"
             continue
         }
-        if ($tool -eq 'kimi' -and -not $NoProbe) {
-            $problem = Get-KimiProblem $Config
+        if ($tool -eq 'kimi') {
+            $problem = Get-KimiProblem -Config $Config -Checkout $Checkout -NoDoctor:$NoProbe
             if ($problem) { $reasons += "kimi is not usable: $problem"; continue }
         }
         return @{ Target = $tool; Reasons = $reasons }
@@ -2132,14 +2158,11 @@ function Invoke-LauncherBody {
             if (-not $config.failover) { Write-Step 'failover: would refuse: "failover" is false' }
         }
         if ($resolved.Tool -eq 'kimi') {
-            # A dry run reports what the real launch would refuse on; it runs nothing (#65).
-            $exe = Find-KimiExe $config
-            if ($exe) { Write-Step "kimi: $exe; a real launch runs 'kimi doctor' first" }
-            else { Write-Step 'kimi: would refuse: kimi not found (kimiPath, PATH, ~\.kimi-code\bin\kimi.exe)' }
-            $guard = @('web-guard')
-            if ($config.allowNetwork) { $guard += '--allow-network' }
-            $said = (& python (Join-Path $script:Lib 'kimi.py') @guard 2>&1 | ForEach-Object { "$_" }) -join ' '
-            if ($LASTEXITCODE -ne 0) { Write-Step "kimi: would refuse: $said" } else { Write-Step 'kimi: web tools checked off (or allowNetwork)' }
+            # A dry run reports what the real launch would refuse on - the same checks, reading only,
+            # without running kimi (#65).
+            $problem = Get-KimiProblem -Config $config -Checkout $co.Dir -NoDoctor
+            if ($problem) { Write-Step "kimi: would refuse: $problem" }
+            else { Write-Step "kimi: $(Find-KimiExe $config); web tools checked off (or allowNetwork); a real launch runs 'kimi doctor' first" }
         }
         Write-Step "right pane: $codexLaunch"
         $relayTool = ''
@@ -2167,7 +2190,7 @@ function Invoke-LauncherBody {
         if ($resolved.Conflict) { throw [ImplementerConflict]::new($resolved.Conflict) }
         # Kimi is checked before anything is recorded, so a refusal changes nothing (#65). A failover
         # to kimi checked it before it stopped the limited agent.
-        if ($resolved.Tool -eq 'kimi' -and -not $Failover) { Assert-KimiReady $config }
+        if ($resolved.Tool -eq 'kimi' -and -not $Failover) { Assert-KimiReady $config $co.Dir }
         Save-Implementer $co.Dir $resolved
         # The human choosing a tool explicitly says its limit has reset (#24).
         if ($Implementer -and -not $Failover) { Set-ImplementerLimit $co.Dir $Implementer $null }

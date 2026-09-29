@@ -3547,6 +3547,13 @@ exit /b 0
 """
 
 
+def with_git(env):
+    """The kimi checks look for Git Bash next to git (Kimi's shell), so the kimi fixtures keep git."""
+    git = shutil.which('git')
+    if git:
+        env['PATH'] = env['PATH'] + os.pathsep + str(Path(git).parent)
+
+
 class KimiImplementer(LauncherFixtures):
     """#65: Kimi Code as a third implementer. The kimi executable is always a stub (kimiPath), and
     KIMI_CODE_HOME points at a temp dir: no test runs the real kimi or reads ~/.kimi-code."""
@@ -3565,6 +3572,7 @@ class KimiImplementer(LauncherFixtures):
         self.kimi_calls = self.temp / 'kimi-calls.txt'
         self.env.update(KIMI_CODE_HOME=str(self.kimi_home), STUB_KIMI_DOCTOR='0', STUB_KIMI_CALLS=str(self.kimi_calls))
         self.env.pop('STUB_KIMI_SESSION', None)
+        with_git(self.env)
         self.configure()
 
     def guard_on(self):
@@ -3612,8 +3620,7 @@ class KimiImplementer(LauncherFixtures):
         self.assertIn('implementer: kimi (revmux profile claude-only)', result.stdout)
         self.assertIn('pane-implementer-kimi.ps1', result.stdout)
         self.assertIn('--implementer-tool kimi', result.stdout)
-        self.assertIn(f'kimi: {self.kimi}', result.stdout)
-        self.assertIn('web tools checked off', result.stdout)
+        self.assertIn(f'kimi: {self.kimi}; web tools checked off', result.stdout)
         self.assertFalse((self.checkout / '.workbench').exists())
         self.assertFalse(self.calls())
         self.assertFalse(self.kimi_calls.exists())
@@ -3660,12 +3667,16 @@ class KimiImplementer(LauncherFixtures):
             ('web tools', lambda: (self.kimi_home / 'config.toml').write_text('[tools]\ndisabled = ["FetchURL"]\n', encoding='utf-8'),
              'WebSearch are on'),
             ('bad toml', lambda: (self.kimi_home / 'config.toml').write_text('[tools\n', encoding='utf-8'), 'cannot read'),
+            # FIX r1 m1: the pane's own refusals are checked here too, before anything is recorded.
+            ('kimiArgs', lambda: self.configure(kimiArgs=['--yolo']), "kimiArgs: '--yolo' would re-decide"),
+            ('foreign role file', self.foreign_role, 'not written by agworkbench'),
         ]
         for name, breaks, reason in cases:
             with self.subTest(case=name):
                 self.configure()
                 self.env['STUB_KIMI_DOCTOR'] = '0'
                 self.guard_on()
+                shutil.rmtree(self.checkout / '.kimi-code', ignore_errors=True)
                 breaks()
                 result = self.body('kimi')
                 self.assertEqual(1, result.returncode, result.stdout)
@@ -3674,6 +3685,11 @@ class KimiImplementer(LauncherFixtures):
                 self.assertIn(reason, result.stdout)
                 self.assertFalse(any(c[:2] in (['session', 'new'], ['session', 'restore']) for c in self.calls()))
                 self.assertFalse((self.checkout / '.workbench/state/implementer.json').exists())
+
+    def foreign_role(self):
+        role = self.checkout / '.kimi-code/AGENTS.md'
+        role.parent.mkdir(parents=True, exist_ok=True)
+        role.write_text("the repository's own notes\n", encoding='utf-8')
 
     def test_allow_network_needs_no_web_tool_config(self):
         (self.kimi_home / 'config.toml').unlink()
@@ -3826,6 +3842,7 @@ class KimiFailover(LauncherFixtures):
         self.kimi_home.mkdir()
         (self.kimi_home / 'config.toml').write_text('[tools]\ndisabled = ["FetchURL", "WebSearch"]\n', encoding='utf-8')
         self.env.update(KIMI_CODE_HOME=str(self.kimi_home), STUB_KIMI_DOCTOR='0', STUB_KIMI_CALLS=str(self.temp / 'calls.txt'))
+        with_git(self.env)
 
     def configure(self, **settings):
         config = dict(checkoutRoot=str(self.temp), kimiPath=str(self.kimi))
@@ -3898,6 +3915,27 @@ class KimiFailover(LauncherFixtures):
         self.assertIn('failover refused: kimi is not usable: kimi not found', result.stdout)
         self.assertEqual('codex', self.state('implementer.json')['tool'])
         self.assertNotIn('limits', self.state('implementer.json'))
+
+    def test_a_kimi_the_pane_would_refuse_is_never_failed_over_to(self):
+        # FIX r1 m1: kimiArgs and prepare's refusals are checked before the limited Codex is stopped.
+        for name, settings, setup, reason in (
+                ('kimiArgs', {'kimiArgs': ['--yolo']}, lambda: None, "kimiArgs: '--yolo' would re-decide"),
+                ('role file', {}, lambda: KimiImplementer.foreign_role(self), 'not written by agworkbench')):
+            with self.subTest(case=name):
+                self.configure(failoverOrder=['kimi', 'codex'])
+                self.launch()
+                self.configure(failoverOrder=['kimi', 'codex'], **settings)
+                setup()
+                self.right(self.frame('codex-limited-exited'))
+                result = self.failover([])
+                self.assertEqual(1, result.returncode, result.stdout)
+                self.assertIn('EXIT=2', result.stdout)
+                self.assertIn('failover refused: kimi is not usable: ', result.stdout)
+                self.assertIn(reason, result.stdout)
+                self.assertEqual('codex', self.state('implementer.json')['tool'])
+                self.assertNotIn('limits', self.state('implementer.json'))
+                self.assertEqual([], self.stopped_pids())
+                shutil.rmtree(self.checkout / '.kimi-code', ignore_errors=True)
 
     def test_the_default_order_keeps_codex_to_claude_and_claude_to_codex(self):
         for saved, expected in (('codex', 'claude'), ('claude', 'codex')):

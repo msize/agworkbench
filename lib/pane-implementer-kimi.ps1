@@ -47,17 +47,9 @@ if (-not $kimi) {
     exit 1
 }
 
-# Long forms case-insensitively with or without =value; short flags case-sensitively, also bundled
-# (-yc): commander accepts both. -m (the model) passes.
-$forbiddenLong = '^--(auto|yolo|yes|auto-approve|continue|session|agent|agent-file|skills-dir|add-dir|prompt|plan|output-format)(=|$)'
-$forbiddenShort = '^-[^-]*[ycSp]'
+$argumentProblem = Get-KimiArgsProblem $config
+if ($argumentProblem) { throw $argumentProblem }
 $extra = @(@($config.kimiArgs) | Where-Object { $null -ne $_ })
-foreach ($argument in $extra) {
-    $text = [string]$argument
-    if ($text -match $forbiddenLong -or $text -cmatch $forbiddenShort) {
-        throw "kimiArgs: '$text' would re-decide the Kimi implementer's approval mode, session or agent"
-    }
-}
 
 if (-not $WhatIfOnly) {
     $problem = Get-KimiProblem $config
