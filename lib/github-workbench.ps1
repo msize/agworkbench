@@ -179,7 +179,7 @@ if ($PSBoundParameters.ContainsKey('ClearLimit') -and
 }
 
 if ($Failover -and ($Implementer -or $PSBoundParameters.ContainsKey('Queue') -or $NewSession -or $QueueMember)) {
-    Write-Host '-Failover picks the other tool itself; it cannot be combined with -Implementer, -Queue, -NewSession or a queue member.' -ForegroundColor Yellow
+    Write-Host '-Failover picks the next tool in failoverOrder itself; it cannot be combined with -Implementer, -Queue, -NewSession or a queue member.' -ForegroundColor Yellow
     exit 2
 }
 if ($Autonomous -and $NoAutonomous) {

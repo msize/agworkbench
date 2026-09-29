@@ -54,6 +54,8 @@ EXPECTED = {
     "kimi-rate-limit-transient": ("kimi", None, False),
     "kimi-retrying": ("kimi", None, False),
     "kimi-tool-output": ("kimi", None, False),
+    # FIX r1 m6: the tool call is the last item above the composer, its output ending in error + hint
+    "kimi-tool-output-last": ("kimi", None, False),
     "kimi-history": ("kimi", None, False),
     "kimi-diff": ("kimi", None, False),
 }

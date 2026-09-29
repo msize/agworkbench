@@ -3435,7 +3435,7 @@ class FailoverLaunch(LauncherFixtures):
                                          '-Failover', *extra], env=self.env, cwd=ROOT, capture_output=True,
                                         text=True, encoding='utf-8', errors='replace', timeout=20)
                 self.assertEqual(2, result.returncode, result.stdout + result.stderr)
-                self.assertIn('-Failover picks the other tool itself', result.stdout)
+                self.assertIn('-Failover picks the next tool in failoverOrder itself', result.stdout)
 
     def test_dry_run_describes_the_failover_and_acts_on_nothing(self):
         self.cmd('gh', 'echo {"title":"fix-x","state":"OPEN"}\nexit /b 0')
@@ -3646,7 +3646,8 @@ class KimiImplementer(LauncherFixtures):
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
         self.assertEqual('kimi', self.state('implementer.json')['tool'])
         self.configure(implementer='kimi', revmuxProfile='comprehensive')
-        ps(". ./lib/Workbench.ps1; Get-RevmuxProfile kimi 'comprehensive'", env=self.env)
+        chosen = ps(". ./lib/Workbench.ps1; Get-RevmuxProfile kimi 'comprehensive'", env=self.env)
+        self.assertEqual('comprehensive', chosen.stdout.strip())                 # revmuxProfile wins
         for tool, profile in (('codex', 'comprehensive'), ('claude', 'claude-only'), ('kimi', 'claude-only')):
             with self.subTest(tool=tool):
                 out = ps(f". ./lib/Workbench.ps1; Get-RevmuxProfile {tool} $null", env=self.env)

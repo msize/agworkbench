@@ -2295,6 +2295,8 @@ class ToolLimits(unittest.TestCase):
         self.assertEqual(('claude', None), q.tool_route(limits('codex')))
         self.assertIn('planner is always Claude', q.tool_route(limits('claude'))[1])
         self.assertEqual((None, None), q.tool_route(limits('kimi')))    # a codex queue ignores a kimi limit
+        self.config.write_text(json.dumps({'failoverOrder': None}))      # null is the default too (FIX r1 m3)
+        self.assertEqual(('claude', None), q.tool_route(limits('codex')))
 
     def test_clear_limit_and_implementer_accept_kimi(self):
         self.record(1, tool='kimi', kind='limited', relay=True)

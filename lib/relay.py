@@ -335,15 +335,11 @@ def git_head(root: Path) -> str | None:
     return done.stdout.strip() if done.returncode == 0 else None
 
 
-def _kimi_last_words(text: str) -> str | None:
-    """Kimi Code's last paragraph: the block above its composer box, past any spinner row."""
-    import peerchat
-    box = peerchat.kimi_box(text)
-    if box is None:
-        return None
-    lines, top, _ = box
-    above = lines[:top]
-    while above and (not above[-1].strip() or peerchat.KIMI_SPINNER_RE.match(above[-1])):
+def _last_paragraph(above: list[str], skip) -> str | None:
+    """The last block of `above`, past trailing blank rows and rows `skip` matches, clipped from the
+    front to LAST_WORDS_MAX."""
+    above = list(above)
+    while above and (not above[-1].strip() or skip(above[-1])):
         above.pop()
     start = len(above)
     while start and above[start - 1].strip():
@@ -359,7 +355,12 @@ def last_words(text: str | None, tool: str) -> str | None:
     status line, which are the pane's real last rows. None when the composer cannot be found."""
     import peerchat
     if tool == "kimi":
-        return _kimi_last_words(text or "")
+        # Kimi's box (#65); a running turn's spinner row sits between the answer and the box.
+        box = peerchat.kimi_box(text or "")
+        if box is None:
+            return None
+        lines, top, _ = box
+        return _last_paragraph(lines[:top], lambda row: bool(peerchat.KIMI_SPINNER_RE.match(row)))
     lines = (text or "").splitlines()
     prompt_re = peerchat.CLAUDE_PROMPT_RE if tool == "claude" else peerchat.CODEX_PROMPT_RE
     prompt = next((i for i in range(len(lines) - 1, -1, -1) if prompt_re.match(lines[i])), None)
@@ -368,17 +369,8 @@ def last_words(text: str | None, tool: str) -> str | None:
     rule = next((i for i in range(prompt - 1, -1, -1) if peerchat.RULE_RE.match(lines[i])), None)
     if rule is None:
         return None
-    above = lines[:rule]
     # Claude's turn timer ("✻ Brewed for 1m 0s") sits between the answer and the box.
-    while above and (not above[-1].strip() or above[-1].lstrip().startswith("✻")):
-        above.pop()
-    start = len(above)
-    while start and above[start - 1].strip():
-        start -= 1
-    words = " ".join(row.strip() for row in above[start:])
-    if not words:
-        return None
-    return words if len(words) <= LAST_WORDS_MAX else "…" + words[-LAST_WORDS_MAX:]
+    return _last_paragraph(lines[:rule], lambda row: row.lstrip().startswith("✻"))
 
 
 class StallWatch:

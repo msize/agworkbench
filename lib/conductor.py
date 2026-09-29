@@ -486,7 +486,9 @@ def tool_route(data):
         return None, f'tool limits: {said}; failover is off'
     # The launcher's -Failover rule (#65): the first tool in failoverOrder that is not the limited one
     # and has no recorded limit. Whether it is installed is the launcher's check, at the launch.
-    order = settings.get('failoverOrder', DEFAULT_FAILOVER_ORDER)
+    order = settings.get('failoverOrder')
+    if order is None:                   # absent or null: the default, as the launcher reads it
+        order = DEFAULT_FAILOVER_ORDER
     if (not isinstance(order, list) or len(order) < 2 or len(set(map(str, order))) != len(order)
             or any(tool not in IMPLEMENTER_TOOLS for tool in order)):
         return None, f'tool limits: {said}; failoverOrder in {data["config"]} is invalid: {order!r}'

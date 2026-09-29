@@ -98,6 +98,9 @@ KIMI_SPINNER_RE = re.compile(r"^\s*[⠀-⣿\U0001F311-\U0001F318]\s")
 KIMI_ERROR_RE = re.compile(r"^\s{1,4}Error: \[")
 KIMI_HINT_RE = re.compile(r"^\s*If this persists, run `/export-debug-zip`")
 KIMI_ITEM_RE = re.compile(r"^\s*[●✗✨$]\s")
+# A tool call's header row: its output rows follow it at the same indent as a status row would.
+KIMI_TOOL_RE = re.compile(r"^\s*(?:✗\s|●\s+(?:Ran|Running|Used|Using|Read|Reading|Wrote|Writing|Edited|Editing"
+                          r"|Searched|Searching|Fetched|Fetching)\b)")
 
 
 @dataclass(frozen=True)
@@ -260,6 +263,11 @@ def _kimi(rows: list[str]) -> Limit | None:
     for start in range(hint - 1, max(hint - 5, -1), -1):
         row = above[start]
         if KIMI_ERROR_RE.match(row):
+            # The status row is glued to the item above it, so that item decides: a message or a
+            # prompt is where a session error lands; a tool call means these are its output rows.
+            owner = next((r for r in reversed(above[:start]) if KIMI_ITEM_RE.match(r)), "")
+            if KIMI_TOOL_RE.match(owner):
+                return None
             message = " ".join(part.strip() for part in above[start:hint])
             if _starts_with(message, LIMITED["kimi"], LIMIT_GLYPH["kimi"]):
                 return Limit("limited", row.strip())

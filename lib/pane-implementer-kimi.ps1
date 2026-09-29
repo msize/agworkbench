@@ -26,8 +26,8 @@
       Kimi's last session for this directory, if there is one; the relay rings each mail only once,
       so a note from 'relay' tells the resumed Kimi to read what arrived while it was down.
   KIMI_CODE_NO_AUTO_UPDATE
-      An auto-update re-executes kimi.exe as a child: two kimi processes for one pane, which the
-      failover's process check refuses.
+      An auto-update re-executes kimi.exe as a child of the running one: an extra process under the
+      pane that the failover's stop (a tree kill of the root kimi.exe) has to take down with it.
 
   Extra arguments from "kimiArgs" in ~/.agworkbench.json pass through, except anything that would
   re-decide the approval mode, the session, the agent or its directories - in any spelling kimi takes.

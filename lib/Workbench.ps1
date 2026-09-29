@@ -121,7 +121,7 @@ function Get-WorkbenchConfig {
                         limited (default ["claude", "codex", "kimi"]): the first that is not the
                         limited one, has no recorded limit and is usable
          autoMerge      let the planner merge its own PR when every condition holds (default false)
-         failover       switch the implementer to the other tool when it hits its usage limit (default true)
+         failover       switch the implementer to the next tool in failoverOrder when it hits its usage limit (default true)
          autonomous     full autonomy (#27): auto-merge, follow-up issues, sessions closed after the merge
                         (default false)
          cleanup        after an autonomous close (#41): merged (default) deletes the checkout, build
