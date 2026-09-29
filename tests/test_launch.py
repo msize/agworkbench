@@ -1378,7 +1378,7 @@ class QueueEntry(LauncherFixtures):
                 result = subprocess.run([PWSH, '-NoProfile', '-File', str(self.entry_lib / 'github-workbench.ps1'), *extra],
                                         env=self.env, cwd=ROOT, capture_output=True, text=True, timeout=45)
                 self.assertEqual(2, result.returncode, result.stdout + result.stderr)
-                self.assertIn('-ClearLimit takes codex or claude and belongs to -Queue', result.stdout)
+                self.assertIn('-ClearLimit takes codex, claude or kimi and belongs to -Queue', result.stdout)
 
     def test_a_query_spec_reaches_the_conductor_exactly_under_both_shells(self):
         # #38: 5.1 strips double quotes from a native argument; the spec goes through the environment.
