@@ -47,7 +47,21 @@ EXPECTED = {
     "claude-reply-starts-with-phrase": ("claude", None, False),
     "claude-reply-second-line-phrase": ("claude", None, False),
     "codex-message-starts-with-phrase": ("codex", None, False),
+    # #65: Kimi Code, synthesised around the captured status-error frame (see README.md)
+    "kimi-limited-quota": ("kimi", "limited", False),
+    "kimi-limited-balance": ("kimi", "limited", False),
+    "kimi-limited-usage": ("kimi", "limited", False),
+    "kimi-rate-limit-transient": ("kimi", None, False),
+    "kimi-retrying": ("kimi", None, False),
+    "kimi-tool-output": ("kimi", None, False),
+    # FIX r1 m6: the tool call is the last item above the composer, its output ending in error + hint
+    "kimi-tool-output-last": ("kimi", None, False),
+    # FIX r2 m3: Kimi exited to the shell with a tool's quoted quota error + hint above the prompt
+    "kimi-exited-quoted": ("kimi", None, False),
+    "kimi-history": ("kimi", None, False),
+    "kimi-diff": ("kimi", None, False),
 }
+KIMI_CAPTURED = ROOT / "tests" / "fixtures" / "kimi"
 
 
 def frame(name: str) -> str:
@@ -73,8 +87,8 @@ class Fixtures(unittest.TestCase):
         captured = {"Heads up, you have less than 10% of your weekly limit left. Run /status for a",
                     "Switch to gpt-5.6-luna for lower credit usage?"}
         for name, (tool, kind, _) in EXPECTED.items():
-            if kind != "limited":
-                continue
+            if kind != "limited" or tool == "kimi":
+                continue                 # Kimi's rows are composed from templates: test_kimi_rows_...
             with self.subTest(frame=name):
                 line = limits.classify(frame(name), tool).line
                 phrase = line.split(" ", 1)[1].lstrip() if not line[0].isalnum() else line
@@ -99,6 +113,36 @@ class Fixtures(unittest.TestCase):
         for needle in ("You've hit your", "Usage limit reached", "usage credit limit reached",
                        'five_hour:"session limit"'):
             self.assertIn(needle, claude)
+        kimi = (FIXTURES / "strings-kimi.txt").read_text(encoding="utf-8")
+        for needle in ("exceeded_current_quota_error", "exceeded your current (?:token )?quota", "insufficient balance",
+                       "this.showStatus(`Error: ${message}`", "return `[${error.code}] ${error.message}`",
+                       "If this persists, run `/export-debug-zip`", "Retrying (${retry.nextAttempt}",
+                       'PROVIDER_API_ERROR_CODE = "provider.api_error"', '"provider.rate_limit"'):
+            self.assertIn(needle, kimi)
+
+    def test_kimi_rows_are_composed_from_the_binarys_templates(self):
+        """Kimi draws a session error as showStatus(`Error: ${formatErrorPayload}`) - `[code] message` -
+        and then its report hint. The code, the hint and the quota wording come from strings-kimi.txt;
+        only the provider's message around the quota words is invented (and marked in README.md)."""
+        kimi = (FIXTURES / "strings-kimi.txt").read_text(encoding="utf-8")
+        hint = re.search(r'return "(If this persists, run [^"]+)";', kimi).group(1)
+        for name, (tool, kind, _) in EXPECTED.items():
+            if tool != "kimi":
+                continue
+            with self.subTest(frame=name):
+                text = frame(name)
+                error = next(row.strip() for row in text.splitlines() if "Error: [provider." in row)
+                code = re.search(r"\[(provider\.[a-z_]+)\]", error).group(1)
+                self.assertTrue(f'"{code}"' in kimi, code)
+                self.assertTrue(" ".join(text.split()).find(" ".join(hint.split())) >= 0 or name == "kimi-diff")
+                if kind == "limited" and name != "kimi-limited-usage":
+                    self.assertTrue(any(phrase in " ".join(text.split()) for phrase in
+                                        ("exceeded your current quota", "insufficient balance")), name)
+
+    def test_kimi_captured_frames_are_never_limits(self):
+        for path in sorted(KIMI_CAPTURED.glob("*.txt")):
+            with self.subTest(frame=path.name):
+                self.assertIsNone(limits.classify(path.read_text(encoding="utf-8"), "kimi"))
 
 
 class Position(unittest.TestCase):
@@ -139,6 +183,18 @@ class Position(unittest.TestCase):
         picker = "• Ran ls\n  └ lib\n\n› 1. Switch to plan mode\n  2. Keep current model\n"
         self.assertIsNone(limits.classify(picker, "codex"))
 
+    def test_kimi_needs_the_idle_composer_and_the_hint_right_below_the_error(self):
+        quota = frame("kimi-limited-quota")
+        self.assertEqual("limited", limits.classify(quota, "kimi").kind)
+        # A dialog replaced the composer: no verdict from a pane nobody can read.
+        self.assertIsNone(limits.classify(quota.split(" ╭")[0] + "\n   ▶ 1. Approve once\n", "kimi"))
+        # Without the hint row the error row cannot be told from a tool's output.
+        no_hint = "\n".join(row for row in quota.splitlines() if "If this persists" not in row)
+        self.assertIsNone(limits.classify(no_hint, "kimi"))
+        # The same rows classify as nothing for the other tools.
+        self.assertIsNone(limits.classify(quota, "claude"))
+        self.assertIsNone(limits.classify(quota, "codex"))
+
     def test_unknown_tool_is_refused(self):
         with self.assertRaises(ValueError):
             limits.classify("x", "aider")
@@ -157,6 +213,10 @@ class Cli(unittest.TestCase):
         result = json.loads(done.stdout)
         self.assertEqual(("limited", True), (result["kind"], result["exited"]))
         self.assertEqual(limits.tail_hash(frame("codex-limited-exited")), result["tail"])
+        done = subprocess.run([sys.executable, str(ROOT / "lib" / "limits.py"), "classify", "--tool", "kimi"],
+                              input=frame("kimi-limited-quota").encode("utf-8"), capture_output=True)
+        self.assertEqual(0, done.returncode, done.stderr)
+        self.assertEqual("limited", json.loads(done.stdout)["kind"])
         done = subprocess.run([sys.executable, str(ROOT / "lib" / "limits.py"), "classify", "--tool", "claude"],
                               input=frame("claude-grep").encode("utf-8"), capture_output=True)
         self.assertIsNone(json.loads(done.stdout)["kind"])

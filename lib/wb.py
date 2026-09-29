@@ -101,8 +101,9 @@ def open_session(name: str, cwd: Path, command: str, select: bool) -> str:
 
 
 def revmux_profile(root: Path) -> str:
-    """The profile the launcher resolved for this checkout (#20): claude-only when Claude is the
-    implementer and Codex may be out of quota, comprehensive otherwise, or the human's revmuxProfile."""
+    """The profile the launcher resolved for this checkout (#20): claude-only when Claude or Kimi
+    (#65) is the implementer and Codex may be out of quota, comprehensive otherwise, or the human's
+    revmuxProfile."""
     return checkout_settings(root)["revmuxProfile"]
 
 
@@ -207,10 +208,11 @@ def checkout_settings(root: Path) -> dict:
         saved = {}
     if not isinstance(saved, dict):
         saved = {}
-    tool = saved.get("tool") if saved.get("tool") in ("codex", "claude") else "codex"
+    tool = saved.get("tool") if saved.get("tool") in ("codex", "claude", "kimi") else "codex"
     profile = saved.get("revmuxProfile")
     if not (isinstance(profile, str) and re.fullmatch(r"[A-Za-z0-9._-]+", profile)):
-        profile = "comprehensive"
+        # The launcher's Get-RevmuxProfile default: Codex reviews only when Codex implements.
+        profile = "comprehensive" if tool == "codex" else "claude-only"
     return {"implementer": tool, "revmuxProfile": profile, "autoMerge": saved.get("autoMerge") is True,
             "autonomous": saved.get("autonomous") is True}
 

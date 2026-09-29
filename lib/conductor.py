@@ -357,6 +357,8 @@ GIB = 1024 ** 3                 # minFreeGB counts what Explorer labels "GB" (#4
 CEILING_EXTRA = 2               # live members beyond -Parallel the conductor tolerates (#61)
 SESSION_GRACE = 120             # seconds a slot-holding member's session may be missing before its slot goes (#61)
 LIVE_STATES = {'active', 'blocked', 'pr-open'}
+IMPLEMENTER_TOOLS = ('codex', 'claude', 'kimi')     # #65
+DEFAULT_FAILOVER_ORDER = ['claude', 'codex', 'kimi']
 _UNREAD = object()
 
 
@@ -419,11 +421,11 @@ def valid_tool_limits(data):
     if not isinstance(limits, dict) or not isinstance(cleared, dict):
         return False
     for tool, entry in limits.items():
-        if (tool not in ('codex', 'claude') or not isinstance(entry, dict) or
+        if (tool not in IMPLEMENTER_TOOLS or not isinstance(entry, dict) or
                 type(entry.get('at')) not in (int, float) or not isinstance(entry.get('line'), str) or
                 entry.get('kind') not in ('limited', 'warning') or type(entry.get('member')) is not int):
             return False
-    return all(tool in ('codex', 'claude') and type(at) in (int, float) for tool, at in cleared.items())
+    return all(tool in IMPLEMENTER_TOOLS and type(at) in (int, float) for tool, at in cleared.items())
 
 
 def epoch(value):
@@ -441,14 +443,14 @@ def member_limits(m):
     path = directory / 'implementer.json'
     if path.exists():
         for tool, entry in (read_json(path).get('limits') or {}).items():
-            if tool in ('codex', 'claude') and isinstance(entry, dict):
+            if tool in IMPLEMENTER_TOOLS and isinstance(entry, dict):
                 found.append((tool, epoch(entry.get('at')), str(entry.get('line') or ''),
                               'warning' if entry.get('kind') == 'warning' else 'limited'))
     path = directory / 'relay.json'
     if path.exists():
         for episode in (read_json(path).get('limits') or {}).values():
             if (isinstance(episode, dict) and episode.get('announced') and
-                    episode.get('tool') in ('codex', 'claude') and episode.get('kind') in ('limited', 'warning')):
+                    episode.get('tool') in IMPLEMENTER_TOOLS and episode.get('kind') in ('limited', 'warning')):
                 found.append((episode['tool'], epoch(episode.get('firstSeen')), str(episode.get('line') or ''),
                               episode['kind']))
     return [item for item in found if item[1] is not None]
@@ -482,7 +484,18 @@ def tool_route(data):
         return None, None
     if settings.get('failover') is False:
         return None, f'tool limits: {said}; failover is off'
-    return 'claude', None
+    # The launcher's -Failover rule (#65): the first tool in failoverOrder that is not the limited one
+    # and has no recorded limit. Whether it is installed is the launcher's check, at the launch.
+    order = settings.get('failoverOrder')
+    if order is None:                   # absent or null: the default, as the launcher reads it
+        order = DEFAULT_FAILOVER_ORDER
+    if (not isinstance(order, list) or len(order) < 2 or len(set(map(str, order))) != len(order)
+            or any(tool not in IMPLEMENTER_TOOLS for tool in order)):
+        return None, f'tool limits: {said}; failoverOrder in {data["config"]} is invalid: {order!r}'
+    target = next((tool for tool in order if tool != wanted and tool not in limits), None)
+    if target is None:
+        return None, f'tool limits: {said}; no tool in failoverOrder {order} is free of a recorded limit'
+    return target, None
 
 
 class Store:
@@ -503,7 +516,7 @@ class Store:
                 raise ValueError('unsupported version or repository')
             if type(data['parallel']) is not int or not 1 <= data['parallel'] <= 8 or type(data['watch']) is not bool:
                 raise ValueError('invalid settings')
-            if data.get('implementer') not in (None, 'codex', 'claude'):
+            if data.get('implementer') not in (None, *IMPLEMENTER_TOOLS):
                 raise ValueError('invalid implementer')
             if data.get('autonomous') is not None and type(data['autonomous']) is not bool:
                 raise ValueError('invalid autonomous')
@@ -667,10 +680,10 @@ def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=Fa
     store = Store(root / (repo + '.json'))
     if parallel is not None and not 1 <= parallel <= 8:
         raise UsageError('-Parallel must be between 1 and 8')
-    if implementer not in (None, 'codex', 'claude'):
-        raise UsageError('-Implementer must be codex or claude')
-    if clear_limit not in (None, 'codex', 'claude'):
-        raise UsageError('-ClearLimit must be codex or claude')
+    if implementer not in (None, *IMPLEMENTER_TOOLS):
+        raise UsageError('-Implementer must be codex, claude or kimi')
+    if clear_limit not in (None, *IMPLEMENTER_TOOLS):
+        raise UsageError('-ClearLimit must be codex, claude or kimi')
     existing = store.load() if store.path.exists() else None      # under the state lock, like every other read
     known = {m['number']: m['state'] for m in existing['members']} if existing else {}
     pruned = [m['number'] for m in existing['members']
@@ -1872,8 +1885,8 @@ def main(argv=None):
     start.add_argument('--parallel', type=int)
     for flag in ('watch', 'retry', 'yes', 'dry-run', 'triage', 'prune'):
         start.add_argument('--' + flag, action='store_true')
-    start.add_argument('--implementer', choices=('codex', 'claude'))
-    start.add_argument('--clear-limit', choices=('codex', 'claude'),
+    start.add_argument('--implementer', choices=IMPLEMENTER_TOOLS)
+    start.add_argument('--clear-limit', choices=IMPLEMENTER_TOOLS,
                        help="forget the queue's recorded usage limit of this tool (#61)")
     merge = start.add_mutually_exclusive_group()
     merge.add_argument('--auto-merge', dest='auto_merge', action='store_const', const=True)

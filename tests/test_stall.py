@@ -454,6 +454,22 @@ class LastWords(unittest.TestCase):
         self.assertIsNone(relay.last_words(CLAUDE_IDLE, 'claude'))      # only the turn timer above the box
         self.assertIsNone(relay.last_words(None, 'claude'))
 
+    def test_kimi_last_paragraph_above_its_box_past_the_spinner(self):
+        # #65: captured Kimi Code frames (tests/fixtures/kimi)
+        kimi = lambda name: (Path(__file__).resolve().parent / 'fixtures' / 'kimi' / f'{name}.txt').read_text(encoding='utf-8')
+        self.assertEqual('● done', relay.last_words(kimi('idle-after-turn'), 'kimi'))
+        self.assertEqual('● Running a command · $ sleep 25 && echo slept', relay.last_words(kimi('running-tool'), 'kimi'))
+        self.assertIsNone(relay.last_words(kimi('approval'), 'kimi'))       # no composer box: a dialog
+        self.assertIsNone(relay.last_words(CLAUDE_IDLE, 'kimi'))
+
+    def test_kimi_idle_blockers(self):
+        kimi = lambda name: (Path(__file__).resolve().parent / 'fixtures' / 'kimi' / f'{name}.txt').read_text(encoding='utf-8')
+        peer = relay.Peer('codex', 'kimi', 'pane')
+        self.assertEqual([], closer.idle_blockers(peer, kimi('idle-after-turn')))
+        self.assertEqual(['codex is running a turn'], closer.idle_blockers(peer, kimi('running-thinking')))
+        self.assertEqual(['codex composer is not provably empty'], closer.idle_blockers(peer, kimi('draft-wrapped')))
+        self.assertEqual(['codex composer is not provably empty'], closer.idle_blockers(peer, kimi('approval')))
+
     def test_a_long_line_is_clipped_from_the_front(self):
         words = relay.last_words(codex('', prefix='• ' + 'x' * 500), 'codex')
         self.assertEqual(relay.LAST_WORDS_MAX + 1, len(words))
@@ -491,9 +507,19 @@ class StallProse(unittest.TestCase):
 
     def test_implementers_never_hide_a_suite_in_a_background_watcher(self):
         self.assertIn('wb.py" suite --label <sha7> -- <command>`', self.text('claude/commands/workbench-implementer.md'))
-        for path in ('claude/commands/workbench-implementer.md', 'codex/skills/workbench-implementer/SKILL.md'):
+        for path in ('claude/commands/workbench-implementer.md', 'codex/skills/workbench-implementer/SKILL.md',
+                     'kimi/AGENTS.md'):
             with self.subTest(path=path):
                 self.assertIn('looks like a stalled loop to the relay', self.text(path))
+
+    def test_every_implementer_role_knows_a_final_round(self):
+        # #64 / #65 FIX r3: the Kimi role (kimi/AGENTS.md) keeps up with the Codex and Claude ones.
+        for path in ('claude/commands/workbench-implementer.md', 'codex/skills/workbench-implementer/SKILL.md',
+                     'kimi/AGENTS.md'):
+            with self.subTest(path=path):
+                text = ' '.join(self.text(path).split())
+                self.assertIn('A `FIX r<K> (final)` round has no revmux round after it', text)
+                self.assertIn('A Major never arrives in a final round.', text)
 
 
 if __name__ == "__main__":

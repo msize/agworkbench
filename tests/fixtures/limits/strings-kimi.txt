@@ -1,0 +1,18 @@
+"provider.rate_limit",
+"provider.rate_limit": {
+.auth_error":"auth","provider.rate_limit":"rateLimit","provider.overloaded":"overloaded","provider.filtered":"filtered","provider.api_error":"api","context.overflow":"contextOverflow"};function wT(e,t){const n=[],i=(r,a)=>{typeof a=="number"||typeof a=="boolean"?n.push({label:r,value:String(a)}):typeof a=="string"&&a.length>0&&n.push({label:r,value:a})};i(t("warnings.details.code"),e.code);const o
+/check your account balance/,
+/exceeded your current (?:token )?quota/,
+/insufficient balance/,
+KIMI_QUOTA_EXHAUSTED_ERROR_CODES = new Set(["exceeded_current_quota_error"]);
+PROVIDER_API_ERROR_CODE = "provider.api_error";
+PROVIDER_RATE_LIMIT: "provider.rate_limit",
+PROVIDER_RATE_LIMIT_ERROR_CODE = "provider.rate_limit";
+check your account balance
+const base = `Retrying (${retry.nextAttempt}/${retry.maxAttempts}) · ${retry.errorName}`;
+exceeded your current (?:token )?quota
+exceeded_current_quota_error
+insufficient balance
+return "If this persists, run `/export-debug-zip` and share the file with us for diagnosis. Please don't share it publicly.";
+return `[${error.code}] ${error.message}`;
+this.showStatus(`Error: ${message}`, "error");

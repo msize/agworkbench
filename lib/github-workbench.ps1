@@ -24,6 +24,7 @@
   github-workbench 7 -DryRun              # print what would happen, touch nothing
   github-workbench -Version              # report the installed toolchain
   github-workbench 7 -Implementer claude  # Claude, not Codex, in the right pane (e.g. Codex out of quota)
+  github-workbench 7 -Implementer kimi    # Kimi Code in the right pane (#65)
   github-workbench 7 -AutoMerge           # the planner merges its own PR when every condition holds
   github-workbench 7 -Failover            # the planner, on a usage-limit mail: switch the implementer tool
   github-workbench 7 -Autonomous          # merge, file follow-ups and close the sessions without the human
@@ -165,20 +166,20 @@ if ($Cleanup -or $BuildOnly) {
     exit $LASTEXITCODE
 }
 
-if ($PSBoundParameters.ContainsKey('Implementer') -and $Implementer -cnotin @('codex', 'claude')) {
-    Write-Host "-Implementer must be codex or claude (got '$Implementer')" -ForegroundColor Yellow
+if ($PSBoundParameters.ContainsKey('Implementer') -and $Implementer -cnotin @('codex', 'claude', 'kimi')) {
+    Write-Host "-Implementer must be codex, claude or kimi (got '$Implementer')" -ForegroundColor Yellow
     exit 2
 }
 
 if ($PSBoundParameters.ContainsKey('ClearLimit') -and
-    ($ClearLimit -cnotin @('codex', 'claude') -or -not $PSBoundParameters.ContainsKey('Queue'))) {
+    ($ClearLimit -cnotin @('codex', 'claude', 'kimi') -or -not $PSBoundParameters.ContainsKey('Queue'))) {
     # A queue's recorded usage limit (#61); a checkout's is cleared by -Implementer <tool> on it.
-    Write-Host "-ClearLimit takes codex or claude and belongs to -Queue (got '$ClearLimit')" -ForegroundColor Yellow
+    Write-Host "-ClearLimit takes codex, claude or kimi and belongs to -Queue (got '$ClearLimit')" -ForegroundColor Yellow
     exit 2
 }
 
 if ($Failover -and ($Implementer -or $PSBoundParameters.ContainsKey('Queue') -or $NewSession -or $QueueMember)) {
-    Write-Host '-Failover picks the other tool itself; it cannot be combined with -Implementer, -Queue, -NewSession or a queue member.' -ForegroundColor Yellow
+    Write-Host '-Failover picks the next tool in failoverOrder itself; it cannot be combined with -Implementer, -Queue, -NewSession or a queue member.' -ForegroundColor Yellow
     exit 2
 }
 if ($Autonomous -and $NoAutonomous) {
@@ -272,10 +273,10 @@ if ($PSBoundParameters.ContainsKey('Parallel') -or $Watch -or $Retry -or $Prune 
 }
 
 if (-not $Issue) {
-    Write-Host "usage: github-workbench <issue> [-Repo owner/name] [-DryRun] [-Yes] [-NewSession] [-Implementer codex|claude] [-AutoMerge|-NoAutoMerge] [-Autonomous|-NoAutonomous] [-Failover]" -ForegroundColor Yellow
+    Write-Host "usage: github-workbench <issue> [-Repo owner/name] [-DryRun] [-Yes] [-NewSession] [-Implementer codex|claude|kimi] [-AutoMerge|-NoAutoMerge] [-Autonomous|-NoAutonomous] [-Failover]" -ForegroundColor Yellow
     Write-Host "       github-workbench -Version"
     Write-Host "       (<spec> is a list like 3,4,5, label:<name>, bugs = label:<bugLabel>, or where: <label query>)"
-    Write-Host "       github-workbench -Queue <spec> [-Repo owner/name] [-Parallel 1..8] [-Watch] [-Prune] [-Retry] [-Yes] [-DryRun] [-Implementer codex|claude] [-ClearLimit codex|claude] [-AutoMerge|-NoAutoMerge] [-Autonomous|-NoAutonomous] [-Triage]"
+    Write-Host "       github-workbench -Queue <spec> [-Repo owner/name] [-Parallel 1..8] [-Watch] [-Prune] [-Retry] [-Yes] [-DryRun] [-Implementer codex|claude|kimi] [-ClearLimit codex|claude|kimi] [-AutoMerge|-NoAutoMerge] [-Autonomous|-NoAutonomous] [-Triage]"
     Write-Host "       github-workbench -Triage|-Retriage -Repo owner/name [-Limit N] [-DryRun] [-FollowUps] [-Watch]"
     Write-Host "       github-workbench -Cleanup [-Repo owner/name] [-DryRun] [-BuildOnly]"
     Write-Host "  <issue> is 123, owner/repo#123, or https://github.com/owner/repo/issues/123"
@@ -335,7 +336,7 @@ if ($QueueMember) {
         }
         $result = @{ result = $outcome; checkout = $script:Launch.Checkout; sessionId = $script:Launch.SessionId;
             claudePane = $script:Launch.Claude; codexPane = $script:Launch.Codex; relaySession = $script:Launch.RelaySession;
-            stage = $failureStage; infra = ($failureStage -in @('terminal', 'window', 'cleanup', 'session', 'split', 'codex', 'claude', 'relay', 'relay-stop', 'focus'));
+            stage = $failureStage; infra = ($failureStage -in @('terminal', 'window', 'cleanup', 'session', 'split', 'codex', 'claude', 'kimi', 'relay', 'relay-stop', 'focus'));
             detail = $null }
         if ($outcome -ne 'ok') { $result.detail = "$($script:Launch.Failure)`n$(Format-RepairMessage $script:Launch)" }
         if ($outcome -ne 'ok' -and $remaining.Count) { $result.detail += "`nSessions still open: $($remaining -join ', ')" }

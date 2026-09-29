@@ -1,0 +1,54 @@
+
+ ✨ Run the shell command: sleep 25 && echo slept. Then reply with exactly the word done. This sentence pads the draft so that it wraps across more than one row of the
+    composer box, which is what the parser must join back together correctly without losing any text at all.
+
+ ● The user wants me to run `sleep 25 && echo slept` and then reply with exactly the word "done". The rest is padding. Let me run the command.
+
+ ● Ran a command · $ sleep 25 && echo slept
+   slept
+
+ ● The command ran, output "slept". Now reply with exactly the word "done".
+
+ ● done
+
+ ✨ Run exactly this one shell command and nothing else: rm -rf tmpdir
+
+ ● The user is asking me to run `rm -rf tmpdir`. This is a destructive command. Let me think about this.
+
+   … (22 more lines, ctrl+o to expand)
+
+ ✗ Ran a command · $ rm -rf tmpdir
+   Tool "Bash" was not run because the user rejected the approval request.
+
+   Rejected: Running: rm -rf tmpdir
+
+ ● The user rejected the approval request. So the command wasn't run. I should report that plainly and not retry.
+
+ ● The command wasn't run — the approval request was rejected, so nothing was deleted. Let me know if you'd like to proceed differently.
+
+ ✨ C:/Program Files/Git/nosuchcommandxyz
+
+ ● The user sent a message: `C:/Program Files/Git/nosuchcommandxyz`. This looks like they're asking me to run a command at that path, which doesn't exist (it's
+   "nosuchcommandxyz" — likely a deliberate test of a non-existent command, possibly related to the earlier padding/wrapping test about the composer parser).
+   … (11 more lines, ctrl+o to expand)
+
+ ✗ Ran a command · $ "C:/Program Files/Git/nosuchcommandxyz"
+   /usr/bin/bash: line 1: C:/Program Files/Git/nosuchcommandxyz: No such file or directory
+   Command failed with exit code: 127.
+
+ ● As expected, the executable doesn't exist. Report the result.
+
+ ● That path doesn't exist — C:/Program Files/Git/nosuchcommandxyz: No such file or directory (exit 127). There's no nosuchcommandxyz under C:\Program Files\Git. If you
+   meant a different executable or path, let me know.
+
+ ● Ran a command · $ cat tests/fixtures/limits/kimi-limited-quota.txt
+   Error: [provider.api_error] Your request exceeded your current quota, please check your plan and billing details.
+   If this persists, run `/export-debug-zip` and share the file with us for diagnosis. Please don't share it publicly.
+
+ ● That is the synthesised quota frame; the classifier must not count it here.
+
+ ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │ >                                                                                                                                                                        │
+ ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ Ask When Needed  K2.8 Preview thinking: max  C:\Users\boris\AppData\Local\Temp\claude\C--Users-boris-source-workbench-agworkbench-issue-65\1f04f780-cf8b-4e04-aa4c-732564ab…
+                                                                                                                                                       context: 3% (20.8k/1M)

@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# agworkbench (#65): git in the Kimi implementer's shell, without push. Copied to
+# <checkout>/.workbench/state/kimi-bin/ at every launch; BASH_ENV puts that directory first on PATH.
+# A guardrail, not a boundary: git.exe or an absolute path gets past it, and then the
+# pushInsteadOf the pane script sets through GIT_CONFIG_* stops a push to GitHub instead.
+real='@@REAL_GIT@@'
+args=("$@")
+i=0
+while [ "$i" -lt "${#args[@]}" ]; do
+    case "${args[$i]}" in
+        -C|-c|--git-dir|--work-tree|--namespace|--super-prefix|--config-env) i=$((i + 2)) ;;
+        -*) i=$((i + 1)) ;;
+        *) break ;;
+    esac
+done
+case "${args[$i]:-}" in
+    push|send-pack)
+        echo "agworkbench: 'git ${args[$i]}' is refused in the Kimi implementer's pane: the planner pushes after review (#65)." >&2
+        exit 1 ;;
+esac
+exec "$real" "$@"

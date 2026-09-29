@@ -1,0 +1,39 @@
+ boris on  ~/AppData/Local/Temp/claude/C--Users-boris-source-workbench-agworkbench-issue-65/1f04f780-cf8b-4e04-aa4c-732564abee4a/scratchpad/kimiframes
+# pwsh -NoLogo -ExecutionPolicy Bypass -File ./run.ps1
+Use 'Show-Help' to list all available functions
+WARNING: oh-my-posh theme not found at C:\Users\boris\cobalt2.omp.json.
+
+ ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │                                                                                                                                                                          │
+ │  ▐█▛█▛█▌  Welcome to Kimi Code!                                                                                                                                          │
+ │  ▐█████▌  Send /help for help information.                                                                                                                               │
+ │                                                                                                                                                                          │
+ │  Directory: C:\Users\boris\AppData\Local\Temp\claude\C--Users-boris-source-workbench-agworkbench-issue-65\1f04f780-cf8b-4e04-aa4c-732564abee4a\scratchpad\kimiframes\proj│
+ │  Session:   session_e25ae5d4-5ffe-47bb-9b56-5570ca5f2590                                                                                                                 │
+ │  Model:     K2.8 Preview                                                                                                                                                 │
+ │  Version:   2.1.1                                                                                                                                                        │
+ │                                                                                                                                                                          │
+ ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ✦ Kimi Code Desktop is here — Everything you love about Kimi Code, now on desktop
+   Run /desktop or visit https://www.kimi.com/code to install
+
+   No session yet — one will be created on your first message.
+
+ ✨ Run the shell command: sleep 25 && echo slept. Then reply with exactly the word done. This sentence pads the draft so that it wraps across more than one row of the
+    composer box, which is what the parser must join back together correctly without losing any text at all.
+
+ ● The user wants me to run `sleep 25 && echo slept` and then reply with exactly the word "done". The rest is padding. Let me run the command.
+
+ ● Ran a command · $ sleep 25 && echo slept
+   slept
+
+ ● The command ran, output "slept". Now reply with exactly the word "done".
+
+ ● done
+
+ ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │ >                                                                                                                                                                        │
+ ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ Ask When Needed  K2.8 Preview thinking: max  C:\Users\boris\AppData\Local\Temp\claude\C--Users-boris-source-workbench-agworkbench-issue-65\1f04f780-cf8b-4e04-aa4c-732564ab…
+                                                                                                                                                       context: 2% (19.7k/1M)

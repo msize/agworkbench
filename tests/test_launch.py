@@ -146,7 +146,7 @@ class CodexLaunch(unittest.TestCase):
         self.assertIn("-c model=o3", self.composed({"codexArgs": ["-c", "model=o3"]}))
 
 
-COMPONENTS = ("agworkbench", "agwinterm", "claude", "codex", "revmux", "revdiff", "gh")
+COMPONENTS = ("agworkbench", "agwinterm", "claude", "codex", "kimi", "revmux", "revdiff", "gh")
 MODULE_VERSION = "v0.0.0-20260820161812-4b87635251dc"
 WINDOWS_PS = shutil.which("powershell.exe")
 
@@ -172,6 +172,7 @@ class VersionFixtures(unittest.TestCase):
                   arguments="version")
         self.stub("claude", ["2.1.278 (Claude Code)"], arguments="--version")
         self.stub("codex", ["codex-cli 0.154.0"], arguments="--version")
+        self.stub("kimi", ["2.1.1"], arguments="--version")
         self.stub("revmux", ["revmux unknown"], arguments="--version")
         self.stub("revdiff", ["version: unknown"], arguments="--version")
         self.stub("gh", ["gh version 2.94.0 (2026-06-10)", "https://example.invalid/releases"],
@@ -232,9 +233,9 @@ class VersionProbe(VersionFixtures):
         self.assertEqual([expected for _, expected in cases],
                          [json.loads(line) for line in result.stdout.splitlines()])
 
-    def test_all_seven_from_stubs(self):
+    def test_all_eight_from_stubs(self):
         self.assertEqual(dict(zip(COMPONENTS, [f"0408866-dirty ({ROOT})", "0.20.9", "2.1.278",
-                                              "0.154.0", MODULE_VERSION, MODULE_VERSION, "2.94.0"])),
+                                              "0.154.0", "2.1.1", MODULE_VERSION, MODULE_VERSION, "2.94.0"])),
                          self.probe_report())
 
     def test_duplicate_path_matches_use_the_first_application(self):
@@ -276,7 +277,8 @@ class VersionProbe(VersionFixtures):
 
     def test_everything_missing(self):
         self.env["PATH"] = str(self.tools / "empty")
-        values = self.probe_report("function Get-AgwintermCtl { return $null }; ")
+        # Find-KimiExe's last resort is the real ~/.kimi-code/bin/kimi.exe, which a test never reads.
+        values = self.probe_report("function Get-AgwintermCtl { return $null }; function Find-KimiExe($Config) { return $null }; ")
         self.assertEqual(f"unversioned ({ROOT})", values.pop("agworkbench"))
         self.assertEqual({"missing"}, set(values.values()))
 
@@ -1376,7 +1378,7 @@ class QueueEntry(LauncherFixtures):
                 result = subprocess.run([PWSH, '-NoProfile', '-File', str(self.entry_lib / 'github-workbench.ps1'), *extra],
                                         env=self.env, cwd=ROOT, capture_output=True, text=True, timeout=45)
                 self.assertEqual(2, result.returncode, result.stdout + result.stderr)
-                self.assertIn('-ClearLimit takes codex or claude and belongs to -Queue', result.stdout)
+                self.assertIn('-ClearLimit takes codex, claude or kimi and belongs to -Queue', result.stdout)
 
     def test_a_query_spec_reaches_the_conductor_exactly_under_both_shells(self):
         # #38: 5.1 strips double quotes from a native argument; the spec goes through the environment.
@@ -1718,6 +1720,16 @@ class QueueEntry(LauncherFixtures):
         self.assertEqual(('incomplete', 'window', True),
                          (launch['result'], launch['stage'], launch['infra']))
         self.assertFalse(any(c[:2] == ['session', 'type'] for c in self.calls()))
+
+    def test_a_kimi_refusal_is_infrastructure_not_a_failed_member(self):
+        # FIX r2 m1: a machine that cannot run kimi defers the member with back-off.
+        self.write_helpers("\nfunction Get-KimiProblem { return 'kimi not found: a test machine without kimi' }\n")
+        result = self.entry('-Implementer', 'kimi')
+        self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+        launch = self.store.load()['members'][0]['result']
+        self.assertEqual(('kimi', True), (launch['stage'], launch['infra']))
+        self.assertIn('the Kimi implementer cannot start: kimi not found', launch['detail'])
+        self.assertFalse(any(c[:2] in (['session', 'new'], ['session', 'restore']) for c in self.calls()))
 
     def test_terminal_start_failure_is_infrastructure(self):
         self.env['AGWINTERM_ENABLED'] = '0'
@@ -2797,7 +2809,7 @@ class ClaudeImplementer(LauncherFixtures):
                                  '-Implementer', 'aider'], env=self.env, cwd=ROOT, capture_output=True, text=True,
                                 encoding='utf-8', errors='replace', timeout=20)
         self.assertEqual(2, result.returncode, result.stdout + result.stderr)
-        self.assertIn('-Implementer must be codex or claude', result.stdout)
+        self.assertIn('-Implementer must be codex, claude or kimi', result.stdout)
         self.assertFalse(self.calls())
 
     # --- B2: relay restart on a tool change, same panes ---------------------------------------------
@@ -3433,7 +3445,7 @@ class FailoverLaunch(LauncherFixtures):
                                          '-Failover', *extra], env=self.env, cwd=ROOT, capture_output=True,
                                         text=True, encoding='utf-8', errors='replace', timeout=20)
                 self.assertEqual(2, result.returncode, result.stdout + result.stderr)
-                self.assertIn('-Failover picks the other tool itself', result.stdout)
+                self.assertIn('-Failover picks the next tool in failoverOrder itself', result.stdout)
 
     def test_dry_run_describes_the_failover_and_acts_on_nothing(self):
         self.cmd('gh', 'echo {"title":"fix-x","state":"OPEN"}\nexit /b 0')
@@ -3504,6 +3516,461 @@ class AgentRoots(LauncherFixtures):
                  dict(ProcessId=22, ParentProcessId=1, Name='claude.exe', CommandLine='claude.exe --session-id 88888888-8888-4888-8888-888888888888')]
         self.assertEqual([21], self.roots('claude', table, identity=sid))
         self.assertEqual([], self.roots('claude', table[:1] + table[2:], identity=sid))
+
+    def test_kimi_root_is_the_child_of_this_checkouts_pane_shell(self):
+        # #65: `kimi -c` carries nothing of the checkout; its parent, the pane's pwsh, does.
+        co = str(self.checkout)
+        table = [dict(ProcessId=30, ParentProcessId=1, Name='pwsh.exe',
+                      CommandLine=f'"C:\\pwsh.exe" -NoLogo -ExecutionPolicy Bypass -File C:\\agw\\lib\\pane-implementer-kimi.ps1 -Checkout {co} -Issue o/repo#7 -Resume'),
+                 dict(ProcessId=31, ParentProcessId=30, Name='kimi.exe', CommandLine='kimi.exe --yolo -c'),
+                 dict(ProcessId=32, ParentProcessId=31, Name='kimi.exe', CommandLine='kimi.exe --yolo -c'),   # an auto-update re-exec
+                 dict(ProcessId=40, ParentProcessId=1, Name='pwsh.exe',
+                      CommandLine=f"pwsh -File pane-implementer-kimi.ps1 -Checkout '{co}0' -Issue o/repo#70"),
+                 dict(ProcessId=41, ParentProcessId=40, Name='kimi.exe', CommandLine='kimi.exe --yolo'),
+                 dict(ProcessId=50, ParentProcessId=1, Name='kimi.exe', CommandLine='kimi.exe --yolo'),
+                 dict(ProcessId=60, ParentProcessId=1, Name='pwsh.exe', CommandLine=f'pwsh -File pane-codex.ps1 -Checkout {co}'),
+                 dict(ProcessId=61, ParentProcessId=60, Name='kimi.exe', CommandLine='kimi.exe')]
+        self.assertEqual([31], self.roots('kimi', table))
+        quoted = [dict(table[0], CommandLine=f"pwsh -File 'C:\\agw\\lib\\pane-implementer-kimi.ps1' -Checkout '{co}' -Issue 'o/repo#7'")] + table[1:2]
+        self.assertEqual([31], self.roots('kimi', quoted))
+        self.assertEqual([], self.roots('kimi', table[3:]))
+
+
+KIMI_FRAMES = ROOT / 'tests' / 'fixtures' / 'kimi'
+KIMI_STUB = r"""@echo off
+if "%1"=="doctor" (
+  echo Kimi doctor stub
+  exit /b %STUB_KIMI_DOCTOR%
+)
+if "%1"=="session" (
+  if defined STUB_KIMI_SESSION (echo [{"id":"%STUB_KIMI_SESSION%","workDir":"x"}]) else (echo [])
+  exit /b 0
+)
+if "%1"=="--version" (
+  echo 2.1.1
+  exit /b 0
+)
+>>"%STUB_KIMI_CALLS%" echo ARGS %*
+>>"%STUB_KIMI_CALLS%" echo ENV AI_BOX=%AI_BOX% AI_HUB=%AI_HUB% GH_TOKEN=%GH_TOKEN% BASH_ENV=%BASH_ENV% GIT_CONFIG_COUNT=%GIT_CONFIG_COUNT% NOUPDATE=%KIMI_CODE_NO_AUTO_UPDATE%
+>>"%STUB_KIMI_CALLS%" echo CWD %CD%
+exit /b 0
+"""
+
+
+def with_git(env):
+    """The kimi checks look for Git Bash next to git (Kimi's shell), so the kimi fixtures keep git."""
+    git = shutil.which('git')
+    if git:
+        env['PATH'] = env['PATH'] + os.pathsep + str(Path(git).parent)
+
+
+class KimiImplementer(LauncherFixtures):
+    """#65: Kimi Code as a third implementer. The kimi executable is always a stub (kimiPath), and
+    KIMI_CODE_HOME points at a temp dir: no test runs the real kimi or reads ~/.kimi-code."""
+    state = ClaudeImplementer.state
+    relay_line = ClaudeImplementer.relay_line
+    typed_right = ClaudeImplementer.typed_right
+    pins = ClaudeImplementer.pins
+
+    def setUp(self):
+        super().setUp()
+        self.kimi = self.temp / 'kimi.cmd'
+        self.kimi.write_text(KIMI_STUB, encoding='utf-8')
+        self.kimi_home = self.temp / 'kimi-home'
+        self.kimi_home.mkdir()
+        self.guard_on()
+        self.kimi_calls = self.temp / 'kimi-calls.txt'
+        self.env.update(KIMI_CODE_HOME=str(self.kimi_home), STUB_KIMI_DOCTOR='0', STUB_KIMI_CALLS=str(self.kimi_calls))
+        self.env.pop('STUB_KIMI_SESSION', None)
+        with_git(self.env)
+        self.configure()
+
+    def guard_on(self):
+        (self.kimi_home / 'config.toml').write_text('[tools]\ndisabled = ["FetchURL", "WebSearch"]\n', encoding='utf-8')
+
+    def configure(self, **settings):
+        config = dict(checkoutRoot=str(self.temp), kimiPath=str(self.kimi))
+        config.update(settings)
+        self.config_path.write_text(json.dumps({k: v for k, v in config.items() if v is not None}), encoding='utf-8')
+
+    def body(self, implementer=None, extra=''):
+        switch = f" -Implementer {implementer}" if implementer else ''
+        return ps(self.setup_ps() +
+                  "function Get-IssueInfo { return @{title='fix-x'; state='OPEN'} }; "
+                  "function New-IssueCheckout { Connect-LaunchLog " + ps_quote(self.log_path) +
+                  "; return @{Dir=" + ps_quote(self.checkout) + "; Branch='issue-7-fix-x'} }; "
+                  "function Grant-CodexTrust {}; function Grant-ClaudeTrust {}; "
+                  "$ok=Invoke-LaunchSafely { Invoke-LauncherBody -Issue 'o/repo#7' -NewSession" + switch + extra + " }; "
+                  "if (-not $ok) { Write-Output \"EXIT=$($script:Launch.ExitCode)\"; exit 1 }", env=self.env)
+
+    def dry_run(self, *extra):
+        self.cmd('gh', 'echo {"title":"fix-x","state":"OPEN"}\nexit /b 0')
+        env = {k: v for k, v in self.env.items() if not k.startswith('AGWINTERM_')}
+        return subprocess.run([PWSH, '-NoProfile', '-File', str(LIB / 'github-workbench.ps1'), 'o/repo#7',
+                               '-NewSession', '-DryRun', *extra], env=env, cwd=ROOT, capture_output=True, text=True,
+                              encoding='utf-8', errors='replace', timeout=30)
+
+    def pane_env(self):
+        # The pane script needs git (Kimi's shell is the Git Bash next to it) and python.
+        return dict(self.env, PATH=str(self.temp) + os.pathsep + os.environ['PATH'])
+
+    def pane(self, *switches):
+        command = ('& ./lib/pane-implementer-kimi.ps1 -Checkout ' + ps_quote(self.checkout) + " -Issue 'o/repo#7' " +
+                   ' '.join(switches))
+        return ps(command, env=self.pane_env())
+
+    def git_init(self):
+        subprocess.run(['git', '-C', str(self.checkout), 'init', '-q'], check=True, capture_output=True)
+
+    # --- AC1: the dry run -------------------------------------------------------------------------
+
+    def test_dry_run_shows_the_kimi_pane_relay_and_checks_and_writes_nothing(self):
+        result = self.dry_run('-Implementer', 'kimi')
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertIn('implementer: kimi (revmux profile claude-only)', result.stdout)
+        self.assertIn('pane-implementer-kimi.ps1', result.stdout)
+        self.assertIn('--implementer-tool kimi', result.stdout)
+        self.assertIn(f'kimi: {self.kimi}; web tools checked off', result.stdout)
+        self.assertFalse((self.checkout / '.workbench').exists())
+        self.assertFalse(self.calls())
+        self.assertFalse(self.kimi_calls.exists())
+        (self.kimi_home / 'config.toml').unlink()
+        refused = self.dry_run('-Implementer', 'kimi')
+        self.assertEqual(0, refused.returncode, refused.stdout + refused.stderr)
+        self.assertIn('kimi: would refuse:', refused.stdout)
+        self.assertIn('disabled = ["FetchURL", "WebSearch"]', refused.stdout)
+
+    # --- AC1/AC3: a real launch ---------------------------------------------------------------------
+
+    def test_kimi_composes_right_pane_relay_mailbox_and_pin(self):
+        result = self.body('kimi')
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        line = self.typed_right()[0].rstrip('\n')
+        self.assertIn("pane-implementer-kimi.ps1'", line)
+        self.assertNotIn('-Resume', line)
+        self.assertEqual(line + ' -Resume', self.pins()[RIGHT_ID])          # the restart pin resumes (-c)
+        self.assertTrue(self.relay_line().endswith("--implementer-tool 'kimi'"))
+        agents = self.state('agents.json')['agents']
+        self.assertEqual(('kimi', RIGHT_ID), (agents['codex']['tool'], agents['codex']['pane']))
+        self.assertEqual({'tool': 'kimi', 'revmuxProfile': 'claude-only', 'autoMerge': False, 'autonomous': False,
+                          'cleanup': 'merged'}, self.state('implementer.json'))
+        self.assertIn('Kimi implementer starting in the right pane', result.stdout)
+        self.assertFalse((self.checkout / '.workbench/state/implementer-claude.json').exists())
+
+    def test_config_selects_kimi_and_other_tools_are_unchanged(self):
+        self.configure(implementer='kimi')
+        result = self.body()
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertEqual('kimi', self.state('implementer.json')['tool'])
+        self.configure(implementer='kimi', revmuxProfile='comprehensive')
+        chosen = ps(". ./lib/Workbench.ps1; Get-RevmuxProfile kimi 'comprehensive'", env=self.env)
+        self.assertEqual('comprehensive', chosen.stdout.strip())                 # revmuxProfile wins
+        for tool, profile in (('codex', 'comprehensive'), ('claude', 'claude-only'), ('kimi', 'claude-only')):
+            with self.subTest(tool=tool):
+                out = ps(f". ./lib/Workbench.ps1; Get-RevmuxProfile {tool} $null", env=self.env)
+                self.assertEqual(profile, out.stdout.strip())
+
+    def test_a_launch_refuses_before_anything_is_recorded(self):
+        cases = [
+            ('missing', lambda: self.configure(kimiPath=str(self.temp / 'no-kimi.exe')), 'kimi not found at kimiPath'),
+            ('doctor', lambda: self.env.update(STUB_KIMI_DOCTOR='3'), "doctor' failed (exit 3): Kimi doctor stub"),
+            ('web tools', lambda: (self.kimi_home / 'config.toml').write_text('[tools]\ndisabled = ["FetchURL"]\n', encoding='utf-8'),
+             'WebSearch are on'),
+            ('bad toml', lambda: (self.kimi_home / 'config.toml').write_text('[tools\n', encoding='utf-8'), 'cannot read'),
+            # FIX r1 m1: the pane's own refusals are checked here too, before anything is recorded.
+            ('kimiArgs', lambda: self.configure(kimiArgs=['--yolo']), "kimiArgs: '--yolo' would re-decide"),
+            ('foreign role file', self.foreign_role, 'not written by agworkbench'),
+        ]
+        for name, breaks, reason in cases:
+            with self.subTest(case=name):
+                self.configure()
+                self.env['STUB_KIMI_DOCTOR'] = '0'
+                self.guard_on()
+                shutil.rmtree(self.checkout / '.kimi-code', ignore_errors=True)
+                breaks()
+                result = self.body('kimi')
+                self.assertEqual(1, result.returncode, result.stdout)
+                self.assertIn('EXIT=2', result.stdout)
+                self.assertIn('the Kimi implementer cannot start', result.stdout)
+                self.assertIn(reason, result.stdout)
+                self.assertFalse(any(c[:2] in (['session', 'new'], ['session', 'restore']) for c in self.calls()))
+                self.assertFalse((self.checkout / '.workbench/state/implementer.json').exists())
+
+    def foreign_role(self):
+        role = self.checkout / '.kimi-code/AGENTS.md'
+        role.parent.mkdir(parents=True, exist_ok=True)
+        role.write_text("the repository's own notes\n", encoding='utf-8')
+
+    def test_allow_network_needs_no_web_tool_config(self):
+        (self.kimi_home / 'config.toml').unlink()
+        self.configure(allowNetwork=True)
+        result = self.body('kimi')
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+
+    def test_executable_resolution_order(self):
+        path_stub = self.temp / 'bin'
+        path_stub.mkdir()
+        (path_stub / 'kimi.cmd').write_text('@echo off\n', encoding='utf-8')
+        env = dict(self.env, PATH=str(path_stub) + os.pathsep + self.env['PATH'])
+        find = lambda config: ps(". ./lib/Workbench.ps1; Find-KimiExe " + config, env=env).stdout.strip()
+        self.assertEqual(str(self.kimi), find("@{kimiPath=" + ps_quote(self.kimi) + "}"))           # kimiPath first
+        self.assertEqual(str(path_stub / 'kimi.cmd'), find('@{kimiPath=$null}'))                     # then PATH
+        self.assertEqual('', find("@{kimiPath=" + ps_quote(self.temp / 'none.exe') + "}"))           # never a guess
+
+    def test_config_values_are_validated(self):
+        for settings, message in (({'implementer': 'Kimi'}, 'codex, claude or kimi'), ({'kimiPath': 7}, 'kimiPath'),
+                                  ({'kimiPath': ''}, 'kimiPath'), ({'kimiArgs': [1]}, 'kimiArgs'),
+                                  ({'failoverOrder': ['codex']}, 'failoverOrder'), ({'failoverOrder': ['codex', 'codex']}, 'failoverOrder'),
+                                  ({'failoverOrder': ['codex', 'aider']}, 'failoverOrder'), ({'failoverOrder': 'codex,claude'}, 'failoverOrder')):
+            with self.subTest(settings=settings):
+                self.configure(**settings)
+                result = ps('. ./lib/Workbench.ps1; Get-WorkbenchConfig | Out-Null', env=self.env)
+                self.assertNotEqual(0, result.returncode)
+                self.assertIn(message, result.stdout + result.stderr)
+        self.configure(failoverOrder=['kimi', 'claude'], kimiArgs=['-m', 'k2'])
+        out = ps(". ./lib/Workbench.ps1; $c = Get-WorkbenchConfig; ($c.failoverOrder -join ','), ($c.kimiArgs -join ' ')", env=self.env)
+        self.assertEqual(['kimi,claude', '-m k2'], out.stdout.split('\n')[:2])
+
+    def test_entry_accepts_kimi_and_refuses_unknown_tools(self):
+        result = subprocess.run([PWSH, '-NoProfile', '-File', str(LIB / 'github-workbench.ps1'), 'o/repo#7',
+                                 '-Implementer', 'aider'], env=self.env, cwd=ROOT, capture_output=True, text=True,
+                                encoding='utf-8', errors='replace', timeout=20)
+        self.assertEqual(2, result.returncode, result.stdout + result.stderr)
+        self.assertIn('-Implementer must be codex, claude or kimi', result.stdout)
+        clear = subprocess.run([PWSH, '-NoProfile', '-File', str(LIB / 'github-workbench.ps1'), '-Queue', 'o/repo#7',
+                                '-ClearLimit', 'aider'], env=self.env, cwd=ROOT, capture_output=True, text=True,
+                               encoding='utf-8', errors='replace', timeout=20)
+        self.assertEqual(2, clear.returncode)
+        self.assertIn('-ClearLimit takes codex, claude or kimi', clear.stdout)
+
+    # --- AC4: the pane script -----------------------------------------------------------------------
+
+    def test_pane_fresh_resume_and_environment(self):
+        self.git_init()
+        fresh = self.pane('-WhatIfOnly')
+        self.assertEqual(0, fresh.returncode, fresh.stdout + fresh.stderr)
+        self.assertIn(f"would run: {ps_quote(self.kimi)} '--yolo'\n", fresh.stdout + '\n')
+        for expected in ('would set: AI_BOX=codex', f"would set: AI_HUB={self.checkout / '.workbench'}",
+                         f'would set: AGWORKBENCH={ROOT}', 'would set: KIMI_CODE_NO_AUTO_UPDATE=1',
+                         'would set: GH_TOKEN=agworkbench-refused', 'would set: GIT_CONFIG_COUNT=5',
+                         'would set: console output encoding UTF-8',
+                         f"would set: PATH={self.checkout / '.workbench/state/kimi-bin'}"):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, fresh.stdout)
+        self.assertRegex(fresh.stdout, r'would set: KIMI_SHELL_PATH=.*\\bin\\bash\.exe')
+        self.assertRegex(fresh.stdout, r'would set: BASH_ENV=.*/\.workbench/state/kimi-bin/env\.sh')
+        self.assertNotIn('--agent-file', fresh.stdout)            # ignored by Kimi 2.1.1 in interactive mode
+        self.assertFalse((self.checkout / '.kimi-code').exists())  # -WhatIfOnly writes nothing
+        none = self.pane('-Resume', '-WhatIfOnly')
+        self.assertIn(f"would run: {ps_quote(self.kimi)} '--yolo'\n", none.stdout + '\n')
+        self.assertNotIn('would mail', none.stdout)
+        self.env['STUB_KIMI_SESSION'] = 'session_abc'
+        resumed = self.pane('-Resume', '-WhatIfOnly')
+        self.assertIn(f"would run: {ps_quote(self.kimi)} '--yolo' '-c'", resumed.stdout)
+        self.assertIn('would mail box codex from relay: resumed after restart', resumed.stdout)
+
+    def test_pane_refuses_policy_and_session_arguments(self):
+        self.git_init()
+        for flag in ['--auto', '--Auto', '--yolo', '-y', '--yes', '--auto-approve', '-c', '--continue', '-S',
+                     '--session', '--session=abc', '--agent', '--agent=x', '--agent-file', '--skills-dir', '--add-dir',
+                     '--add-dir=C:/', '-p', '--prompt', '--plan', '--output-format', '-yc', '-my']:
+            with self.subTest(flag=flag):
+                self.configure(kimiArgs=[flag])
+                result = self.pane('-WhatIfOnly')
+                self.assertNotEqual(0, result.returncode)
+                self.assertNotIn('would run:', result.stdout)
+                self.assertIn('approval mode, session or agent', result.stdout + result.stderr)
+        self.configure(kimiArgs=['-m', 'kimi-k2'])
+        self.assertIn("'--yolo' '-m' 'kimi-k2'", self.pane('-WhatIfOnly').stdout)
+
+    def test_pane_run_sets_the_environment_writes_the_role_and_trusts_the_clone(self):
+        self.git_init()
+        self.registry_path.parent.mkdir(parents=True, exist_ok=True)
+        self.registry_path.write_text('{}', encoding='utf-8')
+        result = self.pane()
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        calls = self.kimi_calls.read_text(encoding='utf-8')
+        self.assertIn('ARGS --yolo', calls)
+        self.assertIn(f"ENV AI_BOX=codex AI_HUB={self.checkout / '.workbench'} GH_TOKEN=agworkbench-refused", calls)
+        self.assertIn('GIT_CONFIG_COUNT=5 NOUPDATE=1', calls)
+        self.assertIn(f'CWD {self.checkout}', calls)
+        self.assertIn('GitHub issue o/repo#7', (self.checkout / '.kimi-code/AGENTS.md').read_text(encoding='utf-8'))
+        self.assertTrue((self.checkout / '.workbench/state/kimi-bin/git').exists())
+        trusted = list((self.kimi_home / 'workspace-trust').iterdir())
+        self.assertEqual(1, len(trusted))
+        self.assertEqual(str(self.checkout.resolve()), json.loads(trusted[0].read_text(encoding='utf-8'))['root'])
+        # A resumed pane leaves the relay a note to ring, since the relay rings each mail only once.
+        self.env['STUB_KIMI_SESSION'] = 'session_abc'
+        resumed = self.pane('-Resume')
+        self.assertEqual(0, resumed.returncode, resumed.stdout + resumed.stderr)
+        notes = list((self.checkout / '.workbench/inbox/codex').glob('*-relay-*.md'))
+        self.assertEqual(1, len(notes))
+        self.assertIn('resumed after restart', notes[0].read_text(encoding='utf-8'))
+        self.assertIn('ARGS --yolo -c', self.kimi_calls.read_text(encoding='utf-8'))
+
+    def test_pane_refuses_when_kimi_is_not_ready(self):
+        self.git_init()
+        self.env['STUB_KIMI_DOCTOR'] = '2'
+        result = self.pane()
+        self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+        self.assertIn("Cannot start the Kimi implementer: '", result.stdout)
+        self.assertFalse(self.kimi_calls.exists())
+        self.configure(kimiPath=str(self.temp / 'none.exe'))
+        missing = self.pane('-WhatIfOnly')
+        self.assertEqual(1, missing.returncode)
+        self.assertIn('kimi not found', missing.stdout)
+
+    # --- the frames the launcher reads ------------------------------------------------------------
+
+    def test_kimi_frames_are_never_a_shell_and_idle_ones_are_a_running_agent(self):
+        for path in sorted(KIMI_FRAMES.glob('*.txt')):
+            with self.subTest(frame=path.name):
+                result = ps(". ./lib/Workbench.ps1; $t = [IO.File]::ReadAllText(" + ps_quote(path) +
+                            ", [Text.Encoding]::UTF8); \"$(Test-ShellReady $t)|$(Test-ImplementerRunningFrame $t 'kimi')\"",
+                            env=self.env)
+                shell, running = result.stdout.strip().split('|')
+                self.assertEqual('False', shell)
+                if path.stem in ('idle-fresh', 'idle-after-turn', 'running-tool', 'draft-wrapped'):
+                    self.assertEqual('True', running)
+
+
+class KimiFailover(LauncherFixtures):
+    """#24/#65: -Failover off a limited Kimi, onto Kimi, and failoverOrder."""
+    state = ClaudeImplementer.state
+    frame = FailoverLaunch.frame
+    right = FailoverLaunch.right
+    typed_right = FailoverLaunch.typed_right
+    stopped_pids = FailoverLaunch.stopped_pids
+    KIMI_PID, PANE_PID = 5252, 5250
+
+    def setUp(self):
+        super().setUp()
+        self.stopped = self.temp / 'stopped.txt'
+        self.kimi = self.temp / 'kimi.cmd'
+        self.kimi.write_text(KIMI_STUB, encoding='utf-8')
+        self.kimi_home = self.temp / 'kimi-home'
+        self.kimi_home.mkdir()
+        (self.kimi_home / 'config.toml').write_text('[tools]\ndisabled = ["FetchURL", "WebSearch"]\n', encoding='utf-8')
+        self.env.update(KIMI_CODE_HOME=str(self.kimi_home), STUB_KIMI_DOCTOR='0', STUB_KIMI_CALLS=str(self.temp / 'calls.txt'))
+        with_git(self.env)
+
+    def configure(self, **settings):
+        config = dict(checkoutRoot=str(self.temp), kimiPath=str(self.kimi))
+        config.update(settings)
+        self.config_path.write_text(json.dumps(config), encoding='utf-8')
+
+    def launch(self, implementer=None):
+        result = KimiImplementer.body(self, implementer)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+
+    def failover(self, processes, timing="Stable=90; Confirm=0; Sample=0.3; Step=0.1; ShellWait=2"):
+        self.processes = lambda *extra: processes
+        return FailoverLaunch.failover(self, processes=processes, timing=timing)
+
+    def kimi_processes(self):
+        return [dict(ProcessId=self.PANE_PID, ParentProcessId=1, Name='pwsh.exe',
+                     CommandLine=f"pwsh -File pane-implementer-kimi.ps1 -Checkout '{self.checkout}' -Issue 'o/repo#7'"),
+                dict(ProcessId=self.KIMI_PID, ParentProcessId=self.PANE_PID, Name='kimi.exe', CommandLine='kimi.exe --yolo')]
+
+    def test_a_limited_kimi_is_stopped_and_claude_takes_over(self):
+        self.configure()
+        self.launch('kimi')
+        self.right(self.frame('kimi-limited-quota'))
+        result = self.failover(self.kimi_processes())
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertEqual([self.KIMI_PID], self.stopped_pids())
+        record = self.state('implementer.json')
+        self.assertEqual('claude', record['tool'])
+        self.assertIn('exceeded your current quota', record['limits']['kimi']['line'])
+        typed = self.typed_right()
+        self.assertEqual('Clear-Host\n', typed[-2])
+        self.assertIn('pane-implementer-claude.ps1', typed[-1])
+
+    def test_a_transient_rate_limit_is_refused(self):
+        self.configure()
+        self.launch('kimi')
+        self.right(self.frame('kimi-rate-limit-transient'))
+        result = self.failover(self.kimi_processes())
+        self.assertIn('EXIT=2', result.stdout)
+        self.assertIn('neither showing its own usage-limit message', result.stdout)
+        self.assertEqual([], self.stopped_pids())
+        self.assertEqual('kimi', self.state('implementer.json')['tool'])
+
+    def test_failover_order_can_put_kimi_first(self):
+        self.configure(failoverOrder=['kimi', 'claude', 'codex'])
+        self.launch()                                          # a Codex loop
+        self.right(self.frame('codex-limited-exited'))
+        result = self.failover([])
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertEqual('kimi', self.state('implementer.json')['tool'])
+        self.assertIn('pane-implementer-kimi.ps1', self.typed_right()[-1])
+
+    def test_an_unusable_kimi_is_skipped_for_the_next_tool(self):
+        self.configure(failoverOrder=['kimi', 'claude', 'codex'])
+        self.launch()
+        self.env['STUB_KIMI_DOCTOR'] = '4'
+        self.right(self.frame('codex-limited-exited'))
+        result = self.failover([])
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertEqual('claude', self.state('implementer.json')['tool'])
+
+    def test_no_usable_tool_is_refused_before_anything_is_stopped(self):
+        self.configure(failoverOrder=['codex', 'kimi'])
+        self.launch()
+        self.configure(failoverOrder=['codex', 'kimi'], kimiPath=str(self.temp / 'none.exe'))
+        self.right(self.frame('codex-limited-exited'))
+        result = self.failover([])
+        self.assertEqual(1, result.returncode, result.stdout)
+        self.assertIn('EXIT=2', result.stdout)
+        self.assertIn('failover refused: kimi is not usable: kimi not found', result.stdout)
+        self.assertEqual('codex', self.state('implementer.json')['tool'])
+        self.assertNotIn('limits', self.state('implementer.json'))
+
+    def test_a_kimi_the_pane_would_refuse_is_never_failed_over_to(self):
+        # FIX r1 m1: kimiArgs and prepare's refusals are checked before the limited Codex is stopped.
+        for name, settings, setup, reason in (
+                ('kimiArgs', {'kimiArgs': ['--yolo']}, lambda: None, "kimiArgs: '--yolo' would re-decide"),
+                ('role file', {}, lambda: KimiImplementer.foreign_role(self), 'not written by agworkbench')):
+            with self.subTest(case=name):
+                self.configure(failoverOrder=['kimi', 'codex'])
+                self.launch()
+                self.configure(failoverOrder=['kimi', 'codex'], **settings)
+                setup()
+                self.right(self.frame('codex-limited-exited'))
+                result = self.failover([])
+                self.assertEqual(1, result.returncode, result.stdout)
+                self.assertIn('EXIT=2', result.stdout)
+                self.assertIn('failover refused: kimi is not usable: ', result.stdout)
+                self.assertIn(reason, result.stdout)
+                self.assertEqual('codex', self.state('implementer.json')['tool'])
+                self.assertNotIn('limits', self.state('implementer.json'))
+                self.assertEqual([], self.stopped_pids())
+                shutil.rmtree(self.checkout / '.kimi-code', ignore_errors=True)
+
+    def test_a_failover_dry_run_off_kimi_does_not_check_the_outgoing_kimi(self):
+        # FIX r2 m2: the limited kimi is the one being replaced; its launch checks are irrelevant.
+        self.configure()
+        self.launch('kimi')
+        self.env['STUB_KIMI_DOCTOR'] = '5'
+        (self.kimi_home / 'config.toml').unlink()
+        self.cmd('gh', 'echo {"title":"fix-x","state":"OPEN"}\nexit /b 0')
+        env = {k: v for k, v in self.env.items() if not k.startswith('AGWINTERM_')}
+        result = subprocess.run([PWSH, '-NoProfile', '-File', str(LIB / 'github-workbench.ps1'), 'o/repo#7',
+                                 '-DryRun', '-Failover'], env=env, cwd=ROOT, capture_output=True, text=True,
+                                encoding='utf-8', errors='replace', timeout=30)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertIn('stop the limited kimi', result.stdout)
+        self.assertIn('then switch to claude', result.stdout)
+        self.assertNotIn('kimi: would refuse', result.stdout)
+        self.assertNotIn("runs 'kimi doctor'", result.stdout)
+
+    def test_the_default_order_keeps_codex_to_claude_and_claude_to_codex(self):
+        for saved, expected in (('codex', 'claude'), ('claude', 'codex')):
+            with self.subTest(saved=saved):
+                self.configure()
+                out = ps(". ./lib/Workbench.ps1; (Get-FailoverTarget -Checkout " + ps_quote(self.checkout) +
+                         " -Config (Get-WorkbenchConfig) -Saved " + saved + " -NoProbe).Target", env=self.env)
+                self.assertEqual(expected, out.stdout.strip(), out.stderr)
 
 
 class AutonomyLaunch(LauncherFixtures):

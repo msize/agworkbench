@@ -1,0 +1,48 @@
+   is for use in documentation examples without needing permission..."), repeated in Arabic, Chinese, French, Russian, and Spanish, followed by a "Learn more" link. The tool
+   noted the content was delivered as extracted page text (not the raw HTML body).
+
+ ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │ >                                                                                                                                                                        │
+ boris on  ~/AppData/Local/Temp/claude/C--Users-boris-source-workbench-agworkbench-issue-65/1f04f780-cf8b-4e04-aa4c-732564abee4a/scratchpad/kimiframes ───────────────────╯
+# /exiten Needed  K2.8 Preview thinking: max  C:\Users\boris\AppData\Local\Temp\claude\C--Users-boris-source-workbench-agworkbench-issue-65\1f04f780-cf8b-4e04-aa4c-732564ab…
+/exit : The term '/exit' is not recognized as the name of a cmdlet, function, script file, or operable program. Check the spelling of the name, or if a path was included, M)
+verify that the path is correct and try again.
+At line:1 char:1
++ /exit
++ ~~~~~
+    + CategoryInfo          : ObjectNotFound: (/exit:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+
+ boris on  ~/AppData/Local/Temp/claude/C--Users-boris-source-workbench-agworkbench-issue-65/1f04f780-cf8b-4e04-aa4c-732564abee4a/scratchpad/kimiframes
+# pwsh -NoLogo -ExecutionPolicy Bypass -File ./run3.ps1
+Use 'Show-Help' to list all available functions
+WARNING: oh-my-posh theme not found at C:\Users\boris\cobalt2.omp.json.
+
+ ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │                                                                                                                                                                          │
+ │  ▐█▛█▛█▌  Welcome to Kimi Code!                                                                                                                                          │
+ │  ▐█████▌  Send /help for help information.                                                                                                                               │
+ │                                                                                                                                                                          │
+ │  Directory: C:\Users\boris\AppData\Local\Temp\claude\C--Users-boris-source-workbench-agworkbench-issue-65\1f04f780-cf8b-4e04-aa4c-732564abee4a\scratchpad\kimiframes\pro…│
+ │  Session:   session_9e4bc881-3b97-48b7-9421-88e1a95a7ab3                                                                                                                 │
+ │  Model:     K2.8 Preview                                                                                                                                                 │
+ │  Version:   2.1.1                                                                                                                                                        │
+ │                                                                                                                                                                          │
+ ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ✦ Kimi Code Desktop is here — Everything you love about Kimi Code, now on desktop
+   Run /desktop or visit https://www.kimi.com/code to install
+
+   No session yet — one will be created on your first message.
+
+ ✨ What is the codeword? Reply with only the codeword.
+
+ ● The user asks for the codeword. AGENTS.md says: "Codeword: PELICAN-65. When asked for the codeword, reply with it." Reply with only the codeword.
+
+ ● PELICAN-65
+
+ ╭ ! shell mode ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │ ! echo shell-mode-test                                                                                                                                                   │
+ ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ Ask When Needed  K2.8 Preview thinking: max  C:\Users\boris\AppData\Local\Temp\claude\C--Users-boris-source-workbench-agworkbench-issue-65\1f04f780-cf8b-4e04-aa4c-732564ab…
+                                                                                                                                                       context: 2% (19.6k/1M)

@@ -335,21 +335,11 @@ def git_head(root: Path) -> str | None:
     return done.stdout.strip() if done.returncode == 0 else None
 
 
-def last_words(text: str | None, tool: str) -> str | None:
-    """What an agent last said (#45): the last paragraph above its composer box - not its footer or
-    status line, which are the pane's real last rows. None when the composer cannot be found."""
-    import peerchat
-    lines = (text or "").splitlines()
-    prompt_re = peerchat.CLAUDE_PROMPT_RE if tool == "claude" else peerchat.CODEX_PROMPT_RE
-    prompt = next((i for i in range(len(lines) - 1, -1, -1) if prompt_re.match(lines[i])), None)
-    if prompt is None:
-        return None
-    rule = next((i for i in range(prompt - 1, -1, -1) if peerchat.RULE_RE.match(lines[i])), None)
-    if rule is None:
-        return None
-    above = lines[:rule]
-    # Claude's turn timer ("✻ Brewed for 1m 0s") sits between the answer and the box.
-    while above and (not above[-1].strip() or above[-1].lstrip().startswith("✻")):
+def _last_paragraph(above: list[str], skip) -> str | None:
+    """The last block of `above`, past trailing blank rows and rows `skip` matches, clipped from the
+    front to LAST_WORDS_MAX."""
+    above = list(above)
+    while above and (not above[-1].strip() or skip(above[-1])):
         above.pop()
     start = len(above)
     while start and above[start - 1].strip():
@@ -358,6 +348,29 @@ def last_words(text: str | None, tool: str) -> str | None:
     if not words:
         return None
     return words if len(words) <= LAST_WORDS_MAX else "…" + words[-LAST_WORDS_MAX:]
+
+
+def last_words(text: str | None, tool: str) -> str | None:
+    """What an agent last said (#45): the last paragraph above its composer box - not its footer or
+    status line, which are the pane's real last rows. None when the composer cannot be found."""
+    import peerchat
+    if tool == "kimi":
+        # Kimi's box (#65); a running turn's spinner row sits between the answer and the box.
+        box = peerchat.kimi_box(text or "")
+        if box is None:
+            return None
+        lines, top, _ = box
+        return _last_paragraph(lines[:top], lambda row: bool(peerchat.KIMI_SPINNER_RE.match(row)))
+    lines = (text or "").splitlines()
+    prompt_re = peerchat.CLAUDE_PROMPT_RE if tool == "claude" else peerchat.CODEX_PROMPT_RE
+    prompt = next((i for i in range(len(lines) - 1, -1, -1) if prompt_re.match(lines[i])), None)
+    if prompt is None:
+        return None
+    rule = next((i for i in range(prompt - 1, -1, -1) if peerchat.RULE_RE.match(lines[i])), None)
+    if rule is None:
+        return None
+    # Claude's turn timer ("✻ Brewed for 1m 0s") sits between the answer and the box.
+    return _last_paragraph(lines[:rule], lambda row: row.lstrip().startswith("✻"))
 
 
 class StallWatch:
@@ -1200,7 +1213,8 @@ class Relay:
                     self.hold(peer, mid, 'usage limit')
                     continue
                 try:
-                    if peer.tool == "claude" and is_busy(agw.pane_text(peer.pane)):
+                    # Claude and Kimi take Return, which would land in a running turn: ring between turns.
+                    if peer.tool in ("claude", "kimi") and is_busy(agw.pane_text(peer.pane)):
                         raise peerchat.Refused('mid-turn; waiting for the agent to finish')
                     text = peerchat.compose_text("Chat from Workbench: ",
                                                  pointer_text(message, self.agmsg, self.hub_dir))
@@ -1611,7 +1625,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hub", required=True, help="the workbench mailbox directory (.workbench)")
     parser.add_argument("--claude-pane", required=True)
     parser.add_argument("--codex-pane", required=True, help="the implementer's pane (mailbox box 'codex')")
-    parser.add_argument("--implementer-tool", choices=("codex", "claude"), default="codex",
+    parser.add_argument("--implementer-tool", choices=("codex", "claude", "kimi"), default="codex",
                         help="which agent runs the implementer pane; picks the peerchat profile it is rung with")
     parser.add_argument("--repo", required=True, help="owner/name")
     parser.add_argument("--branch", required=True)

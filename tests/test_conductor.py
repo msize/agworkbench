@@ -2257,6 +2257,59 @@ class ToolLimits(unittest.TestCase):
         self.next_member()
         self.assertEqual([(2, None)], [(n, None if tool == 'claude' else tool) for n, tool in self.implementers])
 
+    def test_a_limited_kimi_queue_fails_over_by_the_order(self):
+        # #65: a kimi queue whose kimi is limited goes to the first free tool in failoverOrder.
+        self.start('o/r#1', implementer='kimi')
+        self.record(1, tool='kimi', kind='limited', relay=True)
+        self.next_member()
+        self.assertEqual([(2, 'claude')], self.implementers)
+        self.assertEqual('kimi', self.store.load()['implementer'])
+        self.assertEqual('kimi', self.store.load()['toolLimits']['kimi']['line'].split()[0])
+
+    def test_failover_order_is_configurable_and_skips_limited_tools(self):
+        self.config.write_text(json.dumps({'checkoutRoot': str(self.root / 'clones'),
+                                           'failoverOrder': ['kimi', 'codex', 'claude']}))
+        self.record(1)                                               # codex limited
+        self.next_member()
+        self.assertEqual([(2, 'kimi')], self.implementers)
+        self.assertEqual(('kimi', None), q.tool_route({'config': str(self.config), 'toolLimits': {
+            'codex': {'kind': 'limited', 'member': 1, 'line': 'x', 'at': 1}}}))
+        both = {'config': str(self.config), 'toolLimits': {
+            'codex': {'kind': 'limited', 'member': 1, 'line': 'x', 'at': 1},
+            'kimi': {'kind': 'limited', 'member': 2, 'line': 'y', 'at': 2}}}
+        self.assertEqual(('claude', None), q.tool_route(both))
+        self.config.write_text(json.dumps({'failoverOrder': ['codex', 'kimi']}))
+        route, reason = q.tool_route(both)
+        self.assertIsNone(route)
+        self.assertIn('no tool in failoverOrder', reason)
+        for bad in (['codex'], ['codex', 'codex'], ['codex', 'aider'], 'codex,claude'):
+            with self.subTest(order=bad):
+                self.config.write_text(json.dumps({'failoverOrder': bad}))
+                route, reason = q.tool_route(both)
+                self.assertIsNone(route)
+                self.assertIn('failoverOrder', reason)
+
+    def test_the_default_order_keeps_codex_and_claude_as_before(self):
+        limits = lambda *tools: {'config': str(self.config), 'toolLimits': {
+            tool: {'kind': 'limited', 'member': 1, 'line': tool, 'at': 1} for tool in tools}}
+        self.assertEqual(('claude', None), q.tool_route(limits('codex')))
+        self.assertIn('planner is always Claude', q.tool_route(limits('claude'))[1])
+        self.assertEqual((None, None), q.tool_route(limits('kimi')))    # a codex queue ignores a kimi limit
+        self.config.write_text(json.dumps({'failoverOrder': None}))      # null is the default too (FIX r1 m3)
+        self.assertEqual(('claude', None), q.tool_route(limits('codex')))
+
+    def test_clear_limit_and_implementer_accept_kimi(self):
+        self.record(1, tool='kimi', kind='limited', relay=True)
+        self.w.tick()
+        self.assertIn('kimi', self.store.load()['toolLimits'])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.start('o/r#1', clear_limit='kimi', implementer='kimi')
+        self.assertNotIn('toolLimits', self.store.load())
+        self.assertEqual('kimi', self.store.load()['implementer'])
+        with self.assertRaises(q.UsageError):
+            self.start('o/r#1', implementer='aider')
+
     def test_clear_limit_forgets_it_and_old_records_stay_ignored(self):
         self.record(1, at=datetime.now(timezone.utc) - timedelta(minutes=5))
         self.w.tick()
@@ -2318,7 +2371,7 @@ class ToolLimits(unittest.TestCase):
         self.assertEqual(2, self.w.errors['environment #1'])
 
     def test_malformed_tool_limits_are_refused(self):
-        for bad in ({'toolLimits': {'aider': {}}}, {'toolLimits': {'codex': {'at': 'x'}}},
+        for bad in ({'toolLimits': {'aider': {}}}, {'toolLimits': {'codex': {'at': 'x'}}}, {'implementer': 'aider'},
                     {'toolLimitsClearedAt': {'codex': 'yesterday'}}, {'toolsPaused': 3}, {'ramPaused': 3}):
             with self.subTest(bad=bad):
                 data = q.read_json(self.store.path)

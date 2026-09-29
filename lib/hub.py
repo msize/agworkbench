@@ -43,7 +43,7 @@ reload_paths()
 
 KINDS = ("message", "task", "question", "answer", "review-request", "review", "handoff", "note", "stall")
 BOX_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,40}$")
-TOOLS = ("claude", "codex", "other")
+TOOLS = ("claude", "codex", "kimi", "other")
 
 
 def now_iso() -> str:

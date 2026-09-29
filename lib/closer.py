@@ -366,7 +366,7 @@ def idle_blockers(peer, text: str) -> list[str]:
     if peerchat.is_busy(text) or (peer.tool == 'codex' and any('Working' in row for row in text.splitlines()[-6:])):
         reasons.append(f'{peer.box} is running a turn')
     profile = peerchat.PROFILES[peer.tool]
-    content = (peerchat.claude_composer(text) if peer.tool == 'claude' else peerchat.codex_composer(text))
+    content = peerchat.composer_content(peer.tool, text)
     if content is None or not peerchat.looks_empty(profile, content):
         reason = f'{peer.box} composer is not provably empty'
         if peer.tool == 'claude':
