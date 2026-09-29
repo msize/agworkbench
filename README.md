@@ -381,9 +381,12 @@ above its composer), and failover and the queue know it. `lib/pane-implementer-k
 and `lib/kimi.py` prepares what the pane needs.
 
 - **Where kimi comes from.** `kimiPath` in the config, else `kimi` on `PATH`, else
-  `%USERPROFILE%\.kimi-code\bin\kimi.exe`. A launch (and a failover to Kimi) is refused, before
-  anything is recorded, when kimi is missing, when `kimi doctor` fails, or when the web-tool check
-  below fails. `-DryRun` prints what it would check instead.
+  `%USERPROFILE%\.kimi-code\bin\kimi.exe`. The launcher refuses a launch, and a failover to Kimi,
+  before anything is recorded or stopped, when kimi is missing, `kimiArgs` would re-decide its
+  policy, `kimi doctor` fails, the web-tool check below fails, Git Bash is missing, or the clone
+  tracks (or someone else wrote) `.kimi-code/AGENTS.md`. The pane checks these again. `-DryRun`
+  makes the same checks except `kimi doctor`, which would run kimi. In a queue, such a refusal
+  counts as infrastructure: the member is deferred with back-off, not failed.
 - **`--yolo` ("Ask When Needed"), never `--auto`.** Routine edits and commands run on their own.
   Kimi still stops for commands it rates dangerous (a recursive delete, say), for sensitive files and
   for `.git` control paths. Our guards cover only push, gh and the web, so `--auto` would remove the
@@ -765,7 +768,7 @@ the autonomous close can close it. revmux and revdiff rounds that fail also mail
 | `implementer` | `"codex"` | who runs the right pane (`"codex"`, `"claude"` or `"kimi"`) in a new checkout; an existing checkout keeps its saved tool. `-Implementer` changes it for that checkout (refused while a live agent holds the pane) or sets it for a queue's members |
 | `revmuxProfile` | by implementer | revmux profile for review rounds: `comprehensive` with Codex, `claude-only` with Claude or Kimi |
 | `failover` | `true` | when the implementer hits its usage limit, the planner stops it (only when idle at the limit) and switches to the next tool in `failoverOrder`; `false` only reports |
-| `failoverOrder` | `["claude", "codex", "kimi"]` | the tools a failover (and a queue with a limited tool) tries, in order: the first that is not the limited one, has no recorded limit and is usable. At least two distinct tools |
+| `failoverOrder` | `["claude", "codex", "kimi"]` | the tools a failover (and a queue with a limited tool) tries, in order: the first that is not the limited one and has no recorded limit; `-Failover` also skips a Kimi that fails its launch checks, while a queue routes by limits only and lets the member's launch check Kimi (a refusal defers the member). At least two distinct tools |
 | `kimiPath` | none | `kimi.exe` for the Kimi implementer; without it, `PATH`, then `%USERPROFILE%\.kimi-code\bin\kimi.exe` |
 | `kimiArgs` | `[]` | extra arguments for `kimi` (e.g. `["-m", "<model alias>"]`); approval-mode, session, agent and directory flags are refused in every spelling |
 | `bugLabel` | `"bug"` | the label `-Queue bugs` stands for (non-empty, no comma) |

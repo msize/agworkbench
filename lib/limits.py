@@ -284,7 +284,9 @@ def classify(text: str, tool: str) -> Limit | None:
     if not rows:
         return None
     if shell_prompt(rows):
-        return _exited(rows, tool)
+        # Kimi stays alive on a quota error (it draws it above its composer); an exited Kimi is a
+        # stall for the planner, and a quota row left on screen proves nothing (FIX r2 m3).
+        return None if tool == "kimi" else _exited(rows, tool)
     if tool == "codex":
         return _codex_warning(rows) or _codex(rows)
     if tool == "kimi":

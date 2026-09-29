@@ -336,7 +336,7 @@ if ($QueueMember) {
         }
         $result = @{ result = $outcome; checkout = $script:Launch.Checkout; sessionId = $script:Launch.SessionId;
             claudePane = $script:Launch.Claude; codexPane = $script:Launch.Codex; relaySession = $script:Launch.RelaySession;
-            stage = $failureStage; infra = ($failureStage -in @('terminal', 'window', 'cleanup', 'session', 'split', 'codex', 'claude', 'relay', 'relay-stop', 'focus'));
+            stage = $failureStage; infra = ($failureStage -in @('terminal', 'window', 'cleanup', 'session', 'split', 'codex', 'claude', 'kimi', 'relay', 'relay-stop', 'focus'));
             detail = $null }
         if ($outcome -ne 'ok') { $result.detail = "$($script:Launch.Failure)`n$(Format-RepairMessage $script:Launch)" }
         if ($outcome -ne 'ok' -and $remaining.Count) { $result.detail += "`nSessions still open: $($remaining -join ', ')" }

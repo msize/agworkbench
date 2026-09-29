@@ -56,6 +56,8 @@ EXPECTED = {
     "kimi-tool-output": ("kimi", None, False),
     # FIX r1 m6: the tool call is the last item above the composer, its output ending in error + hint
     "kimi-tool-output-last": ("kimi", None, False),
+    # FIX r2 m3: Kimi exited to the shell with a tool's quoted quota error + hint above the prompt
+    "kimi-exited-quoted": ("kimi", None, False),
     "kimi-history": ("kimi", None, False),
     "kimi-diff": ("kimi", None, False),
 }

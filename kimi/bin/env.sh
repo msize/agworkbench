@@ -7,7 +7,7 @@ case "$PATH" in
     "$shim":*) ;;
     *)
         rest=":$PATH:"
-        rest="${rest//:$shim:/:}"
+        rest="${rest//":$shim:"/:}"      # quoted: a [ or * in the path is literal, not a pattern
         rest="${rest#:}"
         PATH="$shim:${rest%:}"
         ;;

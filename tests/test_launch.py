@@ -1721,6 +1721,16 @@ class QueueEntry(LauncherFixtures):
                          (launch['result'], launch['stage'], launch['infra']))
         self.assertFalse(any(c[:2] == ['session', 'type'] for c in self.calls()))
 
+    def test_a_kimi_refusal_is_infrastructure_not_a_failed_member(self):
+        # FIX r2 m1: a machine that cannot run kimi defers the member with back-off.
+        self.write_helpers("\nfunction Get-KimiProblem { return 'kimi not found: a test machine without kimi' }\n")
+        result = self.entry('-Implementer', 'kimi')
+        self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+        launch = self.store.load()['members'][0]['result']
+        self.assertEqual(('kimi', True), (launch['stage'], launch['infra']))
+        self.assertIn('the Kimi implementer cannot start: kimi not found', launch['detail'])
+        self.assertFalse(any(c[:2] in (['session', 'new'], ['session', 'restore']) for c in self.calls()))
+
     def test_terminal_start_failure_is_infrastructure(self):
         self.env['AGWINTERM_ENABLED'] = '0'
         self.write_helpers("\nfunction Test-AgwintermRunning { return $false }\n"
@@ -3936,6 +3946,23 @@ class KimiFailover(LauncherFixtures):
                 self.assertNotIn('limits', self.state('implementer.json'))
                 self.assertEqual([], self.stopped_pids())
                 shutil.rmtree(self.checkout / '.kimi-code', ignore_errors=True)
+
+    def test_a_failover_dry_run_off_kimi_does_not_check_the_outgoing_kimi(self):
+        # FIX r2 m2: the limited kimi is the one being replaced; its launch checks are irrelevant.
+        self.configure()
+        self.launch('kimi')
+        self.env['STUB_KIMI_DOCTOR'] = '5'
+        (self.kimi_home / 'config.toml').unlink()
+        self.cmd('gh', 'echo {"title":"fix-x","state":"OPEN"}\nexit /b 0')
+        env = {k: v for k, v in self.env.items() if not k.startswith('AGWINTERM_')}
+        result = subprocess.run([PWSH, '-NoProfile', '-File', str(LIB / 'github-workbench.ps1'), 'o/repo#7',
+                                 '-DryRun', '-Failover'], env=env, cwd=ROOT, capture_output=True, text=True,
+                                encoding='utf-8', errors='replace', timeout=30)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertIn('stop the limited kimi', result.stdout)
+        self.assertIn('then switch to claude', result.stdout)
+        self.assertNotIn('kimi: would refuse', result.stdout)
+        self.assertNotIn("runs 'kimi doctor'", result.stdout)
 
     def test_the_default_order_keeps_codex_to_claude_and_claude_to_codex(self):
         for saved, expected in (('codex', 'claude'), ('claude', 'codex')):

@@ -216,7 +216,10 @@ def prepare(checkout: str, issue: str, allow_network: bool, dry_run: bool = Fals
         return result
     _write_lf(role, _render(TEMPLATES / "AGENTS.md", {"ISSUE": issue, "NETWORK": network}))
     _exclude(root)
-    values = {"REAL_GIT": msys_path(git), "SHIM_DIR": msys_path(str(shim_dir))}
+    # The shims hold these inside single quotes: an apostrophe in a path (an O'Neil profile) would
+    # end the string, so each ' becomes '\'' (FIX r2 m5).
+    values = {name: value.replace("'", "'\\''") for name, value in
+              {"REAL_GIT": msys_path(git), "SHIM_DIR": msys_path(str(shim_dir))}.items()}
     for name in ("git", "gh", "env.sh"):
         _write_lf(shim_dir / name, _render(TEMPLATES / "bin" / name, values))
     result["trust"] = grant_trust(str(root), home)

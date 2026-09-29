@@ -2149,7 +2149,7 @@ function Invoke-LauncherBody {
             $choice = Get-FailoverTarget -Checkout $co.Dir -Config $config -Saved $resolved.Tool -NoProbe
             if ($choice.Target) {
                 $probe = ''
-                if ($choice.Target -eq 'kimi') { $probe = ' (after checking that kimi is usable: the executable, kimi doctor, its web tools)' }
+                if ($choice.Target -eq 'kimi') { $probe = " (kimi's other checks pass; a real failover also runs 'kimi doctor' first)" }
                 Write-Step "failover: would check the right pane, stop the limited $($resolved.Tool) only if it is idle at its limit (or accept a shell), record the limit, clear the pane, then switch to $($choice.Target)$probe"
                 foreach ($reason in $choice.Reasons) { Write-Step "failover: skipping $reason" }
             } else {
@@ -2157,7 +2157,7 @@ function Invoke-LauncherBody {
             }
             if (-not $config.failover) { Write-Step 'failover: would refuse: "failover" is false' }
         }
-        if ($resolved.Tool -eq 'kimi') {
+        if ($resolved.Tool -eq 'kimi' -and -not $Failover) {
             # A dry run reports what the real launch would refuse on - the same checks, reading only,
             # without running kimi (#65).
             $problem = Get-KimiProblem -Config $config -Checkout $co.Dir -NoDoctor
@@ -2190,7 +2190,13 @@ function Invoke-LauncherBody {
         if ($resolved.Conflict) { throw [ImplementerConflict]::new($resolved.Conflict) }
         # Kimi is checked before anything is recorded, so a refusal changes nothing (#65). A failover
         # to kimi checked it before it stopped the limited agent.
-        if ($resolved.Tool -eq 'kimi' -and -not $Failover) { Assert-KimiReady $config $co.Dir }
+        if ($resolved.Tool -eq 'kimi' -and -not $Failover) {
+            # Its own stage: a machine that cannot run kimi is infrastructure, so a queue member is
+            # deferred with back-off instead of failed (FIX r2 m1).
+            Set-LaunchStage kimi
+            Assert-KimiReady $config $co.Dir
+            Set-LaunchStage implementer
+        }
         Save-Implementer $co.Dir $resolved
         # The human choosing a tool explicitly says its limit has reset (#24).
         if ($Implementer -and -not $Failover) { Set-ImplementerLimit $co.Dir $Implementer $null }

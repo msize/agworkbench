@@ -186,13 +186,14 @@ if GIT:
 @unittest.skipUnless(BASH, "Git Bash not found")
 class GuardRails(Temp):
     """The shims and the backstop, run through Git Bash's launcher with the pane's environment."""
+    SUFFIX = ""
 
     def setUp(self):
         super().setUp()
         # Not under %TEMP%: MSYS spells that /tmp/..., a spelling the shim path never has, which once
         # hid a guard that skipped the prepend whenever the shim was anywhere on PATH (FIX r1 M1). A
         # real checkout is /c/..., like this one (inside the repository's ignored .workbench/).
-        parent = ROOT / ".workbench" / f"test-kimi-{os.getpid()}-{id(self)}"
+        parent = ROOT / ".workbench" / f"test-kimi-{os.getpid()}-{id(self)}{self.SUFFIX}"
         parent.mkdir(parents=True)
         self.addCleanup(shutil.rmtree, parent, ignore_errors=True)
         self.checkout = parent / "repo-issue-7"
@@ -209,7 +210,7 @@ class GuardRails(Temp):
         git(self.checkout, "remote", "add", "origin", "https://github.com/o/repo.git")
 
     def bash(self, command: str) -> subprocess.CompletedProcess:
-        cwd = str(self.checkout).replace("\\", "/")
+        cwd = str(self.checkout).replace("\\", "/").replace("'", "'\\''")
         return subprocess.run([BASH, "-c", f"cd '{cwd}' && {command}"], env=self.env, capture_output=True,
                               text=True, encoding="utf-8", errors="replace", timeout=60)
 
@@ -260,6 +261,12 @@ class GuardRails(Temp):
         self.assertNotEqual(0, done.returncode)
         self.assertIn("planner", done.stderr)
         self.assertEqual("agworkbench-refused", self.bash("echo $GH_TOKEN").stdout.strip())
+
+
+class GuardRailsInAnOddPath(GuardRails):
+    """FIX r2 m5: an apostrophe and a bracket in the checkout path (an O'Neil profile) must not break
+    the single-quoted shims or env.sh's substitution - every guard-rail test again, in such a path."""
+    SUFFIX = " o'neil [x]"
 
 
 if __name__ == "__main__":
