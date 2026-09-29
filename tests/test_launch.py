@@ -3540,6 +3540,66 @@ class FailoverLaunch(LauncherFixtures):
         self.assertEqual(calls, len(self.calls()))
 
 
+class NamedCheckoutLaunch(LauncherFixtures):
+    """#66 r1 M1: a single-issue launch outside the conductor (the planner's -Failover, a human's
+    -Implementer) of a named queue's member finds its checkout and workspace by its membership."""
+
+    def named(self, number=7, queue='kimi', repo='o/repo', checkout=None):
+        directory = self.temp / f'repo-{queue}-issue-{number}'
+        state = directory / '.workbench' / 'state'
+        state.mkdir(parents=True, exist_ok=True)
+        (state / 'queue-member.json').write_text(json.dumps({
+            'queue': str(self.temp / f'repo.{queue}.json'), 'repo': repo, 'number': number, 'queueName': queue,
+            'workspace': f'repo-{queue}', 'checkout': str(checkout or directory)}), encoding='utf-8')
+        return directory
+
+    def dry_run(self, cwd, *extra):
+        self.cmd('gh', 'echo {"title":"fix-x","state":"OPEN"}' + chr(10) + 'exit /b 0')
+        env = {k: v for k, v in self.env.items() if not k.startswith('AGWINTERM_')}
+        return subprocess.run([PWSH, '-NoProfile', '-File', str(LIB / 'github-workbench.ps1'), 'o/repo#7',
+                               '-DryRun', *extra], env=env, cwd=cwd, capture_output=True, text=True,
+                              encoding='utf-8', errors='replace', timeout=30)
+
+    def test_failover_from_a_named_checkout_uses_it_and_its_workspace(self):
+        self.checkout.rmdir()                                       # no plain repo-issue-7
+        named = self.named()
+        for cwd in (named, ROOT):                                   # from inside it, or found by its membership
+            with self.subTest(cwd=cwd):
+                result = self.dry_run(cwd, '-Failover')
+                self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+                self.assertIn(f"named queue 'kimi': checkout {named}, workspace 'repo-kimi'", result.stdout)
+                self.assertIn(f'into {named} on branch', result.stdout)
+                self.assertIn("in workspace 'repo-kimi'", result.stdout)
+                self.assertNotIn('repo-issue-7', result.stdout)
+
+    def test_a_membership_for_another_issue_repo_or_directory_is_ignored(self):
+        self.checkout.rmdir()
+        for case, kwargs in (('issue', dict(number=8)), ('repo', dict(repo='o/other')),
+                             ('directory', dict(checkout=self.temp / 'elsewhere'))):
+            with self.subTest(case=case):
+                named = self.named(**kwargs)
+                result = self.dry_run(named, '-Implementer', 'claude')
+                self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+                self.assertNotIn('named queue', result.stdout)
+                self.assertIn(f"into {self.temp / 'repo-issue-7'} on branch", result.stdout)
+                self.assertIn("in workspace 'repo'", result.stdout)
+                shutil.rmtree(named)
+
+    def test_a_plain_clone_wins_the_scan_and_two_named_ones_are_refused(self):
+        (self.checkout / '.git').mkdir()                             # repo-issue-7 is a clone
+        self.named()
+        result = self.dry_run(ROOT)
+        self.assertNotIn('named queue', result.stdout)
+        (self.checkout / '.git').rmdir()
+        self.named(queue='gpt')
+        result = self.dry_run(ROOT)
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn('checkouts in several named queues', result.stdout + result.stderr)
+        result = self.dry_run(self.temp / 'repo-gpt-issue-7')       # from inside one: that one
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertIn("workspace 'repo-gpt'", result.stdout)
+
+
 class AgentRoots(LauncherFixtures):
     """#24: which process is the limited agent - the binary itself, found by this checkout's marks."""
 

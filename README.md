@@ -216,10 +216,17 @@ github-workbench -Queue 'where: priority IN [P2]' -Repo yeroo/docxy -QueueName k
   repo-wide `github-workbench -Triage -Repo yeroo/docxy -Watch`, and named queues read the priority
   labels it sets.
 - **Review profile:** `-RevmuxProfile <name>` saves a profile on the queue and passes it to every
-  member the conductor launches. It holds for conductor launches only: a manual resume or a failover
-  inside the checkout uses the tool's default, and a member the conductor routes to another tool
-  because of a usage limit gets that tool's default too. The default for Kimi is `kimi-mixed` when
-  the installed revmux lists it (`revmux config`), else `claude-only` with a warning.
+  member the conductor launches. It holds for conductor launches only: a single-issue launch (a
+  manual resume, the planner's `-Failover`) uses the tool's default, and a member the conductor
+  routes to another tool because of a usage limit gets that tool's default too. The default for
+  Kimi is `kimi-mixed` when the installed revmux lists it (`revmux config`), else `claude-only` with
+  a warning.
+- **Single-issue launches of a named member:** `github-workbench <owner/repo>#N` (with `-Failover`,
+  `-Implementer`, ...) run from inside a named queue's checkout uses that checkout and its
+  workspace, proven by its `.workbench/state/queue-member.json`. From elsewhere it does the same
+  when `<repo>-issue-N` has no clone and exactly one `<repo>-<queue>-issue-N` has such a membership;
+  two are refused, naming them. Otherwise it is the plain `<repo>-issue-N` launch. Relaunching a
+  named member through its conductor is `-Queue <spec> -QueueName <name> -Retry`.
 - **Names:** `<repo>-<queue>` should not be another repo's name. A clone that the queue has not yet
   established is reused only when its origin is the queue's repo.
 - `-Cleanup` recognises `<repo>-<queue>-issue-N` checkouts and checks their sessions in the workspace
@@ -573,12 +580,13 @@ merges, unless you opted in for that checkout.
   `.git/index.lock`. The implementer's unread mail works differently (#44). The relay's own
   `PR #N MERGED` notice and anything sent after the merge or no-PR done record, such as the planner's "loop complete"
   note, never hold the close. Older unread implementer mail holds it for 10 minutes; then the
-  close goes ahead and logs the ids. It only ever touches this repository's workspace. Every step
+  close goes ahead and logs the ids. It only ever touches the checkout's workspace (a named
+  queue's own, else the repo's). Every step
   goes to `.workbench/state/relay-close.log`. Nothing else is overridden on a timeout: it alerts
   you instead.
 - **It deletes the checkout** (#41, config `cleanup`, default `merged`). Once the issue session is
   closed, a detached `lib/cleanup.py after-close` waits (up to 10 minutes) until no `#N` session is
-  left in the repo's workspace, then deletes the clone, but only when it is safe: nothing
+  left in the checkout's workspace (a named queue's own, else the repo's), then deletes the clone, but only when it is safe: nothing
   uncommitted, untracked or stashed, no linked worktree, no submodule, no `.git/index.lock`, no launcher or queue
   still using it, and every local commit on a remote-tracking ref or inside the merged PR's head.
   For a no-PR completion, only remote-tracking refs can vouch for local commits.

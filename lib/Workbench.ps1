@@ -1593,7 +1593,7 @@ function Start-WorkbenchSessionCore {
     }
     $tree = Get-Tree
     if ($AdoptSession) {
-        try { $livePlan = Get-AdoptionPlan $tree $Checkout $RepoName $Number }
+        try { $livePlan = Get-AdoptionPlan $tree $Checkout $WorkspaceName $Number }
         catch [AdoptRefused] { throw "adoption changed after setup: $($_.Exception.Message)" }
         if ($livePlan.Session.id -ne $AdoptSession -or $livePlan.CallerPane -ne $CallerPane) {
             throw 'adoption caller session changed'
@@ -1934,6 +1934,40 @@ function Get-GitHubOriginRepo([string] $Url) {
     return $null
 }
 
+function Get-NamedCheckoutMembership([string] $Dir, [hashtable] $Issue) {
+    <# A named queue member's checkout (#66), proven by its own queue membership: it names this repo
+       and issue, and this directory as its checkout. Returns @{ Dir; Workspace; Queue } or $null. #>
+    $path = Join-Path $Dir '.workbench\state\queue-member.json'
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    try { $member = Get-Content -Raw -LiteralPath $path -Encoding UTF8 | ConvertFrom-Json } catch { return $null }
+    if (-not $member.queueName -or -not $member.workspace -or -not $member.checkout -or
+        "$($member.repo)" -ne $Issue.Repo -or "$($member.number)" -ne "$($Issue.Number)") { return $null }
+    $full = [IO.Path]::GetFullPath($Dir).TrimEnd('\', '/')
+    if ([IO.Path]::GetFullPath([string]$member.checkout).TrimEnd('\', '/') -ne $full) { return $null }
+    return @{ Dir = $full; Workspace = [string]$member.workspace; Queue = [string]$member.queueName }
+}
+
+function Find-NamedCheckout([hashtable] $Issue, [string] $Root, [string] $Cwd) {
+    <# A single-issue launch outside a queue (the planner's -Failover, a human's -Implementer) of a
+       named queue's member (#66): the checkout it runs in, when that is one; else, when the plain
+       <repo>-issue-N has no clone, the one <repo>-<queue>-issue-N whose membership says so. Never a
+       guess without a membership; more than one is refused. $null: the plain checkout. #>
+    if ($Cwd) {
+        $here = Get-NamedCheckoutMembership $Cwd $Issue
+        if ($here) { return $here }
+    }
+    $name = ($Issue.Repo -split '/')[1]
+    if (Test-Path -LiteralPath (Join-Path (Join-Path $Root "$name-issue-$($Issue.Number)") '.git')) { return $null }
+    if (-not (Test-Path -LiteralPath $Root)) { return $null }
+    $found = @(Get-ChildItem -LiteralPath $Root -Directory -Filter "$name-*-issue-$($Issue.Number)" -ErrorAction SilentlyContinue |
+        ForEach-Object { Get-NamedCheckoutMembership $_.FullName $Issue } | Where-Object { $_ })
+    if ($found.Count -gt 1) {
+        throw "issue $($Issue.Repo)#$($Issue.Number) has checkouts in several named queues: $(($found | ForEach-Object { $_.Dir }) -join ', '); run from the one to use"
+    }
+    if ($found.Count) { return $found[0] }
+    return $null
+}
+
 function New-IssueCheckout {
     <# A FULL clone per issue, not a worktree: a worktree's .git lives outside the checkout, and
        Codex's workspace-write sandbox would then be unable to commit. Reused if it already exists,
@@ -2131,7 +2165,17 @@ function Invoke-LauncherBody {
     $repoName = ($ref.Repo -split '/')[1]
     # The issue's sessions live in the repo's workspace, or a named queue's own (#66).
     $workspaceName = $repoName
-    if ($script:Launch.QueueContext -and $script:Launch.QueueContext.workspace) { $workspaceName = [string]$script:Launch.QueueContext.workspace }
+    $namedDir = $null
+    if ($script:Launch.QueueContext) {
+        if ($script:Launch.QueueContext.workspace) { $workspaceName = [string]$script:Launch.QueueContext.workspace }
+    } else {
+        # Outside the conductor, a named queue member's checkout is found by its membership (#66).
+        $named = Find-NamedCheckout $ref $config.checkoutRoot (Get-Location).ProviderPath
+        if ($named) {
+            $namedDir, $workspaceName = $named.Dir, $named.Workspace
+            Write-Step "named queue '$($named.Queue)': checkout $namedDir, workspace '$workspaceName'"
+        }
+    }
     $slug = ConvertTo-Slug $info.title 24
     Write-Host "workbench for $issueRef - $($info.title)" -ForegroundColor Cyan
     if ($info.state -ne 'OPEN') { Write-Warning "issue is $($info.state)" }
@@ -2139,7 +2183,8 @@ function Invoke-LauncherBody {
     if ((Test-InsideAgwinterm) -and -not $NewSession) {
         Set-LaunchStage adoption-preflight
         $expectedCheckout = Join-Path $config.checkoutRoot "$repoName-issue-$($ref.Number)"
-        $adoptionPlan = Get-AdoptionPlan (Get-Tree) $expectedCheckout $repoName $ref.Number
+        if ($namedDir) { $expectedCheckout = $namedDir }
+        $adoptionPlan = Get-AdoptionPlan (Get-Tree) $expectedCheckout $workspaceName $ref.Number
     }
 
     # --- 1. the terminal --------------------------------------------------------------------------
@@ -2160,11 +2205,13 @@ function Invoke-LauncherBody {
     # --- 2. the checkout --------------------------------------------------------------------------
     if ($DryRun) {
         $dir = Join-Path $config.checkoutRoot "$repoName-issue-$($ref.Number)"
+        if ($namedDir) { $dir = $namedDir }
         $co = @{ Dir = $dir; Branch = "issue-$($ref.Number)-$(ConvertTo-Slug $info.title 32)" }
         Write-Step "would clone $($ref.Repo) into $($co.Dir) on branch $($co.Branch)"
     } else {
         $checkoutArgs = @{}
         if ($script:Launch.QueueContext) { $checkoutArgs.Directory = $script:Launch.QueueContext.checkout }
+        elseif ($namedDir) { $checkoutArgs.Directory = $namedDir }
         $co = New-IssueCheckout -Issue $ref -Title $info.title -Root $config.checkoutRoot @checkoutArgs
         Set-LaunchStage trust
         Grant-CodexTrust -Dir $co.Dir
@@ -2195,11 +2242,11 @@ function Invoke-LauncherBody {
             -RequestedRevmuxProfile $RevmuxProfile
         $codexLaunch = (& $implementerLines $resolved.Tool).Launch
         if ($adoptionPlan) {
-            Write-Step "would $($adoptionPlan.Mode) session '$($adoptionPlan.Session.id)' as '#$($ref.Number) $slug' in workspace '$repoName'"
+            Write-Step "would $($adoptionPlan.Mode) session '$($adoptionPlan.Session.id)' as '#$($ref.Number) $slug' in workspace '$workspaceName'"
             Write-Step "caller pane '$($adoptionPlan.CallerPane)' preserved; would write adoption state and Bash context"
             if (-not (Test-ClaudeCaller)) { Write-Step "would start Claude here after successful setup: $claudeLaunch" }
         } else {
-            Write-Step "would open session '#$($ref.Number) $slug' in workspace '$repoName'"
+            Write-Step "would open session '#$($ref.Number) $slug' in workspace '$workspaceName'"
             Write-Step "left pane:  $claudeLaunch"
         }
         Write-Step "implementer: $($resolved.Tool) (revmux profile $($resolved.RevmuxProfile)); auto-merge $(Format-AutoMerge $resolved.AutoMerge); autonomous $(Format-AutoMerge $resolved.Autonomous)"
@@ -2269,7 +2316,7 @@ function Invoke-LauncherBody {
         $adoptArgs = @{}
         if ($adoptionPlan) {
             Set-LaunchStage adoption-recheck
-            $currentPlan = Get-AdoptionPlan (Get-Tree) $co.Dir $repoName $ref.Number
+            $currentPlan = Get-AdoptionPlan (Get-Tree) $co.Dir $workspaceName $ref.Number
             $previousPanes = (@(Get-PaneIds $adoptionPlan.Session) | Sort-Object) -join ','
             $currentPanes = (@(Get-PaneIds $currentPlan.Session) | Sort-Object) -join ','
             if ($currentPlan.Session.id -ne $adoptionPlan.Session.id -or
@@ -2290,7 +2337,7 @@ function Invoke-LauncherBody {
             if ($adoptionPlan.CodexPane) {
                 $implementerReady = Set-ImplementerRestore $co.Dir $adoptionPlan.CodexPane $codexRestore $resolved.Tool -ExistingPane
             }
-            Initialize-AdoptedSession $adoptionPlan $co.Dir $repoName $ref.Number $slug
+            Initialize-AdoptedSession $adoptionPlan $co.Dir $workspaceName $ref.Number $slug
             $adoptArgs = @{ AdoptSession = $adoptionPlan.Session.id; CallerPane = $adoptionPlan.CallerPane;
                             ImplementerIdentityReady = [bool]$implementerReady }
         }
