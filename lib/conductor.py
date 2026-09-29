@@ -122,6 +122,102 @@ def repo_name(value):
     return value.lower()
 
 
+# --- named queues (#66) ------------------------------------------------------------------------
+# A repo's main queue is `<owner>/<repo>.json`; a named one `<owner>/<repo>.<name>.json`, with its own
+# agwinterm workspace (default `<repo>-<name>`) and checkouts `<repo>-<name>-issue-N`. Repo names may
+# contain dots, so a file name alone never says whose queue it is: the recorded repo and name do.
+
+QUEUE_NAME = re.compile(r'[a-z0-9][a-z0-9-]{0,31}')
+WORKSPACE_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}')
+REVMUX_PROFILE = re.compile(r'[A-Za-z0-9._-]+')
+TERMINAL_STATES = {'merged', 'closed'}
+
+
+def queue_name(value):
+    """The queue name -QueueName gives, case-folded; None for the main queue."""
+    if value is None or value == '':
+        return None
+    name = value.casefold() if isinstance(value, str) else value
+    if not isinstance(name, str) or not QUEUE_NAME.fullmatch(name) or name == 'main':
+        raise UsageError(f'invalid queue name {value!r}: 1-32 of a-z, 0-9 and -, not starting with -; "main" is the '
+                         'unnamed queue')
+    return name
+
+
+def queue_file_name(repo, name=None):
+    return repo.split('/')[1] + (f'.{name}' if name else '') + '.json'
+
+
+def queue_path(root, repo, name=None):
+    return Path(root) / repo.split('/')[0] / queue_file_name(repo, name)
+
+
+def queue_label(data):
+    """`o/r` for the main queue, `o/r (kimi)` for a named one: every line and title that names the queue."""
+    return data['repo'] + (f' ({data["name"]})' if data.get('name') else '')
+
+
+def queue_workspace(data):
+    """The agwinterm workspace of the queue's sessions: its own for a named queue, else the repo's name."""
+    return data.get('workspace') or data['repo'].split('/')[1]
+
+
+def checkout_name(repo, number, name=None):
+    return f'{repo.split("/")[1]}{"-" + name if name else ""}-issue-{number}'
+
+
+def claims_lock(root, repo):
+    """The repo-wide lock every member add of every queue of the repo takes (#66), so the sibling
+    check and the write are one step. Order: gh/terminal lookups with no lock -> this lock -> the
+    siblings, each read through its own Store.load (never nested in our state lock) -> our own state
+    lock. Nothing takes it while holding a state lock, and nothing slow runs under it. The Worker's
+    other transactions never take it: they only change states or remove members, which can only
+    release a claim, never create one."""
+    owner, name = repo.split('/')
+    return Lock(Path(root) / owner / f'{name}.claims.lock', 30)
+
+
+def sibling_queues(root, repo, own):
+    """Every other queue of this repo, loaded: only the candidate files `<repo>.json` and
+    `<repo>.<q>.json`, so another repo's queue is never read. A candidate that records another repo
+    (`docxy.kimi.json` may be repo `docxy.kimi`'s) is not a sibling; an unreadable one raises
+    StateError - never "unclaimed"."""
+    owner, name = repo.split('/')
+    directory = Path(root) / owner
+    prefix = name.casefold() + '.'
+    found = []
+    if not directory.is_dir():
+        return found
+    for path in sorted(directory.iterdir()):
+        file = path.name.casefold()
+        if not file.startswith(prefix) or not file.endswith('.json') or not path.is_file():
+            continue
+        middle = file[len(prefix):-len('.json')]
+        if middle and not QUEUE_NAME.fullmatch(middle):
+            continue
+        if not middle and file != name.casefold() + '.json':
+            continue
+        if Path(own).resolve() == path.resolve():
+            continue
+        data = Store(path).load()
+        if data['repo'] == repo:
+            found.append(data)
+    return found
+
+
+def repo_workspaces(repo, siblings, own=None):
+    """Every workspace an issue of the repo can be worked in (#66): the repo's own - manual launches
+    and the main queue, whether or not it has a file - every sibling's, and this queue's."""
+    return list(dict.fromkeys([repo.split('/')[1], *(queue_workspace(d) for d in siblings), *([own] if own else [])]))
+
+
+def claims(siblings):
+    """{issue number: queue name} for every sibling member that is not merged or closed: a pending,
+    live, blocked or failed member holds its issue (#66)."""
+    return {m['number']: data.get('name') or 'main'
+            for data in siblings for m in data['members'] if m['state'] not in TERMINAL_STATES}
+
+
 CLOSE_BACKSTOP_AFTER = 900.0   # a merged or no-PR closed member's pending close gets the backstop (#33)
 CLOSE_ISSUE_CHECK_INTERVAL = 60.0  # GitHub CLOSED gate during a no-PR backstop wait
 TRIAGE_JOB_TIMEOUT = 600.0     # one triage.py run for one member (#34)
@@ -263,12 +359,13 @@ def pr_reasons(repo, numbers, gh=gh_json):
     return reasons
 
 
-def session_numbers(repo, tree):
-    """Issue numbers with a live issue session in the repo's workspace (Find-IssueSession's rule)."""
-    workspace_name = repo.split('/')[1].casefold()
+def session_numbers(repo, tree, workspaces=None):
+    """Issue numbers with a live issue session in the given workspaces (Find-IssueSession's rule);
+    by default the repo's own workspace (#66: a named queue's members live in the queue's)."""
+    wanted = {w.casefold() for w in (workspaces or [repo.split('/')[1]])}
     numbers = set()
     for workspace, session in agw.sessions(tree):
-        if (workspace.get('name') or '').casefold() != workspace_name:
+        if (workspace.get('name') or '').casefold() not in wanted:
             continue
         match = re.match(r'#(\d+) ', session.get('name') or '')
         if match and not HELPER_SESSION.fullmatch(session.get('name') or ''):
@@ -276,35 +373,48 @@ def session_numbers(repo, tree):
     return numbers
 
 
-def skip_reasons(numbers, repo, root, queue_path, prs, sessions):
+def skip_reasons(numbers, repo, root, queue_path, prs, sessions, name=None):
     """{number: reason} for issues someone is already handling, from the given PR and session
-    lookups plus the checkouts on disk (a held launch.lock, a foreign .workbench)."""
+    lookups plus the checkouts on disk (a held launch.lock, a foreign .workbench). A named queue
+    (#66) checks its own checkout and the repo's plain `<repo>-issue-N` one, which a manual launch
+    or the main queue uses."""
     reasons = {}
     for n in numbers:
-        checkout = Path(root) / f'{repo.split("/")[1]}-issue-{n}'
-        state = checkout / '.workbench' / 'state'
-        membership = state / 'queue-member.json'
+        for checkout in dict.fromkeys(Path(root) / checkout_name(repo, n, q) for q in (name, None)):
+            reason = checkout_reason(checkout, repo, n, queue_path)
+            if reason:
+                break
         if n in prs:
             reasons[n] = prs[n]
         elif n in sessions:
             reasons[n] = 'session: a live workbench session is open for it'
-        elif checkout_locked(checkout):
-            reasons[n] = 'checkout-lock: a launcher holds its checkout'
-        elif state.is_dir():
-            try:
-                owner = read_json(membership).get('queue') if membership.exists() else None
-            except (OSError, ValueError):
-                owner = None
-            if owner is None or Path(owner).resolve() != Path(queue_path).resolve():
-                reasons[n] = (f'checkout exists from an earlier loop ({checkout}); resume with '
-                              f'github-workbench {repo}#{n} or delete it')
+        elif reason:
+            reasons[n] = reason
     return reasons
 
 
-def in_hand(repo, numbers, root, queue_path, gh=gh_json, tree=None):
+def checkout_reason(checkout, repo, n, queue_path):
+    state = checkout / '.workbench' / 'state'
+    membership = state / 'queue-member.json'
+    if checkout_locked(checkout):
+        return 'checkout-lock: a launcher holds its checkout'
+    if state.is_dir():
+        try:
+            owner = read_json(membership).get('queue') if membership.exists() else None
+        except (OSError, ValueError):
+            owner = None
+        if owner is None or Path(owner).resolve() != Path(queue_path).resolve():
+            return (f'checkout exists from an earlier loop ({checkout}); resume with '
+                    f'github-workbench {repo}#{n} or delete it')
+    return None
+
+
+def in_hand(repo, numbers, root, queue_path, gh=gh_json, tree=None, *, name=None, workspaces=None):
+    """The in-hand skips (#28) of one queue: `workspaces` are every workspace of the repo's queues (#66)."""
     if not numbers:
         return {}
-    return skip_reasons(numbers, repo, root, queue_path, pr_reasons(repo, numbers, gh), session_numbers(repo, tree))
+    return skip_reasons(numbers, repo, root, queue_path, pr_reasons(repo, numbers, gh),
+                        session_numbers(repo, tree, workspaces), name)
 
 
 def valid_watch(data):
@@ -504,6 +614,7 @@ class Store:
         self.directory = self.path.with_suffix('')
         self.state_lock = self.directory / 'state.lock'
         self.worker_lock = self.directory / 'worker.lock'
+        self.root = self.path.parent.parent        # <root>/<owner>/<file>: where the repo's other queues are
 
     def load(self):
         with Lock(self.state_lock):
@@ -524,6 +635,22 @@ class Store:
                 raise ValueError('invalid autoMerge')
             if data.get('triage') is not None and type(data['triage']) is not bool:
                 raise ValueError('invalid triage')
+            # #66: the file name is the one its recorded repo and name give - which also tells a dotted
+            # repo's main queue (`docxy.kimi.json` of `o/docxy.kimi`) from a named one.
+            name = data.get('name')
+            if name is not None and (not isinstance(name, str) or not QUEUE_NAME.fullmatch(name) or name == 'main'):
+                raise ValueError('invalid name')
+            if self.path.name.casefold() != queue_file_name(data['repo'], name).casefold():
+                raise ValueError(f'the file name does not match its queue ({queue_file_name(data["repo"], name)})')
+            workspace = data.get('workspace')
+            if (workspace is not None or name is not None) and (
+                    not isinstance(workspace, str) or not WORKSPACE_NAME.fullmatch(workspace) or name is None):
+                raise ValueError('invalid workspace')
+            if name is not None and data.get('triage'):
+                raise ValueError('a named queue does not triage')
+            if data.get('revmuxProfile') is not None and (
+                    not isinstance(data['revmuxProfile'], str) or not REVMUX_PROFILE.fullmatch(data['revmuxProfile'])):
+                raise ValueError('invalid revmuxProfile')
             for key in ('diskPaused', 'ramPaused', 'toolsPaused'):
                 if data.get(key) is not None and not isinstance(data[key], str):
                     raise ValueError(f'invalid {key}')
@@ -574,9 +701,9 @@ class Store:
             return True
 
 
-def new_member(number, repo, root):
+def new_member(number, repo, root, name=None):
     return dict(number=number, state='pending', phase='active', attempt=0, slotReleased=False,
-                checkout=str(root / f'{repo.split("/")[1]}-issue-{number}'), checkoutEstablished=False,
+                checkout=str(root / checkout_name(repo, number, name)), checkoutEstablished=False,
                 pr=None, prState=None, reason=None, consumedLoop=None, consumedRev=0, since=time.time())
 
 
@@ -648,11 +775,14 @@ def pin_conductor(store, owner):
             data['owner']['pinned'] = True
 
 
-def settings_changes(data, parallel, yes, implementer, auto_merge, autonomous, watch, label, triage_on=False):
-    """What this start or append changes in a queue's saved settings (#28): {key: [old, new]}."""
+def settings_changes(data, parallel, yes, implementer, auto_merge, autonomous, watch, label, triage_on=False,
+                     revmux_profile=None):
+    """What this start or append changes in a queue's saved settings (#28): {key: [old, new]}. A revmux
+    profile is saved only when the human passed one (#66): the kimi default is the launcher's, per launch."""
     current = data or {}
     wanted = {'parallel': parallel, 'yes': True if yes else None, 'implementer': implementer,
-              'autoMerge': auto_merge, 'autonomous': autonomous, 'triage': True if triage_on else None}
+              'autoMerge': auto_merge, 'autonomous': autonomous, 'triage': True if triage_on else None,
+              'revmuxProfile': revmux_profile}
     changes = {key: [current.get(key), value] for key, value in wanted.items()
                if value is not None and data is not None and current.get(key) != value}
     if watch and data is not None:
@@ -666,9 +796,41 @@ def settings_changes(data, parallel, yes, implementer, auto_merge, autonomous, w
     return changes
 
 
+def start_workspace(repo, name, workspace, existing):
+    """The workspace a named queue's start or append uses (#66): the saved one; on the first start the
+    given one or `<repo>-<name>`. A different one later is refused, since the members already live in
+    the saved one. None for the main queue."""
+    if name is None:
+        return None
+    saved = (existing or {}).get('workspace')
+    if saved and workspace and workspace.casefold() != saved.casefold():
+        raise UsageError(f'queue {repo} ({name}) runs in workspace {saved!r}; it cannot move to {workspace!r}')
+    workspace = saved or workspace or f'{repo.split("/")[1]}-{name}'
+    if workspace.casefold() == repo.split('/')[1].casefold():
+        raise UsageError(f"workspace {workspace!r} is the repo's own, the main queue's; a named queue needs its own")
+    return workspace
+
+
+def check_workspace(workspace, siblings):
+    """A named queue's workspace is its own: no other queue of the repo may use it (#66)."""
+    for data in siblings:
+        if workspace is not None and queue_workspace(data).casefold() == workspace.casefold():
+            raise UsageError(f'workspace {workspace!r} belongs to queue {queue_label(data)}')
+
+
 def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=False, dry_run=False, root=None,
                 implementer=None, auto_merge=None, autonomous=None, gh=gh_json, triage_on=False,
-                prune=False, clear_limit=None):
+                prune=False, clear_limit=None, name=None, workspace=None, revmux_profile=None):
+    name = queue_name(name)
+    if workspace is not None and name is None:
+        raise UsageError('-Workspace requires -QueueName: the main queue uses the workspace named after the repo')
+    if workspace is not None and not WORKSPACE_NAME.fullmatch(workspace):
+        raise UsageError(f'invalid workspace name {workspace!r}')
+    if triage_on and name is not None:
+        raise UsageError('a named queue does not triage; triage is the repo-wide '
+                         'github-workbench -Triage -Repo <owner/name> -Watch')
+    if revmux_profile is not None and not REVMUX_PROFILE.fullmatch(revmux_profile):
+        raise UsageError(f'invalid revmux profile {revmux_profile!r}')
     repo, numbers, label = resolve_spec(expand_spec(spec, config_path()), repo, gh)
     matched = set(numbers)
     matches = len(numbers)
@@ -677,7 +839,7 @@ def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=Fa
     if prune and (not watch or not label):
         raise UsageError('-Prune requires -Queue with a watched label:, bugs or where: spec')
     root = Path(root or os.environ.get('AGWORKBENCH_QUEUE_ROOT', Path.home() / '.agworkbench/queues')).resolve()
-    store = Store(root / (repo + '.json'))
+    store = Store(queue_path(root, repo, name))
     if parallel is not None and not 1 <= parallel <= 8:
         raise UsageError('-Parallel must be between 1 and 8')
     if implementer not in (None, *IMPLEMENTER_TOOLS):
@@ -685,102 +847,130 @@ def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=Fa
     if clear_limit not in (None, *IMPLEMENTER_TOOLS):
         raise UsageError('-ClearLimit must be codex, claude or kimi')
     existing = store.load() if store.path.exists() else None      # under the state lock, like every other read
+    if existing and existing['repo'] != repo:
+        # `o/docxy -QueueName kimi` is `docxy.kimi.json`, which can be repo o/docxy.kimi's main queue (#66).
+        raise QueueError(f'queue repository mismatch in {store.path}: it is {queue_label(existing)}')
+    workspace = start_workspace(repo, name, workspace, existing)
+    tag = f'({name}) ' if name else ''
     known = {m['number']: m['state'] for m in existing['members']} if existing else {}
     pruned = [m['number'] for m in existing['members']
               if m['state'] == 'pending' and m['number'] not in matched] if existing and prune else []
     skipped = {n: f'queued ({known[n]})' for n in numbers if n in known}
     fresh = [n for n in numbers if n not in known]
+    # The repo's other queues (#66), read here with no lock for the in-hand lookup and the dry run. The
+    # claims that decide are read again under the claims lock, right before the write.
+    siblings = sibling_queues(root, repo, store.path)
+    check_workspace(workspace, siblings)
     if label:
         # Only a label spec is filtered: an explicit list is what the human named. Before any write.
         skipped.update(in_hand(repo, fresh, checkout_root((existing or {}).get('config') or config_path()),
-                               store.path, gh))
+                               store.path, gh, name=name, workspaces=repo_workspaces(repo, siblings, workspace)))
+    # A claim holds against an explicit list too: two queues never both work on one issue.
+    skipped.update({n: f'claimed by queue {q}' for n, q in claims(siblings).items() if n in fresh and n not in skipped})
     numbers = [n for n in numbers if n not in skipped]
     if dry_run:
         live = store.running() if store.worker_lock.exists() else False
         mode = 'start' if existing is None else ('append to a running queue' if live else 'append to a stopped queue')
-        changes = settings_changes(existing, parallel, yes, implementer, auto_merge, autonomous, watch, label, triage_on)
+        changes = settings_changes(existing, parallel, yes, implementer, auto_merge, autonomous, watch, label, triage_on,
+                                   revmux_profile)
         query = dict(query=label.text, matches=matches) if isinstance(label, labelquery.Query) else {}
         limits = dict(clearLimit=dict(tool=clear_limit, recorded=((existing or {}).get('toolLimits') or {}).get(clear_limit))
                       ) if clear_limit else {}
-        print(json.dumps(dict(repo=repo, **query, members=numbers, running=live, mode=mode,
+        print(json.dumps(dict(repo=repo, name=name or 'main', workspace=workspace or repo.split('/')[1], **query,
+                              members=numbers, running=live, mode=mode,
                               skipped=[dict(number=n, reason=r) for n, r in sorted(skipped.items())],
                               settings=changes, pruned=pruned, owner=existing.get('owner') if existing else None,
                               **limits)))
         return 0
     token = None
-    with Lock(store.state_lock):
-        if store.path.exists():
-            data = store._load()
-            if data['repo'] != repo:
-                raise QueueError(f'queue repository mismatch in {store.path}')
-        else:
-            data = dict(version=1, repo=repo, parallel=parallel or 1, watch=watch,
-                        **(watch_fields(label) if watch else {'label': None}),
-                        yes=yes, config=str(config_path()), members=[], owner=None)
-        # One mapping decides and applies every switch, and is what gets reported (#28). All apply to
-        # members launched from now on; autonomous/autoMerge are saved explicitly, false included,
-        # and -Watch onto a queue started from a list turns watching on.
-        changes = settings_changes(data, parallel, yes, implementer, auto_merge, autonomous, watch, label, triage_on)
-        for key, (_, new) in changes.items():
-            data[key] = new
-        cleared = None
-        if clear_limit:
-            # The human says this tool's limit has reset (#61), and nothing else changes: records of it
-            # from before now are ignored, so a member's old failover never brings it back.
-            data.setdefault('toolLimitsClearedAt', {})[clear_limit] = time.time()
-            cleared = (data.get('toolLimits') or {}).pop(clear_limit, None)
-            if not data.get('toolLimits'):
-                data.pop('toolLimits', None)
-        pruned = [m['number'] for m in data['members']
-                  if m['state'] == 'pending' and m['number'] not in matched] if prune else []
-        if pruned:
-            removed = set(pruned)
-            data['members'] = [m for m in data['members'] if m['number'] not in removed]
-            if data.get('launchBackoff', {}).get('member') in removed:
-                data.pop('launchBackoff', None)
-                if (data.get('launchPaused') or '').startswith('launches failing: '):
-                    data.pop('launchPaused', None)
-        known = {m['number'] for m in data['members']}
-        added = [n for n in numbers if n not in known]
-        data['members'].extend(new_member(n, repo, checkout_root(data['config'])) for n in added)
-        if retry:
-            for m in data['members']:
-                if m['state'] == 'failed':
-                    m.update(state='pending', reason=None, slotReleased=False, consumedLoop=None, consumedRev=0)
-        owner = data.get('owner') or {}
-        if store.running() or (owner.get('state') == 'starting' and time.time() - owner['reservedAt'] < 90):
-            owner = dict(owner)
-        else:
-            token = str(uuid.uuid4())
-            if owner.get('session'):
-                print(f'previous conductor session {owner["session"]} left untouched')
-            data['owner'] = dict(token=token, state='starting', session=None, pinned=False, reservedAt=time.time())
-        atomic_json(store.path, data)
+    with claims_lock(root, repo):
+        siblings = sibling_queues(root, repo, store.path)
+        check_workspace(workspace, siblings)
+        claimed = claims(siblings)
+        with Lock(store.state_lock):
+            if store.path.exists():
+                data = store._load()
+                if data['repo'] != repo:
+                    raise QueueError(f'queue repository mismatch in {store.path}')
+            else:
+                data = dict(version=1, repo=repo, parallel=parallel or 1, watch=watch,
+                            **(watch_fields(label) if watch else {'label': None}),
+                            yes=yes, config=str(config_path()), members=[], owner=None)
+                if name:
+                    data.update(name=name, workspace=workspace)
+            # One mapping decides and applies every switch, and is what gets reported (#28). All apply to
+            # members launched from now on; autonomous/autoMerge are saved explicitly, false included,
+            # and -Watch onto a queue started from a list turns watching on.
+            changes = settings_changes(data, parallel, yes, implementer, auto_merge, autonomous, watch, label,
+                                       triage_on, revmux_profile)
+            for key, (_, new) in changes.items():
+                data[key] = new
+            cleared = None
+            if clear_limit:
+                # The human says this tool's limit has reset (#61), and nothing else changes: records of it
+                # from before now are ignored, so a member's old failover never brings it back.
+                data.setdefault('toolLimitsClearedAt', {})[clear_limit] = time.time()
+                cleared = (data.get('toolLimits') or {}).pop(clear_limit, None)
+                if not data.get('toolLimits'):
+                    data.pop('toolLimits', None)
+            pruned = [m['number'] for m in data['members']
+                      if m['state'] == 'pending' and m['number'] not in matched] if prune else []
+            if pruned:
+                removed = set(pruned)
+                data['members'] = [m for m in data['members'] if m['number'] not in removed]
+                if data.get('launchBackoff', {}).get('member') in removed:
+                    data.pop('launchBackoff', None)
+                    if (data.get('launchPaused') or '').startswith('launches failing: '):
+                        data.pop('launchPaused', None)
+            known = {m['number'] for m in data['members']}
+            for n in numbers:
+                if n not in known and n in claimed:
+                    skipped[n] = f'claimed by queue {claimed[n]}'
+            added = [n for n in numbers if n not in known and n not in claimed]
+            data['members'].extend(new_member(n, repo, checkout_root(data['config']), name) for n in added)
+            if retry:
+                for m in data['members']:
+                    if m['state'] == 'failed':
+                        m.update(state='pending', reason=None, slotReleased=False, consumedLoop=None, consumedRev=0)
+            owner = data.get('owner') or {}
+            if store.running() or (owner.get('state') == 'starting' and time.time() - owner['reservedAt'] < 90):
+                owner = dict(owner)
+            else:
+                token = str(uuid.uuid4())
+                if owner.get('session'):
+                    print(f'{tag}previous conductor session {owner["session"]} left untouched')
+                data['owner'] = dict(token=token, state='starting', session=None, pinned=False, reservedAt=time.time())
+            atomic_json(store.path, data)
     # Reported only once written: a refused or failed write never shows changes that did not happen.
     for n, reason in sorted(skipped.items()):
-        print(f'#{n} skipped: {reason}')
+        print(f'{tag}#{n} skipped: {reason}')
     for n in pruned:
-        print(f'#{n} pruned: no longer matches the watched spec')
+        print(f'{tag}#{n} pruned: no longer matches the watched spec')
     for key, (old, new) in changes.items():
         suffix = '' if key in ('label', 'query') else ' (for every member launched from now on)'
-        print(f'settings: {key} {json.dumps(old)} -> {json.dumps(new)}{suffix}')
+        print(f'{tag}settings: {key} {json.dumps(old)} -> {json.dumps(new)}{suffix}')
     if clear_limit:
         was = f' ({cleared["line"]})' if cleared else ' (none was recorded)'
-        print(f'settings: cleared the recorded usage limit for {clear_limit}{was}; older records are ignored')
+        print(f'{tag}settings: cleared the recorded usage limit for {clear_limit}{was}; older records are ignored')
     if token is None:
         if owner.get('session') and not owner.get('pinned'):
             pin_conductor(store, owner)
-        print(f'queue running/starting in session {owner.get("session") or "pending"}; appended {len(added)}')
+        print(f'{tag}queue running/starting in session {owner.get("session") or "pending"}; appended {len(added)}')
         return 0
     line = conductor_command(store, token)
-    session = str(agw.request('session.new', args={'name': f'#queue {repo}', 'cwd': str(HERE.parent), 'command': line})).split()[0]
+    args = {'name': f'#queue {queue_label(data)}', 'cwd': str(HERE.parent), 'command': line}
+    if name:
+        # A named queue's conductor lives in its workspace (#66), created when missing; the main
+        # queue's opens beside its caller, as before.
+        args.update({'workspace-name': workspace, 'create-workspace': True})
+    session = str(agw.request('session.new', args=args)).split()[0]
     if not valid_uuid(session):
         raise QueueError(f'invalid conductor session id: {session}')
     with store.transaction() as data:
         if data['owner']['token'] == token:
             data['owner']['session'] = session
     pin_conductor(store, dict(session=session, token=token))
-    print(f'queue running in session {session}: {store.path}')
+    print(f'{tag}queue running in session {session}: {store.path}')
     return 0
 
 
@@ -794,7 +984,8 @@ def member_context(path, number, attempt, token):
         if m['checkoutEstablished'] and not Path(m['checkout']).is_dir():
             raise QueueError(f'checkout moved or deleted: {m["checkout"]}; restore it or remove the member')
         return dict(queue=str(store.path), repo=data['repo'], number=number, attempt=attempt, token=token,
-                    checkout=m['checkout'], checkoutEstablished=m['checkoutEstablished'], config=data['config'])
+                    checkout=m['checkout'], checkoutEstablished=m['checkoutEstablished'], config=data['config'],
+                    queueName=data.get('name'), workspace=queue_workspace(data))
 
 
 def usable_checkout(path):
@@ -939,7 +1130,7 @@ def adopt_done(data, member):
 
 
 def summary(data):
-    lines = [f'Queue {data["repo"]} — snapshot at {time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())}',
+    lines = [f'Queue {queue_label(data)} — snapshot at {time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())}',
              'Rerun github-workbench -Queue <spec> to refresh.', '', '| Issue | State | PR | Reason |', '|---|---|---|---|']
     for m in data['members']:
         state = m['state'] + (' (PR closed)' if m.get('prState') == 'CLOSED' else '')
@@ -973,6 +1164,7 @@ class Worker:
         self.last_display = {}
         self.last_skips = {}          # the last rescan's skip reasons, kept in memory only (#28)
         self.closes = {}              # member -> {'since', 'attempt'}: the close backstop (#33), memory only
+        self._name = _UNREAD          # the queue's name (#66), read once: it never changes
 
     def error(self, key, err):
         count = self.errors.get(key, 0) + 1
@@ -1017,9 +1209,19 @@ class Worker:
         except (OSError, ValueError, KeyError, TypeError, agw.CtlError) as err:
             self.error(f'cleanup launch {checkout}', err)
 
+    @property
+    def tag(self):
+        """`(kimi) ` for a named queue's lines and titles (#66): two conductors print into one terminal."""
+        if self._name is _UNREAD:
+            try:
+                self._name = self.store.load().get('name')
+            except (OSError, ValueError):
+                return ''                 # an unreadable queue: its own error says which
+        return f'({self._name}) ' if self._name else ''
+
     def notify(self, message):
         try:
-            agw.notify(agw.my_pane() or 'active', message, title='Workbench queue')
+            agw.notify(agw.my_pane() or 'active', message, title=f'Workbench queue {self.tag}'.strip())
         except (agw.CtlError, OSError) as err:
             print(f'notification failed: {err}', flush=True)
 
@@ -1038,6 +1240,8 @@ class Worker:
             args.append('-Yes')
         if data.get('implementer'):
             args += ['-Implementer', data['implementer']]
+        if data.get('revmuxProfile'):
+            args += ['-RevmuxProfile', data['revmuxProfile']]     # the human's explicit one (#66)
         if data.get('autonomous') is not None:
             args.append('-Autonomous' if data['autonomous'] else '-NoAutonomous')
         if data.get('autoMerge') is not None and not (data.get('autonomous') and not data['autoMerge']):
@@ -1107,18 +1311,27 @@ class Worker:
                 _, numbers, _ = resolve_spec(watched_spec(data), data['repo'], self.gh)
                 known = {m['number'] for m in data['members']}
                 fresh = [n for n in numbers if n not in known]
-                skipped = in_hand(data['repo'], fresh, checkout_root(data['config']), self.store.path, self.gh)
+                root = self.store.root
+                siblings = sibling_queues(root, data['repo'], self.store.path)
+                skipped = in_hand(data['repo'], fresh, checkout_root(data['config']), self.store.path, self.gh,
+                                  name=data.get('name'),
+                                  workspaces=repo_workspaces(data['repo'], siblings, queue_workspace(data)))
                 accepted = False
-                with self.store.transaction() as current:
-                    if current['watch'] and watch_key(current) == watch_key(data):
-                        known = {m['number'] for m in current['members']}
-                        current['members'].extend(new_member(n, data['repo'], checkout_root(data['config']))
-                                                  for n in fresh if n not in known and n not in skipped)
-                        accepted = True
+                # The claims (#66) decide under the repo's claims lock, taken before our state lock.
+                with claims_lock(root, data['repo']):
+                    claimed = claims(sibling_queues(root, data['repo'], self.store.path))
+                    skipped.update({n: f'claimed by queue {q}' for n, q in claimed.items() if n in fresh})
+                    with self.store.transaction() as current:
+                        if current['watch'] and watch_key(current) == watch_key(data):
+                            known = {m['number'] for m in current['members']}
+                            current['members'].extend(new_member(n, data['repo'], checkout_root(data['config']),
+                                                                 data.get('name'))
+                                                      for n in fresh if n not in known and n not in skipped)
+                            accepted = True
                 if accepted:
                     for n, reason in sorted(skipped.items()):
                         if self.last_skips.get(n) != reason:
-                            print(f'#{n} skipped: {reason}', flush=True)
+                            print(f'{self.tag}#{n} skipped: {reason}', flush=True)
                     self.last_skips = skipped
                 self.errors.pop('label scan', None)
             except (OSError, ValueError, KeyError, subprocess.SubprocessError, QueueError, agw.CtlError) as err:
@@ -1141,7 +1354,7 @@ class Worker:
         for m in candidates:
             key = f'stale #{m["number"]}'
             try:
-                live = cleanup.live_sessions(data['repo'], m['number'], tree)
+                live = cleanup.live_sessions(data['repo'], m['number'], tree, queue_workspace(data))
                 if live:
                     with self.store.transaction() as current:
                         member = find_member(current, m['number'])
@@ -1187,7 +1400,7 @@ class Worker:
                 if issue is not None and (not isinstance(issue, dict) or issue.get('state') not in {'OPEN', 'CLOSED'}):
                     raise QueueError('invalid issue response')
                 # The original snapshot may predate a newly opened review/helper session.
-                if cleanup.live_sessions(data['repo'], m['number'], agw.tree()):
+                if cleanup.live_sessions(data['repo'], m['number'], agw.tree(), queue_workspace(data)):
                     with self.store.transaction() as current:
                         member = find_member(current, m['number'])
                         if member and member['state'] == 'active':
@@ -1286,7 +1499,7 @@ class Worker:
                     else:
                         reason = 'timed out' if timed_out else f'exited {code}: {tail}'
                         m['triageResult'] = f'failed: {reason}'[:300]
-            print(f'#{number}: triage {"done" if code == 0 else "failed; admitted untriaged"} '
+            print(f'{self.tag}#{number}: triage {"done" if code == 0 else "failed; admitted untriaged"} '
                   f'{outcome.get("priority") or ""}'.rstrip(), flush=True)
         data = self.store.load()
         if not data.get('triage') or self.triage_job is not None or self.clock() < self.triage_paused_until:
@@ -1340,7 +1553,8 @@ class Worker:
                     if (isinstance(done, dict) and done.get('noPr') is True and done.get('pr') is None
                             and str(done.get('issue')) == str(number) and type(last) in (int, float)
                             and type(at) in (int, float)
-                            and at > last and not closer.relay_alive(data['repo'], str(number), agw.tree())):
+                            and at > last and not closer.relay_alive(data['repo'], str(number), agw.tree(),
+                                                                    queue_workspace(data))):
                         relay_state['close_pending'] = closer.NO_PR
                         relay_state['close_merged_at'] = datetime.fromtimestamp(at, timezone.utc).isoformat()
                         atomic_json(hub_dir / 'state' / 'relay.json', relay_state)
@@ -1368,12 +1582,12 @@ class Worker:
     def step_close(self, data, m, pr, hub_dir, watch):
         number = m['number']
         # Every tick: a relay that came back owns the close again, and this attempt is dropped.
-        if closer.relay_alive(data['repo'], str(number), agw.tree()):
+        if closer.relay_alive(data['repo'], str(number), agw.tree(), queue_workspace(data)):
             if watch['attempt'] is not None:
                 watch['attempt'].log('the relay is back; the conductor leaves the close to it')
                 watch['attempt'] = None
             if not m.get('closeStuck'):
-                print(f'#{number}: {RELAY_ALIVE}', flush=True)
+                print(f'{self.tag}#{number}: {RELAY_ALIVE}', flush=True)
                 self.mark(number, closeStuck=RELAY_ALIVE)
             return
         if watch['attempt'] is None:
@@ -1383,8 +1597,8 @@ class Worker:
             registry = read_json(hub_dir / 'state' / 'agents.json')['agents']
             peers = [types.SimpleNamespace(box=box, tool=registry[box].get('tool', box), pane=registry[box]['pane'])
                      for box in ('claude', 'codex')]
-            watch['attempt'] = closer.Closer(hub_dir, data['repo'], number, peers,
-                                             log=lambda text: print(f'#{number} {text}', flush=True), clock=self.clock)
+            watch['attempt'] = closer.Closer(hub_dir, data['repo'], number, peers, workspace=queue_workspace(data),
+                                             log=lambda text: print(f'{self.tag}#{number} {text}', flush=True), clock=self.clock)
             subject = f'PR #{pr} (issue #{number}) merged' if pr is not None else f'issue #{number} closed without a PR'
             watch['attempt'].log(f'{subject} and its relay is gone; the conductor runs the close')
             if str(m.get('closeStuck', '')).startswith(RELAY_ALIVE):
@@ -1511,13 +1725,14 @@ class Worker:
             return f'low memory: {free / GIB:.1f} GB free < {minimum:g} GB'
         return None
 
-    def live_numbers(self, repo):
+    def live_numbers(self, data):
         """Issue numbers with a live issue session, read once per tick and only when needed; None when
         the terminal cannot be read. session_live passes None on: the ceiling then counts every member
         as live, and slot decisions hold a slot whose grace has not started and otherwise change nothing."""
         if self.tick_sessions is _UNREAD:
             try:
-                self.tick_sessions = session_numbers(repo, agw.tree())
+                # Only this queue's workspace (#66): its own members' sessions, and no sibling is read.
+                self.tick_sessions = session_numbers(data['repo'], agw.tree(), [queue_workspace(data)])
                 self.errors.pop('live sessions', None)
             except (OSError, ValueError, KeyError, TypeError, agw.CtlError) as err:
                 self.error('live sessions', err)
@@ -1529,7 +1744,7 @@ class Worker:
         cannot be read (nothing is stamped or cleared then), True when it is seen or has been missing
         for less than SESSION_GRACE seconds - one blank read of a restarting terminal changes
         nothing - and False after that. `sessionGoneSince` records when it was first missed."""
-        live = self.live_numbers(data['repo'])
+        live = self.live_numbers(data)
         if live is None:
             return None
         if m['number'] in live:
@@ -1728,6 +1943,8 @@ class Worker:
             settings = dict(data)
             if route:
                 settings['implementer'] = route     # this launch only; the queue's setting is the human's
+                # A profile chosen for the queue's tool is not the routed tool's (#66): that one's default applies.
+                settings.pop('revmuxProfile', None)
         for number, attempt, token, checkout, cleanup in orphan_timeouts:
             if cleanup:
                 self.cleanup_launch(checkout, token)
@@ -1758,7 +1975,7 @@ class Worker:
             if bool(reason) != getattr(self, attribute):
                 setattr(self, attribute, bool(reason))
                 message = f'queue paused: {reason}' if reason else f'queue resumed: {resumed}'
-                print(message, flush=True)
+                print(self.tag + message, flush=True)
                 self.notify(message)
                 changed = True
         if changed:
@@ -1766,7 +1983,7 @@ class Worker:
         for m in current['members']:
             display = (m['state'], m.get('prState'), m.get('reason'))
             if self.last_display.get(m['number']) != display:
-                print(f'#{m["number"]}: {display[0]} {display[1] or ""} {display[2] or ""}', flush=True)
+                print(f'{self.tag}#{m["number"]}: {display[0]} {display[1] or ""} {display[2] or ""}', flush=True)
                 if m['state'] in {'blocked', 'failed'}:
                     self.notify(f'#{m["number"]}: {m["state"]}: {m.get("reason") or ""}')
                 self.last_display[m['number']] = display
@@ -1886,6 +2103,9 @@ def main(argv=None):
     for flag in ('watch', 'retry', 'yes', 'dry-run', 'triage', 'prune'):
         start.add_argument('--' + flag, action='store_true')
     start.add_argument('--implementer', choices=IMPLEMENTER_TOOLS)
+    start.add_argument('--name', help='a named queue of the repo (#66); omitted: the main queue')
+    start.add_argument('--workspace', help="the named queue's agwinterm workspace (#66)")
+    start.add_argument('--revmux-profile', help="the queue's revmux profile, passed to every member launch (#66)")
     start.add_argument('--clear-limit', choices=IMPLEMENTER_TOOLS,
                        help="forget the queue's recorded usage limit of this tool (#61)")
     merge = start.add_mutually_exclusive_group()
@@ -1932,7 +2152,8 @@ def main(argv=None):
             return start_queue(spec, args.repo, args.parallel, args.watch, args.retry, args.yes, args.dry_run,
                                implementer=args.implementer, auto_merge=args.auto_merge,
                                autonomous=args.autonomous, triage_on=args.triage, prune=args.prune,
-                               clear_limit=args.clear_limit)
+                               clear_limit=args.clear_limit, name=args.name, workspace=args.workspace,
+                               revmux_profile=args.revmux_profile)
         if args.command == 'run':
             return Worker(Store(args.file), args.token).run()
         if args.command == 'mark':
