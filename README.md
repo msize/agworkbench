@@ -142,7 +142,8 @@ A label spec (`bugs`, `label:X`) or a `where:` query queues only issues nobody i
 out is printed as `#N skipped: <reason>`:
 - `pr`: an open pull request will close it, or an open PR is on its `issue-<N>-*` branch in this
   repo;
-- `session`: a workbench session `#N ...` is open for it in the repo's workspace;
+- `session`: a workbench session `#N ...` is open for it in the repo's workspace or a workspace of
+  one of the repo's queues;
 - `checkout-lock`: a launcher currently holds its checkout;
 - `checkout`: its checkout exists from an earlier loop outside this queue (resume or delete it);
 - `queued (<state>)`: it is already a member of this queue.
@@ -190,6 +191,39 @@ slot when a branch PR merged or, with no open PR on the branch, the issue closed
 can record a missing PR with
 `python lib/conductor.py mark --file <queue.json> --number N --pr <url> --reason "<why>"`;
 the action is recorded in the queue and its `operator.log`.
+
+**Named queues (#66).** A repo can run more than one queue at once, for example a main queue for
+P0/P1 with Claude and an evaluation queue for P2 with Kimi whose PRs wait for review:
+
+```powershell
+github-workbench -Queue 'where: priority IN [P2]' -Repo yeroo/docxy -QueueName kimi -Implementer kimi -NoAutoMerge -Watch
+```
+
+- **Its own everything:** the queue file is `~/.agworkbench/queues/yeroo/docxy.kimi.json`; its
+  conductor is `#queue yeroo/docxy (kimi)`; its members, relays and helpers open in the agwinterm
+  workspace `docxy-kimi` (or `-Workspace <name>`, fixed at the first start); its checkouts are
+  `docxy-kimi-issue-N`. Implementer, revmux profile, autonomy, auto-merge and parallel are its own.
+  Without `-QueueName` it is the main queue (`docxy.json`, the `docxy` workspace), as before. A
+  queue name is 1-32 of `a-z 0-9 -`; `main` is reserved.
+- **Exclusive claims:** an issue that is a member of one queue of the repo, in any state but merged
+  or closed (a failed one included, since `-Retry` revives it), is skipped by every other queue with
+  `#N skipped: claimed by queue <name>`. That holds for explicit lists and watch rescans too. The
+  check and the write happen under one repo-wide lock, so two queues adding the same issue at the same
+  moment admit it once. A queue file of the repo that cannot be read stops the add rather than
+  counting as "no claim". The in-hand skips also look in every queue's workspace and in the plain
+  `docxy-issue-N` checkout.
+- **No triage in named queues:** `-Triage` with `-QueueName` is refused. Triage stays the one
+  repo-wide `github-workbench -Triage -Repo yeroo/docxy -Watch`, and named queues read the priority
+  labels it sets.
+- **Review profile:** `-RevmuxProfile <name>` saves a profile on the queue and passes it to every
+  member the conductor launches. It holds for conductor launches only: a manual resume or a failover
+  inside the checkout uses the tool's default, and a member the conductor routes to another tool
+  because of a usage limit gets that tool's default too. The default for Kimi is `kimi-mixed` when
+  the installed revmux lists it (`revmux config`), else `claude-only` with a warning.
+- **Names:** `<repo>-<queue>` should not be another repo's name. A clone that the queue has not yet
+  established is reused only when its origin is the queue's repo.
+- `-Cleanup` recognises `<repo>-<queue>-issue-N` checkouts and checks their sessions in the workspace
+  their queue membership records.
 
 Claude's conversation ID, original project directory and pane binding live in
 `.workbench/state/claude.json`. The launcher reserves the ID before starting Claude, so an
@@ -368,8 +402,10 @@ both Claude panes. For the implementer, flags that would widen its tool policy a
 `--dangerously-skip-permissions`, it asks before commands, and the loop waits for you.
 
 **Review rounds follow the implementer.** `wb.py revmux` uses the revmux profile saved for the
-checkout: `comprehensive` with Codex, `claude-only` with Claude or Kimi, so a round never depends on
-Codex's quota. `revmuxProfile` in the config overrides both, and `--profile` overrides it for one round.
+checkout: `comprehensive` with Codex, `claude-only` with Claude, and `kimi-mixed` with Kimi when the
+installed revmux has it (else `claude-only`, #66), so a round never depends on Codex's quota.
+`revmuxProfile` in the config overrides them, a queue's `-RevmuxProfile` overrides that for its
+members, and `--profile` overrides it for one round.
 
 ### Kimi Code as the implementer
 
@@ -778,7 +814,7 @@ the autonomous close can close it. revmux and revdiff rounds that fail also mail
 | `checkoutRoot` | `~/source/workbench` | where per-issue clones go |
 | `allowNetwork` | `false` | let Codex's sandbox reach the network (package installs, tests that fetch); with a Claude implementer, allows its web tools; with Kimi, drops the launcher's check that Kimi's own `[tools] disabled` turns its web tools off |
 | `implementer` | `"codex"` | who runs the right pane (`"codex"`, `"claude"` or `"kimi"`) in a new checkout; an existing checkout keeps its saved tool. `-Implementer` changes it for that checkout (refused while a live agent holds the pane) or sets it for a queue's members |
-| `revmuxProfile` | by implementer | revmux profile for review rounds: `comprehensive` with Codex, `claude-only` with Claude or Kimi |
+| `revmuxProfile` | by implementer | revmux profile for review rounds: `comprehensive` with Codex, `claude-only` with Claude, `kimi-mixed` with Kimi when revmux has it (else `claude-only`) |
 | `failover` | `true` | when the implementer hits its usage limit, the planner stops it (only when idle at the limit) and switches to the next tool in `failoverOrder`; `false` only reports |
 | `failoverOrder` | `["claude", "codex", "kimi"]` | the tools a failover (and a queue with a limited tool) tries, in order: the first that is not the limited one and has no recorded limit; `-Failover` also skips a Kimi that fails its launch checks, while a queue routes by limits only and lets the member's launch check Kimi (a refusal defers the member). At least two distinct tools |
 | `kimiPath` | none | `kimi.exe` for the Kimi implementer; without it, `PATH`, then `%USERPROFILE%\.kimi-code\bin\kimi.exe` |
