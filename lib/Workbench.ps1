@@ -112,7 +112,7 @@ function Get-WorkbenchConfig {
          allowNetwork   let Codex's sandbox reach the network (default false)
          implementer    who runs in the right pane: codex (default), claude or kimi (#65)
          revmuxProfile  revmux profile for review rounds (default: comprehensive with codex,
-                        claude-only with claude or kimi)
+                        claude-only with claude, kimi-mixed with kimi when revmux has it, #66)
          kimiPath       kimi.exe to run when implementer is kimi (default: PATH, then
                         ~\.kimi-code\bin\kimi.exe)
          kimiArgs       extra arguments for kimi (policy and session flags are refused - see
@@ -190,8 +190,38 @@ function Test-ImplementerTool($Value) { return $Value -is [string] -and $Value -
 function Get-RevmuxProfile([string] $Tool, $Configured) {
     # Codex reviews only when Codex implements: a Claude or Kimi implementer may mean Codex is out of quota.
     if ($Configured) { return [string]$Configured }
+    if ($Tool -eq 'kimi') {
+        # Kimi reviews with kimi-mixed when the installed revmux has it (#66), else claude-only. Per
+        # launch and never saved as a choice: a failover to another tool gets that tool's default.
+        if (Test-RevmuxProfile 'kimi-mixed') { return 'kimi-mixed' }
+        Write-Warning "revmux has no 'kimi-mixed' profile (an older revmux?); kimi reviews with claude-only"
+        return 'claude-only'
+    }
     if ($Tool -ne 'codex') { return 'claude-only' }
     return 'comprehensive'
+}
+
+function Test-RevmuxProfile([string] $Name) {
+    # Whether `revmux config` lists the profile. Anything that goes wrong - no revmux, a timeout,
+    # output that is not its JSON - is "no": the caller falls back, a launch never fails on it.
+    $revmux = Get-Command revmux -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $revmux) { return $false }
+    $out = [IO.Path]::GetTempFileName()
+    $err = [IO.Path]::GetTempFileName()
+    try {
+        $process = Start-Process -FilePath $revmux.Source -ArgumentList 'config' -NoNewWindow -PassThru `
+            -RedirectStandardOutput $out -RedirectStandardError $err
+        if (-not $process.WaitForExit(15000)) {
+            try { $process.Kill() } catch { }
+            return $false
+        }
+        $names = @((Get-Content -Raw -LiteralPath $out -Encoding UTF8 | ConvertFrom-Json).profiles | ForEach-Object { $_.name })
+        return $names -ccontains $Name
+    } catch {
+        return $false
+    } finally {
+        Remove-Item -LiteralPath $out, $err -ErrorAction SilentlyContinue
+    }
 }
 
 # --- Kimi Code (#65) -----------------------------------------------------------------------------
@@ -674,13 +704,14 @@ function Test-IssueSessionName([string] $Name, [int] $Number) {
     return ($Name.StartsWith("#$Number ") -and $Name -notmatch "^#$Number (relay|revmux r\d+|your review)$")
 }
 
-function Find-IssueSession($Tree, [string] $RepoName, [int] $Number, [string] $Slug, $Registry) {
+function Find-IssueSession($Tree, [string] $WorkspaceName, [int] $Number, [string] $Slug, $Registry) {
+    # $WorkspaceName: the repo's name, or a named queue's own workspace (#66).
     $registered = Find-SessionByPane $Tree $Registry.agents.claude.pane
-    if ($registered -and $registered.Workspace.name -eq $RepoName -and
+    if ($registered -and $registered.Workspace.name -eq $WorkspaceName -and
         (Test-IssueSessionName $registered.Session.name $Number)) { return $registered.Session }
     if ($Registry.agents.claude.pane) { Write-LaunchLog resume 'stale or mismatching registry pane ignored' }
     $candidates = @(foreach ($workspace in $Tree.workspaces) {
-        if ($workspace.name -eq $RepoName) {
+        if ($workspace.name -eq $WorkspaceName) {
             foreach ($session in $workspace.sessions) {
                 if (Test-IssueSessionName $session.name $Number) { $session }
             }
@@ -688,18 +719,18 @@ function Find-IssueSession($Tree, [string] $RepoName, [int] $Number, [string] $S
     })
     $exact = @($candidates | Where-Object { $_.name -eq "#$Number $Slug" })
     if ($exact.Count) { $candidates = $exact }
-    if ($candidates.Count -gt 1) { throw "ambiguous #$Number sessions in '$RepoName': $($candidates.id -join ', ')" }
+    if ($candidates.Count -gt 1) { throw "ambiguous #$Number sessions in '$WorkspaceName': $($candidates.id -join ', ')" }
     if ($candidates.Count) { return $candidates[0] }
     return $null
 }
 
-function Find-RelaySession($Tree, [string] $RepoName, [int] $Number) {
+function Find-RelaySession($Tree, [string] $WorkspaceName, [int] $Number) {
     $candidates = @(foreach ($workspace in $Tree.workspaces) {
-        if ($workspace.name -eq $RepoName) {
+        if ($workspace.name -eq $WorkspaceName) {
             $workspace.sessions | Where-Object { $_.name -eq "#$Number relay" }
         }
     })
-    if ($candidates.Count -gt 1) { throw "ambiguous #$Number relay sessions in '$RepoName': $($candidates.id -join ', ')" }
+    if ($candidates.Count -gt 1) { throw "ambiguous #$Number relay sessions in '$WorkspaceName': $($candidates.id -join ', ')" }
     if ($candidates.Count) { return $candidates[0] }
     return $null
 }
@@ -1075,7 +1106,7 @@ function Resolve-Implementer {
        Returns @{ Tool; RevmuxProfile; AutoMerge; Autonomous; Conflict }, Conflict being a refusal
        message or $null. #>
     param([string] $Checkout, [string] $Requested, $Config, $Tree, [switch] $NoProbe, $RequestedAutoMerge = $null,
-          $RequestedAutonomous = $null)
+          $RequestedAutonomous = $null, [string] $RequestedRevmuxProfile)
     if ($Requested -and -not (Test-ImplementerTool $Requested)) { throw [ImplementerConflict]::new("-Implementer must be codex, claude or kimi (got '$Requested')") }
     $saved = Get-SavedImplementerTool $Checkout
     $tool = $Config.implementer
@@ -1109,7 +1140,10 @@ function Resolve-Implementer {
         }
         $autoMerge = $true
     }
-    return @{ Tool = $tool; RevmuxProfile = (Get-RevmuxProfile $tool $Config.revmuxProfile); AutoMerge = $autoMerge;
+    # A queue's explicit profile (#66) wins over the config's; it comes with a conductor launch only.
+    $chosenProfile = $Config.revmuxProfile
+    if ($RequestedRevmuxProfile) { $chosenProfile = $RequestedRevmuxProfile }
+    return @{ Tool = $tool; RevmuxProfile = (Get-RevmuxProfile $tool $chosenProfile); AutoMerge = $autoMerge;
               Autonomous = $autonomous; Cleanup = [string]$Config.cleanup; Conflict = $conflict }
 }
 
@@ -1397,22 +1431,22 @@ function Get-CallerSession($Tree) {
     return $found
 }
 
-function Get-AdoptionPlan($Tree, [string] $Checkout, [string] $RepoName, [int] $Number) {
+function Get-AdoptionPlan($Tree, [string] $Checkout, [string] $WorkspaceName, [int] $Number) {
     if (-not (Test-ClaudeCaller) -and ($env:CODEX_THREAD_ID -or $env:CODEX_SANDBOX)) {
         throw [AdoptRefused]::new('a Codex process cannot adopt its pane as Claude; use -NewSession')
     }
     $caller = Get-CallerSession $Tree
     $session = $caller.Session
     $panes = @(Get-PaneIds $session)
-    $workspaces = @($Tree.workspaces | Where-Object { $_.name -eq $RepoName })
+    $workspaces = @($Tree.workspaces | Where-Object { $_.name -eq $WorkspaceName })
     if ($workspaces.Count -gt 1) {
-        throw [AdoptRefused]::new("multiple workspaces named '$RepoName': $($workspaces.id -join ', ')")
+        throw [AdoptRefused]::new("multiple workspaces named '$WorkspaceName': $($workspaces.id -join ', ')")
     }
     $workspaceId = $null
     if ($workspaces.Count) {
         $guid = [guid]::Empty
         if (-not [guid]::TryParse([string]$workspaces[0].id, [ref]$guid) -or $guid -eq [guid]::Empty) {
-            throw [AdoptRefused]::new("workspace '$RepoName' has no valid id")
+            throw [AdoptRefused]::new("workspace '$WorkspaceName' has no valid id")
         }
         $workspaceId = $workspaces[0].id
     }
@@ -1439,7 +1473,7 @@ function Get-AdoptionPlan($Tree, [string] $Checkout, [string] $RepoName, [int] $
             }
         }
     }
-    $ownRegistry = ($caller.Workspace.name -eq $RepoName -and
+    $ownRegistry = ($caller.Workspace.name -eq $WorkspaceName -and
         (Test-IssueSessionName $session.name $Number) -and $registry.agents.claude.pane -eq $caller.Pane)
     if ($ownRegistry -and $panes.Count -eq 2) {
         $ownRegistry = $registry.agents.codex.pane -in $panes -and $registry.agents.codex.pane -ne $caller.Pane
@@ -1476,7 +1510,7 @@ function Save-AdoptionState([string] $Checkout, $State) {
     Write-AtomicJson $path $State
 }
 
-function Initialize-AdoptedSession($Plan, [string] $Checkout, [string] $RepoName, [int] $Number, [string] $Slug) {
+function Initialize-AdoptedSession($Plan, [string] $Checkout, [string] $WorkspaceName, [int] $Number, [string] $Slug) {
     $script:Launch.SessionId = $Plan.Session.id
     $script:Launch.Claude = $Plan.CallerPane
     $script:Launch.Codex = $Plan.CodexPane
@@ -1492,7 +1526,7 @@ function Initialize-AdoptedSession($Plan, [string] $Checkout, [string] $RepoName
     Set-LaunchStage adopt-workspace
     $workspaceId = $Plan.TargetWorkspace
     if (-not $workspaceId) {
-        $workspaceId = (Invoke-Ctl workspace new $RepoName).Trim()
+        $workspaceId = (Invoke-Ctl workspace new $WorkspaceName).Trim()
         $guid = [guid]::Empty
         if (-not [guid]::TryParse($workspaceId, [ref]$guid) -or $guid -eq [guid]::Empty) {
             throw "workspace new returned an invalid id: '$workspaceId'"
@@ -1511,7 +1545,7 @@ function Start-WorkbenchSession {
           [string] $ClaudeLaunch, [string] $CodexLaunch, [string] $CodexRestore,
           [scriptblock] $RelayCommand, [switch] $NoRelay,
           [string] $AdoptSession, [string] $CallerPane, [string] $ImplementerTool = 'codex',
-          [bool] $ImplementerIdentityReady = $true)
+          [bool] $ImplementerIdentityReady = $true, [string] $WorkspaceName)
     $invokeArgs = @{} + $PSBoundParameters
     Invoke-WithCheckoutLock $Checkout { Start-WorkbenchSessionCore @invokeArgs }
 }
@@ -1521,8 +1555,10 @@ function Start-WorkbenchSessionCore {
           [string] $ClaudeLaunch, [string] $CodexLaunch, [string] $CodexRestore,
           [scriptblock] $RelayCommand, [switch] $NoRelay,
           [string] $AdoptSession, [string] $CallerPane, [string] $ImplementerTool = 'codex',
-          [bool] $ImplementerIdentityReady = $true)
+          [bool] $ImplementerIdentityReady = $true, [string] $WorkspaceName)
     $ErrorActionPreference = 'Stop'
+    # The workspace of the issue's sessions: a named queue's own (#66), else the repo's name.
+    if (-not $WorkspaceName) { $WorkspaceName = $RepoName }
     if (-not $script:Launch) { $script:Launch = @{} }
     $adoptedCodex = $script:Launch.Codex
     foreach ($key in @('SessionId', 'Claude', 'Codex', 'RelaySession', 'MailboxReady', 'ClaudeTyped', 'CodexTyped',
@@ -1557,13 +1593,13 @@ function Start-WorkbenchSessionCore {
     }
     $tree = Get-Tree
     if ($AdoptSession) {
-        try { $livePlan = Get-AdoptionPlan $tree $Checkout $RepoName $Number }
+        try { $livePlan = Get-AdoptionPlan $tree $Checkout $WorkspaceName $Number }
         catch [AdoptRefused] { throw "adoption changed after setup: $($_.Exception.Message)" }
         if ($livePlan.Session.id -ne $AdoptSession -or $livePlan.CallerPane -ne $CallerPane) {
             throw 'adoption caller session changed'
         }
         $session = $livePlan.Session
-    } else { $session = Find-IssueSession $tree $RepoName $Number $Slug $registry }
+    } else { $session = Find-IssueSession $tree $WorkspaceName $Number $Slug $registry }
     if ($script:Launch.QueueContext) {
         $context = $script:Launch.QueueContext
         $check = & python (Join-Path $script:Lib 'conductor.py') member-context --file $context.queue `
@@ -1580,7 +1616,7 @@ function Start-WorkbenchSessionCore {
     }
     $relaySession = $null
     if (-not $NoRelay) {
-        $relaySession = Find-RelaySession $tree $RepoName $Number
+        $relaySession = Find-RelaySession $tree $WorkspaceName $Number
         if ($relaySession) { $script:Launch.RelaySession = $relaySession.id }
     }
     $script:Launch.Adopted = $null -ne $session
@@ -1592,7 +1628,7 @@ function Start-WorkbenchSessionCore {
         $command = @()
         if (-not $script:Launch.QueueContext) { $command = @('--command', $ClaudeLaunch) }
         $id = Invoke-Ctl session new --name "#$Number $Slug" --cwd $Checkout `
-            --workspace-name $RepoName --create-workspace @command @selection
+            --workspace-name $WorkspaceName --create-workspace @command @selection
         $script:Launch.SessionId = ($id -split '\s+')[0]
         if (-not (Test-SessionGuid $script:Launch.SessionId)) { throw 'session new returned an invalid pane id' }
         if ($script:Launch.QueueContext) { Add-QueueCreatedSession $Checkout $script:Launch.SessionId }
@@ -1794,7 +1830,7 @@ function Start-WorkbenchSessionCore {
             }
         } else {
             if (Test-Path -LiteralPath $stopFile) { Remove-Item -LiteralPath $stopFile -ErrorAction Stop }
-            $reply = Invoke-Ctl session new --name "#$Number relay" --cwd $Checkout --workspace-name $RepoName `
+            $reply = Invoke-Ctl session new --name "#$Number relay" --cwd $Checkout --workspace-name $WorkspaceName `
                 --no-select --command $relay
             $script:Launch.RelaySession = ($reply -split '\s+')[0]
             if ($script:Launch.QueueContext) { Add-QueueCreatedSession $Checkout $script:Launch.RelaySession }
@@ -1890,6 +1926,53 @@ function Get-IssueInfo([hashtable] $Issue) {
 
 # --- the checkout ----------------------------------------------------------------------------
 
+function Get-GitHubOriginRepo([string] $Url) {
+    # `owner/name` (lowercase) of a GitHub remote in https, ssh or scp form, else $null (cleanup.py's origin_repo).
+    if ("$Url".Trim() -match '^(?:https?://(?:[^@/]+@)?github\.com/|ssh://git@github\.com/|git@github\.com:)([A-Za-z0-9][A-Za-z0-9_.-]*)/([A-Za-z0-9][A-Za-z0-9_.-]*?)(?:\.git)?/?$') {
+        return "$($Matches[1])/$($Matches[2])".ToLowerInvariant()
+    }
+    return $null
+}
+
+function Get-NamedCheckoutMembership([string] $Dir, [hashtable] $Issue) {
+    <# A named queue member's checkout (#66), proven by its own queue membership: it names this repo
+       and issue, and a checkout of this directory's name - the conductor records a resolved path, which
+       a junction or subst checkoutRoot spells differently. Returns @{ Dir; Workspace; Queue }; $null
+       when there is no membership or a valid one that is not this issue's named checkout. A membership
+       that cannot be read is refused, as closer.workspace_of refuses it: guessing would go plain. #>
+    $path = Join-Path $Dir '.workbench\state\queue-member.json'
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    try { $member = Get-Content -Raw -LiteralPath $path -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop }
+    catch { throw "cannot read the queue membership '$path': $_" }
+    if ($member -isnot [pscustomobject]) { throw "cannot read the queue membership '$path': not an object" }
+    if (-not $member.queueName -or -not $member.workspace -or -not $member.checkout -or
+        "$($member.repo)" -ne $Issue.Repo -or "$($member.number)" -ne "$($Issue.Number)") { return $null }
+    $full = [IO.Path]::GetFullPath($Dir).TrimEnd('\', '/')
+    if ((Split-Path -Leaf ([string]$member.checkout).TrimEnd('\', '/')) -ne (Split-Path -Leaf $full)) { return $null }
+    return @{ Dir = $full; Workspace = [string]$member.workspace; Queue = [string]$member.queueName }
+}
+
+function Find-NamedCheckout([hashtable] $Issue, [string] $Root, [string] $Cwd) {
+    <# A single-issue launch outside a queue (the planner's -Failover, a human's -Implementer) of a
+       named queue's member (#66): the checkout it runs in, when that is one; else, when the plain
+       <repo>-issue-N has no clone, the one <repo>-<queue>-issue-N whose membership says so. Never a
+       guess without a membership; more than one is refused. $null: the plain checkout. #>
+    if ($Cwd) {
+        $here = Get-NamedCheckoutMembership $Cwd $Issue
+        if ($here) { return $here }
+    }
+    $name = ($Issue.Repo -split '/')[1]
+    if (Test-Path -LiteralPath (Join-Path (Join-Path $Root "$name-issue-$($Issue.Number)") '.git')) { return $null }
+    if (-not (Test-Path -LiteralPath $Root)) { return $null }
+    $found = @(Get-ChildItem -LiteralPath $Root -Directory -Filter "$name-*-issue-$($Issue.Number)" -ErrorAction SilentlyContinue |
+        ForEach-Object { Get-NamedCheckoutMembership $_.FullName $Issue } | Where-Object { $_ })
+    if ($found.Count -gt 1) {
+        throw "issue $($Issue.Repo)#$($Issue.Number) has checkouts in several named queues: $(($found | ForEach-Object { $_.Dir }) -join ', '); run from the one to use"
+    }
+    if ($found.Count) { return $found[0] }
+    return $null
+}
+
 function New-IssueCheckout {
     <# A FULL clone per issue, not a worktree: a worktree's .git lives outside the checkout, and
        Codex's workspace-write sandbox would then be unable to commit. Reused if it already exists,
@@ -1918,12 +2001,23 @@ function New-IssueCheckout {
             $target = [IO.Path]::GetFullPath($dir).TrimEnd('\', '/')
             $saved = [IO.Path]::GetFullPath($script:Launch.QueueContext.checkout).TrimEnd('\', '/')
             $item = Get-Item -LiteralPath $target -Force
-            if ($target -ne $saved -or (Split-Path -Leaf $target) -ne "$name-issue-$($Issue.Number)" -or
+            # The saved checkout names the leaf: `<repo>-issue-N`, or a named queue's `<repo>-<queue>-issue-N` (#66).
+            if ($target -ne $saved -or (Split-Path -Leaf $target) -notmatch "-issue-$($Issue.Number)$" -or
                 -not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
                 throw "refusing to replace partial clone at $target; repair it manually"
             }
             Write-Step "replacing incomplete queue clone $target"
             Remove-Item -LiteralPath $target -Recurse -Force
+        } else {
+            # `<repo>-<queue>` can be another repo's name (#66): a clone this queue has not yet
+            # established is reused only when its origin is this repo.
+            $origin = & {
+                $ErrorActionPreference = 'Continue'
+                & git -C $dir remote get-url origin 2>$null
+            }
+            if ((Get-GitHubOriginRepo $origin) -ne $Issue.Repo.ToLowerInvariant()) {
+                throw "refusing to reuse $dir for $($Issue.Repo): its origin is '$origin'"
+            }
         }
     }
     if (Test-Path -LiteralPath (Join-Path $dir '.git')) {
@@ -2060,7 +2154,7 @@ function Format-AdoptedBlock([string] $Checkout, [string] $Issue) {
 
 function Invoke-LauncherBody {
     param([string] $Issue, [string] $Repo, [switch] $DryRun, [switch] $Yes, [switch] $NoRelay, [switch] $NewSession,
-          [string] $Implementer, $AutoMerge = $null, [switch] $Failover, $Autonomous = $null)
+          [string] $Implementer, $AutoMerge = $null, [switch] $Failover, $Autonomous = $null, [string] $RevmuxProfile)
     $script:Launch.ClaudeHerePending = $false
     $script:Launch.ExitCode = 0
     $script:Launch.NewSession = [bool]$NewSession
@@ -2074,6 +2168,19 @@ function Invoke-LauncherBody {
     $script:Launch.IssueRef = $issueRef
     $info = Get-IssueInfo $ref
     $repoName = ($ref.Repo -split '/')[1]
+    # The issue's sessions live in the repo's workspace, or a named queue's own (#66).
+    $workspaceName = $repoName
+    $namedDir = $null
+    if ($script:Launch.QueueContext) {
+        if ($script:Launch.QueueContext.workspace) { $workspaceName = [string]$script:Launch.QueueContext.workspace }
+    } else {
+        # Outside the conductor, a named queue member's checkout is found by its membership (#66).
+        $named = Find-NamedCheckout $ref $config.checkoutRoot (Get-Location).ProviderPath
+        if ($named) {
+            $namedDir, $workspaceName = $named.Dir, $named.Workspace
+            Write-Step "named queue '$($named.Queue)': checkout $namedDir, workspace '$workspaceName'"
+        }
+    }
     $slug = ConvertTo-Slug $info.title 24
     Write-Host "workbench for $issueRef - $($info.title)" -ForegroundColor Cyan
     if ($info.state -ne 'OPEN') { Write-Warning "issue is $($info.state)" }
@@ -2081,7 +2188,8 @@ function Invoke-LauncherBody {
     if ((Test-InsideAgwinterm) -and -not $NewSession) {
         Set-LaunchStage adoption-preflight
         $expectedCheckout = Join-Path $config.checkoutRoot "$repoName-issue-$($ref.Number)"
-        $adoptionPlan = Get-AdoptionPlan (Get-Tree) $expectedCheckout $repoName $ref.Number
+        if ($namedDir) { $expectedCheckout = $namedDir }
+        $adoptionPlan = Get-AdoptionPlan (Get-Tree) $expectedCheckout $workspaceName $ref.Number
     }
 
     # --- 1. the terminal --------------------------------------------------------------------------
@@ -2102,11 +2210,13 @@ function Invoke-LauncherBody {
     # --- 2. the checkout --------------------------------------------------------------------------
     if ($DryRun) {
         $dir = Join-Path $config.checkoutRoot "$repoName-issue-$($ref.Number)"
+        if ($namedDir) { $dir = $namedDir }
         $co = @{ Dir = $dir; Branch = "issue-$($ref.Number)-$(ConvertTo-Slug $info.title 32)" }
         Write-Step "would clone $($ref.Repo) into $($co.Dir) on branch $($co.Branch)"
     } else {
         $checkoutArgs = @{}
         if ($script:Launch.QueueContext) { $checkoutArgs.Directory = $script:Launch.QueueContext.checkout }
+        elseif ($namedDir) { $checkoutArgs.Directory = $namedDir }
         $co = New-IssueCheckout -Issue $ref -Title $info.title -Root $config.checkoutRoot @checkoutArgs
         Set-LaunchStage trust
         Grant-CodexTrust -Dir $co.Dir
@@ -2133,14 +2243,15 @@ function Invoke-LauncherBody {
                   Restore = (Get-PaneLaunch 'pane-codex.ps1' @{ Checkout = $co.Dir; Issue = $issueRef } -Switches @('Resume')) }
     }
     if ($DryRun) {
-        $resolved = Resolve-Implementer -Checkout $co.Dir -Requested $Implementer -Config $config -NoProbe -RequestedAutoMerge $AutoMerge -RequestedAutonomous $Autonomous
+        $resolved = Resolve-Implementer -Checkout $co.Dir -Requested $Implementer -Config $config -NoProbe -RequestedAutoMerge $AutoMerge -RequestedAutonomous $Autonomous `
+            -RequestedRevmuxProfile $RevmuxProfile
         $codexLaunch = (& $implementerLines $resolved.Tool).Launch
         if ($adoptionPlan) {
-            Write-Step "would $($adoptionPlan.Mode) session '$($adoptionPlan.Session.id)' as '#$($ref.Number) $slug' in workspace '$repoName'"
+            Write-Step "would $($adoptionPlan.Mode) session '$($adoptionPlan.Session.id)' as '#$($ref.Number) $slug' in workspace '$workspaceName'"
             Write-Step "caller pane '$($adoptionPlan.CallerPane)' preserved; would write adoption state and Bash context"
             if (-not (Test-ClaudeCaller)) { Write-Step "would start Claude here after successful setup: $claudeLaunch" }
         } else {
-            Write-Step "would open session '#$($ref.Number) $slug' in workspace '$repoName'"
+            Write-Step "would open session '#$($ref.Number) $slug' in workspace '$workspaceName'"
             Write-Step "left pane:  $claudeLaunch"
         }
         Write-Step "implementer: $($resolved.Tool) (revmux profile $($resolved.RevmuxProfile)); auto-merge $(Format-AutoMerge $resolved.AutoMerge); autonomous $(Format-AutoMerge $resolved.Autonomous)"
@@ -2186,7 +2297,8 @@ function Invoke-LauncherBody {
             $Implementer = Invoke-Failover -Checkout $co.Dir -Config $config -Tree (Get-Tree)
             Set-LaunchStage implementer
         }
-        $resolved = Resolve-Implementer -Checkout $co.Dir -Requested $Implementer -Config $config -Tree (Get-Tree) -RequestedAutoMerge $AutoMerge -RequestedAutonomous $Autonomous
+        $resolved = Resolve-Implementer -Checkout $co.Dir -Requested $Implementer -Config $config -Tree (Get-Tree) -RequestedAutoMerge $AutoMerge -RequestedAutonomous $Autonomous `
+            -RequestedRevmuxProfile $RevmuxProfile
         if ($resolved.Conflict) { throw [ImplementerConflict]::new($resolved.Conflict) }
         # Kimi is checked before anything is recorded, so a refusal changes nothing (#65). A failover
         # to kimi checked it before it stopped the limited agent.
@@ -2209,7 +2321,7 @@ function Invoke-LauncherBody {
         $adoptArgs = @{}
         if ($adoptionPlan) {
             Set-LaunchStage adoption-recheck
-            $currentPlan = Get-AdoptionPlan (Get-Tree) $co.Dir $repoName $ref.Number
+            $currentPlan = Get-AdoptionPlan (Get-Tree) $co.Dir $workspaceName $ref.Number
             $previousPanes = (@(Get-PaneIds $adoptionPlan.Session) | Sort-Object) -join ','
             $currentPanes = (@(Get-PaneIds $currentPlan.Session) | Sort-Object) -join ','
             if ($currentPlan.Session.id -ne $adoptionPlan.Session.id -or
@@ -2230,11 +2342,11 @@ function Invoke-LauncherBody {
             if ($adoptionPlan.CodexPane) {
                 $implementerReady = Set-ImplementerRestore $co.Dir $adoptionPlan.CodexPane $codexRestore $resolved.Tool -ExistingPane
             }
-            Initialize-AdoptedSession $adoptionPlan $co.Dir $repoName $ref.Number $slug
+            Initialize-AdoptedSession $adoptionPlan $co.Dir $workspaceName $ref.Number $slug
             $adoptArgs = @{ AdoptSession = $adoptionPlan.Session.id; CallerPane = $adoptionPlan.CallerPane;
                             ImplementerIdentityReady = [bool]$implementerReady }
         }
-        Start-WorkbenchSession -Checkout $co.Dir -Number $ref.Number -Slug $slug -RepoName $repoName `
+        Start-WorkbenchSession -Checkout $co.Dir -Number $ref.Number -Slug $slug -RepoName $repoName -WorkspaceName $workspaceName `
             -ClaudeLaunch $claudeLaunch -CodexLaunch $codexLaunch -CodexRestore $codexRestore `
             -RelayCommand $relayBuilder -NoRelay:$NoRelay -ImplementerTool $resolved.Tool @adoptArgs
     }

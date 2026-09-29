@@ -211,7 +211,9 @@ def checkout_settings(root: Path) -> dict:
     tool = saved.get("tool") if saved.get("tool") in ("codex", "claude", "kimi") else "codex"
     profile = saved.get("revmuxProfile")
     if not (isinstance(profile, str) and re.fullmatch(r"[A-Za-z0-9._-]+", profile)):
-        # The launcher's Get-RevmuxProfile default: Codex reviews only when Codex implements.
+        # The launcher's Get-RevmuxProfile default: Codex reviews only when Codex implements. For kimi the
+        # launcher probes revmux for kimi-mixed (#66); this fallback cannot, and it only runs when
+        # implementer.json is missing, so it stays claude-only, which every revmux has.
         profile = "comprehensive" if tool == "codex" else "claude-only"
     return {"implementer": tool, "revmuxProfile": profile, "autoMerge": saved.get("autoMerge") is True,
             "autonomous": saved.get("autonomous") is True}

@@ -1010,9 +1010,9 @@ class QueueBugs(unittest.TestCase):
         self.pulls = []
         self.closing = {}
 
-    def fake_in_hand(self, repo, numbers, root, queue_path, gh=None, tree=None):
+    def fake_in_hand(self, repo, numbers, root, queue_path, gh=None, tree=None, **named):
         # The tree is passed through (None -> the live agw.tree(), which each test patches).
-        return self.real_in_hand(repo, numbers, root, queue_path, gh or self.fake_gh, tree)
+        return self.real_in_hand(repo, numbers, root, queue_path, gh or self.fake_gh, tree, **named)
 
     def fake_gh(self, *args):
         if args[:2] == ('repo', 'view'):
@@ -1261,6 +1261,29 @@ class CloseBackstop(unittest.TestCase):
         self.assertEqual([], self.actions)
         self.assertIn('relay is alive', self.member(7)['closeStuck'])
         self.assertTrue(q.finished(self.store.load()))           # flagged: the human's, not a reason to stay up
+
+    def named(self):
+        # #66: the same member in a named queue, whose sessions live in r-kimi.
+        data = self.store.load()
+        data.update(name='kimi', workspace='r-kimi')
+        kimi = q.Store(self.store.path.with_name('r.kimi.json'))
+        q.atomic_json(kimi.path, data)
+        self.store.path.unlink()
+        self.store = kimi
+        self.w = self.worker()
+        self.w.notify = Mock()
+
+    def test_a_named_queue_sees_its_relay_in_its_own_workspace(self):
+        self.named()
+        self.tree['workspaces'][0]['name'] = 'R-Kimi'
+        self.run_for(1200)
+        self.assertEqual([], self.actions)
+        self.assertIn('relay is alive', self.member(7)['closeStuck'])
+
+    def test_a_named_queue_ignores_a_same_named_relay_in_the_repo_workspace(self):
+        self.named()
+        self.run_for(1000)                       # '#7 relay' in 'r' is not this member's
+        self.assertIn(('close', self.PLANNER), self.actions)
 
     def test_a_gone_relay_gets_the_close(self):
         self.relay_gone()
@@ -2200,7 +2223,7 @@ class ToolLimits(unittest.TestCase):
 
     def setUp(self):
         QueueCase.setUp(self)
-        self.implementers = []
+        self.implementers, self.profiles = [], []
         self.start('o/r#1,2,3', parallel=1)
         self.w = self.worker()
         self.w.notify, self.w.status = Mock(), Mock()
@@ -2209,6 +2232,7 @@ class ToolLimits(unittest.TestCase):
 
     def spawn(self, data, m):
         self.implementers.append((m['number'], data.get('implementer')))
+        self.profiles.append((m['number'], data.get('revmuxProfile')))
         return QueueCase.spawn(self, data, m)
 
     def record(self, n, tool='codex', at=None, kind='warning', relay=False):
@@ -2265,6 +2289,19 @@ class ToolLimits(unittest.TestCase):
         self.assertEqual([(2, 'claude')], self.implementers)
         self.assertEqual('kimi', self.store.load()['implementer'])
         self.assertEqual('kimi', self.store.load()['toolLimits']['kimi']['line'].split()[0])
+
+    def test_a_routed_launch_drops_the_queues_revmux_profile(self):
+        # #66: the queue's profile was chosen for its tool; a member routed to another tool gets that
+        # tool's default from the launcher, never kimi-mixed while kimi is limited.
+        self.start('o/r#4', implementer='kimi', revmux_profile='kimi-mixed')
+        self.next_member()
+        self.assertEqual((2, 'kimi-mixed'), self.profiles[-1])
+        self.record(2, tool='kimi', kind='limited', relay=True)
+        self.report(2, 'pr-open')
+        self.w.tick()
+        self.assertEqual([(2, 'kimi'), (3, 'claude')], self.implementers[-2:])
+        self.assertEqual((3, None), self.profiles[-1])
+        self.assertEqual('kimi-mixed', self.store.load()['revmuxProfile'])     # the queue's setting stays
 
     def test_failover_order_is_configurable_and_skips_limited_tools(self):
         self.config.write_text(json.dumps({'checkoutRoot': str(self.root / 'clones'),
@@ -3060,3 +3097,345 @@ class Specs(unittest.TestCase):
         self.assertEqual(['session', 'restore', 'command', '--target', 'pane'],
                          q.agw._cli_args(dict(cmd='session.restore', target='pane', args={'command': 'command'})))
 
+
+class NamedQueues(unittest.TestCase):
+    """#66: a repo runs more than one queue. A named queue has its own file, workspace, checkouts and
+    settings; an issue one queue of the repo holds is skipped by every other; named queues do not triage."""
+    terminal, gh, spawn, worker, member = (QueueCase.terminal, QueueCase.gh, QueueCase.spawn,
+                                           QueueCase.worker, QueueCase.member)
+    fake_in_hand, fake_gh, start_bugs = QueueBugs.fake_in_hand, QueueBugs.fake_gh, QueueBugs.start_bugs
+
+    def setUp(self):
+        QueueBugs.setUp(self)
+        self.queues = self.root / 'queues'
+        self.kimi = q.Store(self.queues / 'o/r.kimi.json')
+
+    def start(self, spec='o/r#1,2,3', **kwargs):
+        with patch.object(q.agw, 'tree', side_effect=lambda: self.tree):
+            return QueueCase.start(self, spec, **kwargs)
+
+    def numbers(self, store):
+        return [m['number'] for m in store.load()['members']]
+
+    def output(self):
+        return sys.stdout.getvalue()
+
+    def test_a_named_queue_has_its_own_file_workspace_checkouts_and_conductor(self):
+        self.start('o/r#1', name='KIMI', implementer='kimi')
+        data = self.kimi.load()
+        self.assertEqual(('kimi', 'r-kimi', 'kimi'), (data['name'], data['workspace'], data['implementer']))
+        self.assertFalse(self.store.path.exists())
+        self.assertEqual(str(self.root / 'clones' / 'r-kimi-issue-1'), data['members'][0]['checkout'])
+        new = [kwargs['args'] for command, kwargs in self.requests if command == 'session.new']
+        self.assertEqual([('#queue o/r (kimi)', 'r-kimi', True)],
+                         [(a['name'], a['workspace-name'], a['create-workspace']) for a in new])
+        self.assertEqual(['session', 'new', '--name', '#queue o/r (kimi)', '--workspace-name', 'r-kimi',
+                          '--create-workspace'],
+                         q.agw._cli_args(dict(cmd='session.new', args={k: new[0][k] for k in
+                                                                        ('name', 'workspace-name', 'create-workspace')})))
+        self.start('o/r#2')                                       # the main queue: unchanged
+        main = self.store.load()
+        self.assertNotIn('name', main)
+        self.assertNotIn('workspace', main)
+        self.assertNotIn('workspace-name', [kwargs['args'] for c, kwargs in self.requests if c == 'session.new'][-1])
+        self.assertEqual(str(self.root / 'clones' / 'r-issue-2'), main['members'][0]['checkout'])
+        self.assertIn('Queue o/r (kimi) — snapshot', q.summary(data))
+
+    def test_member_context_carries_the_workspace_and_queue_name(self):
+        self.start('o/r#1', name='kimi', workspace='kimi-lab')
+        token = str(uuid.uuid4())
+        with self.kimi.transaction() as data:
+            data['members'][0].update(state='launching', attempt=1, token=token)
+        context = q.member_context(self.kimi.path, 1, 1, token)
+        self.assertEqual(('kimi', 'kimi-lab'), (context['queueName'], context['workspace']))
+        self.start('o/r#2')
+        with self.store.transaction() as data:
+            data['members'][0].update(state='launching', attempt=1, token=token)
+        context = q.member_context(self.store.path, 2, 1, token)
+        self.assertEqual((None, 'r'), (context['queueName'], context['workspace']))
+
+    def test_names_and_workspaces_are_validated_before_anything_is_written(self):
+        for bad in ('main', 'MAIN', '-x', 'a.b', 'a_b', 'x' * 33, 'k m'):
+            with self.subTest(name=bad), self.assertRaises(q.UsageError):
+                self.start('o/r#1', name=bad)
+        with self.assertRaises(q.UsageError):
+            self.start('o/r#1', workspace='r-kimi')                 # -Workspace without -QueueName
+        for bad in ('r', 'R', 'a b', '../x'):
+            with self.subTest(workspace=bad), self.assertRaises(q.UsageError):
+                self.start('o/r#1', name='kimi', workspace=bad)
+        with self.assertRaises(q.UsageError) as refused:
+            self.start('o/r#1', name='kimi', triage_on=True)
+        self.assertIn('-Triage -Repo <owner/name> -Watch', str(refused.exception))
+        self.assertEqual([], list(self.queues.glob('o/*.json')) if self.queues.exists() else [])
+        self.start('o/r#1', name='kimi')
+        with self.assertRaises(q.UsageError):
+            self.start('o/r#2', name='kimi', workspace='elsewhere')  # its members already live in r-kimi
+        self.start('o/r#2', name='kimi', workspace='R-KIMI')         # the same one, in another case
+        with self.assertRaises(q.UsageError):
+            self.start('o/r#3', name='gpt', workspace='r-kimi')      # another queue's workspace
+        self.assertFalse(q.queue_path(self.queues, 'o/r', 'gpt').exists())
+        self.assertEqual([1, 2], self.numbers(self.kimi))
+
+    def test_a_file_must_be_the_one_its_repo_and_name_give(self):
+        self.start('o/r#1', name='kimi')
+        data = json.loads(self.kimi.path.read_text())
+        for change in ({'name': None}, {'name': 'gpt'}, {'workspace': None}, {'triage': True},
+                       {'revmuxProfile': 'a b'}, {'name': 'main'}):
+            with self.subTest(change=change):
+                self.kimi.path.write_text(json.dumps(dict(data, **change)))
+                with self.assertRaises(q.StateError):
+                    self.kimi.load()
+        self.kimi.path.write_text(json.dumps(data))
+        main = json.loads(self.kimi.path.read_text())
+        main.pop('name'), main.pop('workspace')
+        q.atomic_json(self.queues / 'o/r.json', dict(main, workspace='r'))   # a main queue has no workspace
+        with self.assertRaises(q.StateError):
+            self.store.load()
+
+    def test_a_dotted_repos_main_queue_is_not_a_named_queue(self):
+        # `o/r -QueueName kimi` is r.kimi.json, which can be repo o/r.kimi's main queue.
+        dotted = dict(version=1, repo='o/r.kimi', parallel=1, watch=False, label=None, yes=False,
+                      config=str(self.config), members=[q.new_member(9, 'o/r.kimi', self.root)], owner=None)
+        q.atomic_json(self.kimi.path, dotted)
+        before = self.kimi.path.read_text()
+        self.assertEqual('o/r.kimi', self.kimi.load()['repo'])
+        with self.assertRaises(q.QueueError) as refused:
+            self.start('o/r#1', name='kimi')
+        self.assertIn('repository mismatch', str(refused.exception))
+        self.assertEqual(before, self.kimi.path.read_text())
+        self.start('o/r#9')                    # not a sibling of o/r: its #9 claims nothing here
+        self.assertEqual([9], self.numbers(self.store))
+
+    # --- exclusive claims -------------------------------------------------------------------
+
+    def test_explicit_lists_never_admit_one_issue_twice_in_either_order(self):
+        for first, second in ((None, 'kimi'), ('kimi', None)):
+            with self.subTest(first=first or 'main'):
+                for path in self.queues.glob('o/*.json'):
+                    path.unlink()
+                self.start('o/r#1,2', name=first)
+                self.start('o/r#2,3', name=second)
+                one = q.Store(q.queue_path(self.queues, 'o/r', first))
+                two = q.Store(q.queue_path(self.queues, 'o/r', second))
+                self.assertEqual(([1, 2], [3]), (self.numbers(one), self.numbers(two)))
+                tag = f'({second}) ' if second else ''
+                self.assertIn(f'{tag}#2 skipped: claimed by queue {first or "main"}', self.output())
+
+    def test_label_specs_disjoint_and_overlapping(self):
+        self.start_bugs('o/r#1,2')
+        self.start_bugs('bugs', name='kimi')          # the fake bug label lists 1..5
+        self.assertEqual([3, 4, 5], self.numbers(self.kimi))
+        self.start_bugs('bugs')                       # and back: the main queue skips the kimi queue's
+        self.assertEqual([1, 2], self.numbers(self.store))
+        out = self.output()
+        self.assertIn('(kimi) #1 skipped: claimed by queue main', out)
+        self.assertIn('#3 skipped: claimed by queue kimi', out)
+
+    def test_only_merged_and_closed_members_release_their_issue(self):
+        self.start('o/r#1,2,3,4,5,6')
+        with self.store.transaction() as data:
+            for m, state in zip(data['members'], ('merged', 'closed', 'failed', 'pr-open', 'closed', 'closed')):
+                m['state'] = state
+            # r1 m3: a closed member whose close is still pending or stuck can be revived by its loop.
+            data['members'][4]['closePending'] = True
+            data['members'][5]['closeStuck'] = 'the relay is alive but its close has been pending'
+        self.start('o/r#1,2,3,4,5,6', name='kimi')
+        self.assertEqual([1, 2], self.numbers(self.kimi))
+
+    def test_a_closed_member_whose_session_is_open_still_claims(self):
+        # r2 m2: a reopened no-PR loop (or one left open with autonomy off) has no close flag once the
+        # relay gives up its close; its open issue session keeps the claim, for an explicit list too.
+        self.start('o/r#1,2', name='kimi')
+        with self.kimi.transaction() as data:
+            for m in data['members']:
+                m['state'] = 'closed'
+        self.tree = {'workspaces': [{'name': 'r-kimi', 'sessions': [{'id': 's1', 'name': '#1 fix'},
+                                                                    {'id': 's2', 'name': '#2 relay'}]},
+                                    {'name': 'r', 'sessions': [{'id': 's3', 'name': '#2 fix'}]}]}
+        self.start('o/r#1,2')                        # #2's issue session is in r, not in the kimi workspace
+        self.assertEqual([2], self.numbers(self.store))
+        self.assertIn('#1 skipped: claimed by queue kimi', self.output())
+        with patch.object(q.agw, 'tree', side_effect=q.agw.CtlError('agwinterm is not running')):
+            with self.assertRaises(q.agw.CtlError):       # an unread terminal is never "unclaimed"
+                q.start_queue('o/r#1', root=self.queues, name='gpt')
+        self.assertFalse(q.queue_path(self.queues, 'o/r', 'gpt').exists())
+
+    def test_the_rescan_keeps_a_closed_member_with_an_open_session_claimed(self):
+        self.start('o/r#1', name='kimi')
+        with self.kimi.transaction() as data:
+            data['members'][0]['state'] = 'closed'
+        self.start_bugs('o/r#9', watch=False)
+        self.start_bugs('bugs', watch=True)
+        with self.store.transaction() as data:
+            data['members'] = []
+        self.tree = {'workspaces': [{'name': 'r-kimi', 'sessions': [{'id': 's1', 'name': '#1 fix'}]}]}
+        worker = q.Worker(self.store, self.store.load()['owner']['token'], gh=self.fake_gh, clock=lambda: self.now)
+        with patch.object(q, 'gh_json', self.fake_gh), patch.object(q.agw, 'tree', side_effect=lambda: self.tree):
+            worker.refresh_remote()
+        self.assertEqual('claimed by queue kimi', worker.last_skips[1])
+        self.assertNotIn(1, self.numbers(self.store))
+
+    def test_a_claim_wins_over_an_in_hand_reason_at_start_and_on_a_rescan(self):
+        # r1 m4: the main queue's member's own checkout is not something the kimi queue should tell
+        # the human to resume or delete.
+        self.start_bugs('o/r#4')
+        q.atomic_json(self.root / 'clones/r-issue-4/.workbench/state/queue-member.json',
+                      {'queue': str(self.store.path), 'repo': 'o/r', 'number': 4})
+        self.start_bugs('bugs', name='kimi', watch=True)
+        out = self.output()
+        self.assertIn('(kimi) #4 skipped: claimed by queue main', out)
+        self.assertNotIn('#4 skipped: checkout exists', out)
+        with self.kimi.transaction() as data:
+            data['members'] = []
+        worker = q.Worker(self.kimi, self.kimi.load()['owner']['token'], gh=self.fake_gh, clock=lambda: self.now)
+        with patch.object(q, 'gh_json', self.fake_gh), patch.object(q.agw, 'tree', side_effect=lambda: self.tree):
+            worker.refresh_remote()
+        self.assertEqual('claimed by queue main', worker.last_skips[4])
+
+    def test_a_named_checkout_without_this_queues_membership_is_to_be_deleted(self):
+        # r2 m3: the skip fires exactly when no membership makes the checkout resumable.
+        (self.root / 'clones/r-kimi-issue-3/.workbench/state').mkdir(parents=True)
+        self.start_bugs('bugs', name='kimi')
+        self.assertIn('(kimi) #3 skipped: checkout exists without a queue membership this queue can use', self.output())
+        self.assertIn('delete it (a member of this queue is relaunched with github-workbench -Queue <spec> '
+                      '-QueueName kimi -Retry)', self.output())
+        (self.root / 'clones/r-issue-3/.workbench/state').mkdir(parents=True)
+        self.start_bugs('bugs')                       # kimi claims 1, 2, 4, 5; #3 is the main queue's to judge
+        self.assertIn('resume with github-workbench o/r#3 or delete it', self.output())
+
+    def test_a_default_workspace_too_long_to_load_is_refused_before_writing(self):
+        # r1 m5: `<repo>-<name>` can exceed a workspace name's 64 characters.
+        repo = 'o/' + 'r' * 40
+        with self.assertRaises(q.UsageError) as refused:
+            self.start(f'{repo}#1', name='k' * 30)
+        self.assertIn('pass -Workspace', str(refused.exception))
+        self.assertEqual([], list((self.queues / 'o').glob('*.json')) if (self.queues / 'o').exists() else [])
+        self.start(f'{repo}#1', name='k' * 30, workspace='long-lab')
+        self.assertEqual('long-lab', q.Store(q.queue_path(self.queues, repo, 'k' * 30)).load()['workspace'])
+
+    def test_the_second_add_waits_for_the_claims_lock_and_sees_the_first(self):
+        # The main queue's add holds the claims lock; the kimi queue's add of the same issue waits
+        # for it and then sees the main queue's member.
+        self.start('o/r#9')
+        held = q.claims_lock(self.queues, 'o/r').acquire()
+        done = threading.Event()
+        errors = []
+
+        def second():
+            try:
+                with patch.object(q.agw, 'tree', side_effect=lambda: self.tree):
+                    q.start_queue('o/r#1', root=self.queues, name='kimi')
+            except BaseException as err:        # noqa: BLE001 - reported below
+                errors.append(err)
+            done.set()
+
+        thread = threading.Thread(target=second)
+        thread.start()
+        self.assertFalse(done.wait(0.5))      # blocked on the claims lock
+        with self.store.transaction() as data:
+            data['members'].append(q.new_member(1, 'o/r', self.root / 'clones'))
+        held.release()
+        thread.join(30)
+        self.assertEqual([], errors)
+        self.assertEqual([9, 1], self.numbers(self.store))
+        self.assertEqual([], self.numbers(self.kimi))
+
+    def test_an_unreadable_sibling_is_an_error_and_an_unrelated_repo_is_never_read(self):
+        self.start('o/r#1', name='kimi')
+        (self.queues / 'o/other.json').write_text('{broken')
+        (self.queues / 'o/rr.json').write_text('{broken')
+        self.start('o/r#2')                             # neither is a queue of o/r
+        self.kimi.path.write_text('{broken')
+        with self.assertRaises(q.StateError):
+            self.start('o/r#3')
+        self.assertEqual([2], self.numbers(self.store))
+
+    def test_the_watch_rescan_skips_another_queues_claims(self):
+        self.start_bugs('o/r#2')
+        self.start_bugs('bugs', name='kimi', watch=True)
+        with self.kimi.transaction() as data:
+            data['members'] = []
+        worker = q.Worker(self.kimi, self.kimi.load()['owner']['token'], gh=self.fake_gh, clock=lambda: self.now)
+        with patch.object(q, 'gh_json', self.fake_gh), patch.object(q.agw, 'tree', side_effect=lambda: self.tree):
+            worker.refresh_remote()
+        self.assertEqual([1, 3, 4, 5], self.numbers(self.kimi))
+        self.assertIn('(kimi) #2 skipped: claimed by queue main', self.output())
+        self.kimi.path.with_name('r.json').write_text('{broken')        # the main queue: unreadable
+        with self.kimi.transaction() as data:
+            data['members'] = []
+        worker.next_scan = 0
+        with patch.object(q, 'gh_json', self.fake_gh), patch.object(q.agw, 'tree', side_effect=lambda: self.tree):
+            worker.refresh_remote()
+        self.assertEqual([], self.numbers(self.kimi))
+        self.assertIn('label scan', worker.errors)
+
+    # --- the in-hand checks see the other queues' footprints --------------------------------
+
+    def test_in_hand_sees_sessions_in_every_queue_workspace_and_the_plain_checkout(self):
+        self.start('o/r#9', name='kimi')
+        self.tree = {'workspaces': [{'name': 'R-Kimi', 'sessions': [{'id': 's1', 'name': '#1 fix'}]},
+                                    {'name': 'r', 'sessions': [{'id': 's2', 'name': '#2 fix'}]},
+                                    {'name': 'other', 'sessions': [{'id': 's3', 'name': '#3 fix'}]}]}
+        foreign = self.root / 'clones' / 'r-issue-4' / '.workbench' / 'state'
+        foreign.mkdir(parents=True)
+        self.start_bugs('bugs', name='kimi')
+        self.assertEqual([9, 3, 5], self.numbers(self.kimi))
+        out = self.output()
+        self.assertIn('(kimi) #1 skipped: session', out)
+        self.assertIn('(kimi) #2 skipped: session', out)
+        self.assertIn('(kimi) #4 skipped: checkout exists from an earlier loop', out)
+        self.start_bugs('bugs')                        # the main queue sees the kimi workspace's #1 too
+        self.assertEqual([], self.numbers(self.store))
+        out = self.output().splitlines()
+        self.assertIn('#1 skipped: session: a live workbench session is open for it', out)
+        self.assertIn('#3 skipped: claimed by queue kimi', out)
+
+    def test_a_named_worker_counts_live_sessions_in_its_own_workspace_only(self):
+        self.start('o/r#1,2', name='kimi')
+        worker = q.Worker(self.kimi, self.kimi.load()['owner']['token'], gh=self.gh, clock=lambda: self.now)
+        self.tree = {'workspaces': [{'name': 'r-kimi', 'sessions': [{'id': 's1', 'name': '#1 fix'}]},
+                                    {'name': 'r', 'sessions': [{'id': 's2', 'name': '#2 fix'}]}]}
+        (self.queues / 'o/r.json').write_text('{broken')          # a broken sibling changes nothing here
+        with patch.object(q.agw, 'tree', side_effect=lambda: self.tree):
+            self.assertEqual({1}, worker.live_numbers(self.kimi.load()))
+
+    def test_status_lines_and_titles_name_the_queue(self):
+        self.start('o/r#1', name='kimi')
+        worker = q.Worker(self.kimi, self.kimi.load()['owner']['token'], gh=self.gh, clock=lambda: self.now)
+        worker.notify('queue paused: x')
+        q.agw.notify.assert_called_with(unittest.mock.ANY, 'queue paused: x', title='Workbench queue (kimi)')
+        self.start('o/r#2')
+        worker = q.Worker(self.store, self.store.load()['owner']['token'], gh=self.gh, clock=lambda: self.now)
+        worker.notify('queue paused: y')
+        q.agw.notify.assert_called_with(unittest.mock.ANY, 'queue paused: y', title='Workbench queue')
+
+    def test_dry_run_reports_the_name_workspace_and_claims(self):
+        self.start('o/r#1')
+        self.start('o/r#1,2', name='kimi', dry_run=True)
+        result = json.loads(self.output().strip().splitlines()[-1])
+        self.assertEqual(('kimi', 'r-kimi', [2]), (result['name'], result['workspace'], result['members']))
+        self.assertEqual([{'number': 1, 'reason': 'claimed by queue main'}], result['skipped'])
+        self.assertFalse(self.kimi.path.exists())
+
+    # --- the queue's revmux profile ---------------------------------------------------------
+
+    def launched_args(self, store):
+        data = store.load()
+        m = dict(q.find_member(data, 1), token=str(uuid.uuid4()))
+        worker = q.Worker(store, data['owner']['token'], gh=self.gh, clock=lambda: self.now)
+        with patch.object(q.subprocess, 'Popen') as popen:
+            job = worker.spawn_launcher(data, m)
+        job['stream'].close()
+        return popen.call_args.args[0]
+
+    def test_an_explicit_profile_is_saved_and_passed_and_the_default_never_is(self):
+        self.start('o/r#1', name='kimi', implementer='kimi')
+        self.assertNotIn('revmuxProfile', self.kimi.load())
+        self.assertNotIn('-RevmuxProfile', self.launched_args(self.kimi))
+        self.start('o/r#2', name='kimi', revmux_profile='kimi-only')
+        self.assertEqual('kimi-only', self.kimi.load()['revmuxProfile'])
+        args = self.launched_args(self.kimi)
+        self.assertEqual(['-RevmuxProfile', 'kimi-only'], args[args.index('-RevmuxProfile'):][:2])
+        self.assertIn('settings: revmuxProfile null -> "kimi-only"', self.output())
+        with self.assertRaises(q.UsageError):
+            self.start('o/r#3', name='kimi', revmux_profile='a b')

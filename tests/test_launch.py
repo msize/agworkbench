@@ -1902,7 +1902,9 @@ class QueueEntry(LauncherFixtures):
         seed = self.temp / 'seed'
         for args in (['init', '-b', 'issue-7-fix-x', str(seed)],
                      ['-C', str(seed), '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
-                      '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-m', 'seed']):
+                      '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-m', 'seed'],
+                     # as `gh repo clone` leaves it: a reused clone's origin is checked (#66)
+                     ['-C', str(seed), 'remote', 'add', 'origin', 'https://github.com/o/repo.git']):
             done = subprocess.run([git, *args], capture_output=True, text=True, timeout=15)
             self.assertEqual(0, done.returncode, done.stdout + done.stderr)
         self.cmd('git', '"' + git + '" %*')
@@ -1947,6 +1949,82 @@ class QueueEntry(LauncherFixtures):
         self.assertEqual('keep', sentinel.read_text())
         calls = [json.loads(line) for line in capture.read_text().splitlines()]
         self.assertEqual(1, sum(call[:2] == ['repo', 'clone'] for call in calls))
+
+    def test_queue_never_reuses_an_unestablished_clone_of_another_repo(self):
+        # #66: `<repo>-<queue>` can be another repo's name; its clone is not this member's.
+        capture, _ = self.configure_real_checkout()
+        self.checkout.rmdir()
+        self.assertEqual(0, self.entry().returncode)
+        with self.store.transaction() as data:
+            data['members'][0]['checkoutEstablished'] = False
+        subprocess.run(['git', '-C', str(self.checkout), 'remote', 'set-url', 'origin',
+                        'https://github.com/o/repo-kimi.git'], check=True, capture_output=True)
+        self.retry()
+        result = self.entry()
+        self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+        self.assertIn('its origin is', self.store.load()['members'][0]['result']['detail'])
+        self.assertEqual(1, sum(json.loads(line)[:2] == ['repo', 'clone'] for line in capture.read_text().splitlines()))
+
+    def named_member(self):
+        """The member as a named queue's (#66): repo.kimi.json, workspace repo-kimi, checkout repo-kimi-issue-7."""
+        data = self.store.load()
+        data.update(name='kimi', workspace='repo-kimi')
+        self.checkout.rename(self.temp / 'repo-kimi-issue-7')
+        self.checkout = self.temp / 'repo-kimi-issue-7'
+        data['members'][0]['checkout'] = str(self.checkout)
+        self.queue_path.unlink()
+        self.queue_path = self.queue_path.with_name('repo.kimi.json')
+        self.store = self.queue_module.Store(self.queue_path)
+        self.store.directory.mkdir(parents=True)
+        self.queue_module.atomic_json(self.queue_path, data)
+
+    def test_a_named_queue_member_opens_every_session_in_its_workspace(self):
+        self.named_member()
+        result = self.entry()
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        created = [c for c in self.calls() if c[:2] == ['session', 'new']]
+        self.assertEqual({'#7 fix-x', '#7 relay'}, {c[c.index('--name') + 1] for c in created})
+        self.assertEqual(['repo-kimi'] * len(created), [c[c.index('--workspace-name') + 1] for c in created])
+        membership = json.loads((self.checkout / '.workbench/state/queue-member.json').read_text(encoding='utf-8-sig'))
+        self.assertEqual(('kimi', 'repo-kimi'), (membership['queueName'], membership['workspace']))
+        # A retry finds the issue and relay sessions in repo-kimi, and a same-named pair in repo is not its.
+        tree = json.loads(self.scenario_path.read_text())['tree']
+        self.assertEqual(['repo-kimi'], [w['name'] for w in tree['workspaces']])
+
+    def test_a_named_queue_member_does_not_adopt_the_repo_workspaces_sessions(self):
+        self.named_member()
+        self.scenario['tree'] = {'workspaces': [{'name': 'repo', 'sessions': [
+            {'id': OTHER_ID, 'name': '#7 fix-x'}, {'id': '44444444-4444-4444-8444-444444444444', 'name': '#7 relay'}]}]}
+        self.save_scenario()
+        result = self.entry()
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        created = [c for c in self.calls() if c[:2] == ['session', 'new']]
+        self.assertEqual({'#7 fix-x', '#7 relay'}, {c[c.index('--name') + 1] for c in created})
+        self.assertNotIn('repo', [c[c.index('--workspace-name') + 1] for c in created])
+
+    def test_named_queue_switches_reach_the_conductor(self):
+        seen = self.conductor_start('bugs', '-QueueName', 'kimi', '-Workspace', 'docxy-kimi', '-RevmuxProfile', 'kimi-mixed',
+                                    '-Implementer', 'kimi', '-NoAutoMerge')
+        args = seen['args']
+        for flag, value in (('--name', 'kimi'), ('--workspace', 'docxy-kimi'), ('--revmux-profile', 'kimi-mixed')):
+            self.assertEqual([flag, value], args[args.index(flag):][:2])
+        for extra, message in ((['-Queue', 'bugs', '-Repo', 'o/repo', '-QueueName', 'kimi', '-Triage'], 'a named queue does not triage'),
+                               (['-Queue', 'bugs', '-Repo', 'o/repo', '-Workspace', 'x'], '-Workspace requires -QueueName'),
+                               (['-Triage', '-Repo', 'o/repo', '-QueueName', 'kimi'], 'belong to -Queue'),
+                               (['o/repo#7', '-QueueName', 'kimi'], 'belong to -Queue'),
+                               (['o/repo#7', '-RevmuxProfile', 'kimi-mixed'], '-RevmuxProfile takes'),
+                               (['-Queue', 'bugs', '-Repo', 'o/repo', '-RevmuxProfile', 'a b'], '-RevmuxProfile takes')):
+            with self.subTest(extra=extra):
+                result, seen = self.launcher(*extra)
+                self.assertEqual(2, result.returncode, result.stdout + result.stderr)
+                self.assertIn(message, result.stdout)
+                self.assertIsNone(seen)
+
+    def test_the_queue_profile_reaches_the_member_launch(self):
+        result = self.entry('-RevmuxProfile', 'kimi-only')
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        saved = json.loads((self.checkout / '.workbench/state/implementer.json').read_text(encoding='utf-8-sig'))
+        self.assertEqual(('codex', 'kimi-only'), (saved['tool'], saved['revmuxProfile']))
 
     def check_partial_clone_retry(self, shell):
         capture, failure = self.configure_real_checkout()
@@ -3462,6 +3540,85 @@ class FailoverLaunch(LauncherFixtures):
         self.assertEqual(calls, len(self.calls()))
 
 
+class NamedCheckoutLaunch(LauncherFixtures):
+    """#66 r1 M1: a single-issue launch outside the conductor (the planner's -Failover, a human's
+    -Implementer) of a named queue's member finds its checkout and workspace by its membership."""
+
+    def named(self, number=7, queue='kimi', repo='o/repo', checkout=None):
+        directory = self.temp / f'repo-{queue}-issue-{number}'
+        state = directory / '.workbench' / 'state'
+        state.mkdir(parents=True, exist_ok=True)
+        (state / 'queue-member.json').write_text(json.dumps({
+            'queue': str(self.temp / f'repo.{queue}.json'), 'repo': repo, 'number': number, 'queueName': queue,
+            'workspace': f'repo-{queue}', 'checkout': str(checkout or directory)}), encoding='utf-8')
+        return directory
+
+    def dry_run(self, cwd, *extra):
+        self.cmd('gh', 'echo {"title":"fix-x","state":"OPEN"}' + chr(10) + 'exit /b 0')
+        env = {k: v for k, v in self.env.items() if not k.startswith('AGWINTERM_')}
+        return subprocess.run([PWSH, '-NoProfile', '-File', str(LIB / 'github-workbench.ps1'), 'o/repo#7',
+                               '-DryRun', *extra], env=env, cwd=cwd, capture_output=True, text=True,
+                              encoding='utf-8', errors='replace', timeout=30)
+
+    def test_failover_from_a_named_checkout_uses_it_and_its_workspace(self):
+        self.checkout.rmdir()                                       # no plain repo-issue-7
+        named = self.named()
+        for cwd in (named, ROOT):                                   # from inside it, or found by its membership
+            with self.subTest(cwd=cwd):
+                result = self.dry_run(cwd, '-Failover')
+                self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+                self.assertIn(f"named queue 'kimi': checkout {named}, workspace 'repo-kimi'", result.stdout)
+                self.assertIn(f'into {named} on branch', result.stdout)
+                self.assertIn("in workspace 'repo-kimi'", result.stdout)
+                self.assertNotIn('repo-issue-7', result.stdout)
+
+    def test_a_membership_for_another_issue_repo_or_directory_is_ignored(self):
+        self.checkout.rmdir()
+        for case, kwargs in (('issue', dict(number=8)), ('repo', dict(repo='o/other')),
+                             ('directory', dict(checkout=self.temp / 'elsewhere'))):
+            with self.subTest(case=case):
+                named = self.named(**kwargs)
+                result = self.dry_run(named, '-Implementer', 'claude')
+                self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+                self.assertNotIn('named queue', result.stdout)
+                self.assertIn(f"into {self.temp / 'repo-issue-7'} on branch", result.stdout)
+                self.assertIn("in workspace 'repo'", result.stdout)
+                shutil.rmtree(named)
+
+    def test_a_differently_spelled_root_still_matches_and_an_unreadable_membership_is_refused(self):
+        # r2 m4: the conductor records a resolved path, which a junction or subst root spells differently.
+        self.checkout.rmdir()
+        named = self.named(checkout=Path('X:/resolved/elsewhere/repo-kimi-issue-7'))
+        result = self.dry_run(named, '-Failover')
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertIn(f"named queue 'kimi': checkout {named}, workspace 'repo-kimi'", result.stdout)
+        # r2 m5: a membership that cannot be read is refused, naming it; never a silent plain launch.
+        membership = named / '.workbench' / 'state' / 'queue-member.json'
+        for broken in ('{broken', '[1, 2]'):
+            with self.subTest(broken=broken):
+                membership.write_text(broken, encoding='utf-8')
+                for cwd in (named, ROOT):
+                    result = self.dry_run(cwd, '-Failover')
+                    self.assertNotEqual(0, result.returncode, result.stdout)
+                    self.assertIn('cannot read the queue membership', result.stdout + result.stderr)
+                    self.assertIn('queue-member.json', result.stdout + result.stderr)
+                    self.assertNotIn('repo-issue-7 on branch', result.stdout)
+
+    def test_a_plain_clone_wins_the_scan_and_two_named_ones_are_refused(self):
+        (self.checkout / '.git').mkdir()                             # repo-issue-7 is a clone
+        self.named()
+        result = self.dry_run(ROOT)
+        self.assertNotIn('named queue', result.stdout)
+        (self.checkout / '.git').rmdir()
+        self.named(queue='gpt')
+        result = self.dry_run(ROOT)
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn('checkouts in several named queues', result.stdout + result.stderr)
+        result = self.dry_run(self.temp / 'repo-gpt-issue-7')       # from inside one: that one
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertIn("workspace 'repo-gpt'", result.stdout)
+
+
 class AgentRoots(LauncherFixtures):
     """#24: which process is the limited agent - the binary itself, found by this checkout's marks."""
 
@@ -3665,10 +3822,40 @@ class KimiImplementer(LauncherFixtures):
         self.configure(implementer='kimi', revmuxProfile='comprehensive')
         chosen = ps(". ./lib/Workbench.ps1; Get-RevmuxProfile kimi 'comprehensive'", env=self.env)
         self.assertEqual('comprehensive', chosen.stdout.strip())                 # revmuxProfile wins
+        # No revmux on this PATH: kimi falls back to claude-only (#66; its warning is tested below).
         for tool, profile in (('codex', 'comprehensive'), ('claude', 'claude-only'), ('kimi', 'claude-only')):
             with self.subTest(tool=tool):
+                out = ps(f". ./lib/Workbench.ps1; Get-RevmuxProfile {tool} $null 3>$null", env=self.env)
+                self.assertEqual(profile, out.stdout.strip())
+
+    def test_kimi_reviews_with_kimi_mixed_when_revmux_has_it(self):
+        # #66: the default for kimi is probed from `revmux config`; anything short of a listing that
+        # names kimi-mixed falls back to claude-only with a warning, and never fails the launch.
+        listing = '{"profiles": [{"name": "claude-only"}, {"name": "kimi-mixed"}]}'
+        for case, body, profile in (('listed', 'echo ' + listing, 'kimi-mixed'),
+                                    ('older', 'echo {"profiles": [{"name": "claude-only"}]}', 'claude-only'),
+                                    ('failing', 'echo boom 1>&2' + chr(10) + 'exit /b 3', 'claude-only'),
+                                    ('garbage', 'echo not json', 'claude-only')):
+            with self.subTest(case=case):
+                self.cmd('revmux', body)
+                out = ps(". ./lib/Workbench.ps1; Get-RevmuxProfile kimi $null 3>&1", env=self.env)
+                lines = out.stdout.strip().splitlines()
+                self.assertEqual(profile, lines[-1], out.stdout + out.stderr)
+                self.assertEqual(profile == 'claude-only', any("no 'kimi-mixed' profile" in l for l in lines))
+        (self.temp / 'revmux.cmd').unlink()
+        out = ps(". ./lib/Workbench.ps1; Get-RevmuxProfile kimi $null 3>$null", env=self.env)
+        self.assertEqual('claude-only', out.stdout.strip())                     # no revmux at all
+        self.cmd('revmux', 'echo ' + listing)
+        for tool, profile in (('codex', 'comprehensive'), ('claude', 'claude-only')):
+            with self.subTest(tool=tool):                                       # only kimi probes
                 out = ps(f". ./lib/Workbench.ps1; Get-RevmuxProfile {tool} $null", env=self.env)
                 self.assertEqual(profile, out.stdout.strip())
+        result = self.body('kimi')
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertEqual('kimi-mixed', self.state('implementer.json')['revmuxProfile'])
+        result = self.body('kimi', ' -RevmuxProfile kimi-only')                 # a queue's explicit one wins
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertEqual('kimi-only', self.state('implementer.json')['revmuxProfile'])
 
     def test_a_launch_refuses_before_anything_is_recorded(self):
         cases = [
