@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# agworkbench (#65): gh in the Kimi implementer's shell. Copied to
+# <checkout>/.workbench/state/kimi-bin/ at every launch. gh.exe gets past this file, and then the
+# GH_TOKEN the pane script sets makes GitHub refuse it instead.
+echo "agworkbench: gh is refused in the Kimi implementer's pane: GitHub is the planner's job. Mail the planner (box claude) instead (#65)." >&2
+exit 1
