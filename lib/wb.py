@@ -12,6 +12,7 @@
   wb.py follow-up file --source 27 --pr 30                        # file every unfiled follow-up (#27), deduped (#42)
   wb.py loop-state done --pr 30 --sha <sha>                       # the planner's last act (#27)
   wb.py loop-state done --no-pr --reason "duplicate"               # closed issue needing no change (#53)
+  wb.py loop-state blocked --environmental --reason "codex limited" # a block the human cannot answer (#61)
   wb.py merge-check --pr 12 --head <sha>                          # read-only auto-merge gate (#23)
   wb.py wait-ci --pr 12 --head <sha>                              # background: until CI on the head is done (#32)
   wb.py update-check --reviewed <sha> --base <sha>                # an UPDATE round is one merge of the base (#32)
@@ -179,8 +180,12 @@ def cmd_loop_state(args: argparse.Namespace) -> int:
             set_waiting(checkout(), False)
         return code
     from conductor import retire_no_pr_done, write_loop_state
+    if getattr(args, 'environmental', False) and args.state != 'blocked':
+        print('wb: loop-state: --environmental is only for blocked', file=sys.stderr)
+        return 2
     try:
-        write_loop_state(checkout(), args.state, args.pr, args.reason)
+        write_loop_state(checkout(), args.state, args.pr, args.reason,
+                         cause='environment' if getattr(args, 'environmental', False) else None)
         if args.state in ('resumed', 'pr-open'):
             retire_no_pr_done(checkout() / '.workbench/state/loop-done.json')
         if args.state == 'resumed':
@@ -1480,6 +1485,8 @@ def main() -> int:
     p.add_argument('--pr')
     p.add_argument('--no-pr', action='store_true', help='done: closed issue with no PR')
     p.add_argument('--reason')
+    p.add_argument('--environmental', action='store_true',
+                   help='blocked: by a limited tool, low disk or memory, not a question; the member keeps its queue slot (#61)')
     p.set_defaults(func=cmd_loop_state)
     p = subs.add_parser("revmux", help="run a revmux round in its own visible session")
     p.add_argument("--round", type=int, required=True)

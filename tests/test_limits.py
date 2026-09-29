@@ -25,6 +25,10 @@ EXPECTED = {
     "claude-limited-team": ("claude", "limited", False),
     "claude-limited-credit": ("claude", "limited", False),
     "codex-warning-chooser": ("codex", "warning", False),
+    # #61: the chooser a fresh pane shows (the #68 frame without its heads-up rows), and the
+    # regression case - the same chooser dumped in tool output, with the composer below it
+    "codex-warning-chooser-no-heads-up": ("codex", "warning", False),
+    "codex-warning-chooser-in-tool-output": ("codex", None, False),
     "codex-auto-switched": ("codex", None, False),
     "codex-tool-output": ("codex", None, False),
     "codex-working": ("codex", None, False),
@@ -124,6 +128,16 @@ class Position(unittest.TestCase):
         self.assertIsNone(limits.classify(old, "codex"))
         fresh = f"{shell}codex\n\u25a0 You\u2019ve hit your usage limit.\nTo continue this session, run codex resume x\n{shell}\n"
         self.assertTrue(limits.classify(fresh, "codex").exited)
+
+    def test_the_warning_chooser_counts_only_at_the_bottom_of_the_pane(self):
+        chooser = frame("codex-warning-chooser")
+        self.assertTrue(limits.classify(chooser, "codex").line.startswith("⚠ Heads up"))
+        # Answered: the heads-up row stays in history, the chooser is gone, the composer is back.
+        answered = chooser.split("\n\n  Approaching")[0] + "\n\n› Ask Codex to do anything\n"
+        self.assertIsNone(limits.classify(answered, "codex"))
+        # Options with no warning row above them (another picker) never count.
+        picker = "• Ran ls\n  └ lib\n\n› 1. Switch to plan mode\n  2. Keep current model\n"
+        self.assertIsNone(limits.classify(picker, "codex"))
 
     def test_unknown_tool_is_refused(self):
         with self.assertRaises(ValueError):

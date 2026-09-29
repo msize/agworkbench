@@ -9,6 +9,7 @@ import sys
 import threading
 import unittest
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -20,6 +21,7 @@ import cleanup
 import wb
 
 REAL_FREE_BYTES = q.free_bytes          # QueueCase patches it; the real one is tested on its own
+REAL_FREE_RAM = q.free_ram
 
 
 class QueueCase(unittest.TestCase):
@@ -42,6 +44,9 @@ class QueueCase(unittest.TestCase):
         # #41: the disk guard reads this; a test machine's real free space must not pause the queue.
         self.free = 500 * q.GIB
         self.enterContext(patch.object(q, 'free_bytes', lambda path: (self.free, 'X:')))
+        # #61: and the memory guard this; the test machine's real free memory must not either.
+        self.ram = 32 * q.GIB
+        self.enterContext(patch.object(q, 'free_ram', lambda: self.ram))
         self.cleanups = []
         self.enterContext(patch.object(cleanup, 'start_after_close',
                                        side_effect=lambda *args: self.cleanups.append(args) or (1, 'wmi')))
@@ -57,6 +62,10 @@ class QueueCase(unittest.TestCase):
             return str(uuid.uuid4())
         if command == 'session.restore':
             return dict(action='pinned', pane=kwargs['target'], command=kwargs['args']['command'])
+        if command == 'tree':
+            # #61: the ceiling reads the terminal; these members' sessions are gone unless a test says so.
+            return {'workspaces': [{'name': 'r', 'sessions': [{'id': str(uuid.uuid4()), 'name': f'#{n} issue'}
+                                                              for n in getattr(self, 'sessions', ())]}]}
         raise AssertionError(command)
 
     def start(self, spec='o/r#1,2,3', **kwargs):
@@ -150,7 +159,9 @@ class QueueCase(unittest.TestCase):
         self.assertNotIn('closePending', self.member(1))
         self.assertNotIn('closeStuck', self.member(1))
         self.assertNotIn(1, worker.closes)
-        self.assertTrue(q.finished(self.store.load()))
+        # #61 M5: a resumed loop is live work again and holds a slot, so the queue is not finished.
+        self.assertFalse(self.member(1)['slotReleased'])
+        self.assertFalse(q.finished(self.store.load()))
 
     def test_parallel_blocked_resumed_and_failed_members_release_slots(self):
         self.start(parallel=2)
@@ -162,7 +173,7 @@ class QueueCase(unittest.TestCase):
         self.assertEqual([1, 2, 3], [x[0] for x in self.launches])
         self.report(1, 'resumed')
         worker.tick()
-        self.assertTrue(self.member(1)['slotReleased'])
+        self.assertFalse(self.member(1)['slotReleased'])       # #61 M5: resumed work takes a slot again
         self.assertEqual('active', self.member(1)['state'])
         self.report(1)
         worker.tick()
@@ -1843,6 +1854,555 @@ class DiskGuard(unittest.TestCase):
         self.assertEqual(Path(self.root).anchor, drive)
 
 
+class EnvironmentalBlocks(unittest.TestCase):
+    """#61: a member blocked by its environment keeps its slot while its session lives; the number
+    of live members is capped at parallel + 2, whatever state the slots are in."""
+    terminal, start, gh, spawn, worker, member, report = (QueueCase.terminal, QueueCase.start, QueueCase.gh,
+                                                          QueueCase.spawn, QueueCase.worker, QueueCase.member,
+                                                          QueueCase.report)
+
+    def setUp(self):
+        QueueCase.setUp(self)
+        self.sessions = set()
+
+    def launched(self):
+        return [n for n, _, _ in self.launches]
+
+    def relay_episode(self, n, tool='codex', kind='warning', box='codex'):
+        path = Path(self.member(n)['checkout']) / '.workbench/state/relay.json'
+        q.atomic_json(path, {'limits': {box: {'kind': kind, 'tool': tool, 'line': 'Approaching rate limits',
+                                              'firstSeen': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                                              'announced': True}}})
+
+    def test_an_environmental_block_keeps_the_slot_while_its_session_lives(self):
+        self.start('o/r#1,2', parallel=1)
+        w = self.worker()
+        w.tick(); w.tick()
+        self.sessions = {1}
+        self.report(1, 'blocked', reason='codex limited, failover off', cause='environment')
+        w.tick(); w.tick()
+        self.assertEqual(('blocked', False, 'environment'),
+                         (self.member(1)['state'], self.member(1)['slotReleased'], self.member(1)['cause']))
+        self.assertEqual([1], self.launched())
+        self.assertFalse(q.finished(self.store.load()))
+        self.sessions = set()                       # the human closed it: the slot goes with it
+        w.tick()
+        self.now += q.SESSION_GRACE
+        w.tick()
+        self.assertTrue(self.member(1)['slotReleased'])
+        self.assertEqual([1, 2], self.launched())
+
+    def test_an_environmental_slot_survives_a_missed_read(self):
+        # r3 M1: a terminal that misses every session for one tick must not admit anyone.
+        self.start('o/r#1,2,3', parallel=2)
+        w = self.worker()
+        w.tick(); w.tick()
+        self.assertEqual([1, 2], self.launched())
+        self.sessions = {1, 2}
+        for n in (1, 2):
+            self.report(n, 'blocked', reason='codex limited', cause='environment')
+        w.tick()
+        self.sessions = set()                       # agwinterm restarting: one read lists nothing
+        w.tick()
+        self.assertEqual([1, 2], self.launched())
+        self.assertFalse(any(self.member(n)['slotReleased'] for n in (1, 2)))
+        self.assertFalse(q.finished(self.store.load()))
+        self.sessions = {1, 2}
+        w.tick()
+        self.assertNotIn('sessionGoneSince', self.member(1))
+        self.assertEqual([1, 2], self.launched())
+        self.assertFalse(self.member(1)['slotReleased'])
+
+    def test_three_members_blocked_on_a_tool_limit_launch_nothing(self):
+        self.start('o/r#1,2,3,4', parallel=3)
+        w = self.worker()
+        w.tick(); w.tick()
+        self.assertEqual([1, 2, 3], self.launched())
+        with self.store.transaction() as data:
+            data['parallel'] = 1
+        self.sessions = {1, 2, 3}
+        for n in (1, 2, 3):
+            self.report(n, 'blocked', reason='codex limited', cause='environment')
+        for _ in range(3):
+            w.tick()
+        self.assertEqual([1, 2, 3], self.launched())
+        self.assertEqual('pending', self.member(4)['state'])
+
+    def test_a_plain_block_under_an_announced_relay_limit_keeps_the_slot(self):
+        # The incident's shape: the planner reported a plain `blocked`, the relay had announced a limit.
+        self.start('o/r#1,2', parallel=1)
+        w = self.worker()
+        w.tick(); w.tick()
+        self.sessions = {1}
+        self.relay_episode(1)
+        self.report(1, 'blocked', reason='codex shows the chooser; human must answer it')
+        w.tick(); w.tick()
+        self.assertFalse(self.member(1)['slotReleased'])
+        self.assertEqual([1], self.launched())
+
+    def test_a_question_still_releases_the_slot_and_resumed_takes_it_back(self):
+        self.start('o/r#1,2,3', parallel=1)
+        w = self.worker()
+        w.tick(); w.tick()
+        self.sessions = {1}
+        self.report(1, 'blocked', reason='which API?')
+        w.tick()
+        self.assertTrue(self.member(1)['slotReleased'])
+        self.assertEqual([1, 2], self.launched())
+        self.report(1, 'resumed')
+        w.tick()
+        self.assertFalse(self.member(1)['slotReleased'])
+        self.assertNotIn('cause', self.member(1))
+        self.report(2, 'pr-open')
+        w.tick()
+        self.assertEqual([1, 2], self.launched())   # #1 holds the only slot again
+
+    def test_a_resumed_member_with_a_pr_frees_its_slot_when_its_session_is_gone(self):
+        self.start('o/r#1,2', parallel=1)
+        w = self.worker()
+        w.tick(); w.tick()
+        self.sessions = {1}
+        self.report(1, 'pr-open')
+        w.tick()
+        self.report(1, 'blocked', reason='a question on review')
+        w.tick()
+        self.report(1, 'resumed')
+        w.tick()
+        self.assertEqual(('active', False), (self.member(1)['state'], self.member(1)['slotReleased']))
+        self.assertTrue(self.member(1)['pr'])
+        w.tick()
+        self.assertEqual([1, 2], self.launched())     # #2 took the slot #1 freed at pr-open
+        self.report(2, 'pr-open')
+        with self.store.transaction() as data:        # a third member waits behind #1's slot
+            data['members'].append(q.new_member(3, 'o/r', self.root / 'clones'))
+        w.tick()
+        self.assertEqual([1, 2], self.launched())
+        self.sessions = {2}                           # #1's sessions die; its PR is never merged
+        w.tick()
+        self.assertFalse(self.member(1)['slotReleased'])            # r2 m1: one missed read is not enough
+        self.assertEqual([1, 2], self.launched())
+        self.now += q.SESSION_GRACE
+        w.tick()
+        self.assertTrue(self.member(1)['slotReleased'])
+        self.assertEqual([1, 2, 3], self.launched())
+
+    def test_a_watched_slot_survives_a_missed_read_and_is_taken_back(self):
+        # r2 m1: re-decided every tick, with a grace; the session coming back takes the slot back.
+        self.start('o/r#1,2', parallel=1)
+        w = self.worker()
+        w.tick(); w.tick()
+        self.sessions = {1}
+        self.report(1, 'blocked', reason='a question')
+        w.tick()
+        self.report(1, 'resumed')
+        w.tick()
+        self.assertTrue(self.member(1)['resumed'])
+        self.sessions = set()                         # agwinterm restarting: the tree misses it once
+        w.tick()
+        self.assertFalse(self.member(1)['slotReleased'])
+        self.sessions = {1}
+        w.tick()
+        self.assertNotIn('sessionGoneSince', self.member(1))
+        self.sessions = set()
+        w.tick()
+        self.now += q.SESSION_GRACE
+        w.tick()
+        self.assertTrue(self.member(1)['slotReleased'])
+        self.sessions = {1, 2}                        # back after all: the slot is taken again
+        w.tick()
+        self.assertFalse(self.member(1)['slotReleased'])
+
+    def test_a_resumed_member_without_a_pr_frees_its_slot_when_its_session_is_gone(self):
+        # r2 m2: blocked before its PR, resumed, then its sessions died; refresh_stale keeps it active.
+        self.start('o/r#1,2', parallel=1)
+        w = self.worker()
+        w.tick(); w.tick()
+        self.sessions = {1}
+        self.report(1, 'blocked', reason='a question')
+        w.tick()
+        self.assertEqual([1, 2], self.launched())
+        self.report(2, 'closed', reason='duplicate')
+        self.report(1, 'resumed')
+        w.tick()
+        self.assertFalse(self.member(1)['slotReleased'])
+        self.assertFalse(q.finished(self.store.load()))
+        self.sessions = set()
+        w.tick()
+        self.now += q.SESSION_GRACE
+        w.tick()
+        self.assertEqual(('active', True), (self.member(1)['state'], self.member(1)['slotReleased']))
+        self.assertTrue(q.finished(self.store.load()))
+        self.report(1, 'pr-open')
+        w.tick()
+        self.assertNotIn('resumed', self.member(1))
+
+    def test_an_orphaned_active_member_does_not_count_against_the_ceiling(self):
+        # r2 M1: an active member whose session is gone and slot released is not live.
+        self.start('o/r#1,2,3,4', parallel=1)
+        with self.store.transaction() as data:
+            for m in data['members'][:3]:
+                m.update(attempt=1, token=str(uuid.uuid4()), pr=f'https://github.com/o/r/pull/{m["number"]}',
+                         state='pr-open', phase='pr-open', slotReleased=True)
+            data['members'][0].update(state='active', phase='active', sessionGoneSince=self.now - q.SESSION_GRACE)
+        self.sessions = {2, 3}
+        w = self.worker()
+        w.tick()
+        self.assertEqual([4], self.launched())
+
+    def test_the_live_ceiling_holds_in_a_cascade(self):
+        self.start('o/r#' + ','.join(map(str, range(1, 9))), parallel=1)
+        w = self.worker()
+        peak = 0
+        for _ in range(12):
+            w.tick()
+            for m in self.store.load()['members']:
+                if m['state'] == 'active' and not m['slotReleased']:
+                    self.sessions.add(m['number'])
+                    self.report(m['number'], 'blocked', reason='a question for the human')
+            w.tick()
+            live = sum(m['state'] in {'launching', 'active', 'blocked', 'pr-open'} and m['number'] in self.sessions
+                       for m in self.store.load()['members'])
+            peak = max(peak, live)
+        self.assertEqual([1, 2, 3], self.launched())
+        self.assertEqual(3, peak)
+        self.sessions.discard(1)                    # one member's sessions close: one more may start
+        w.tick()
+        self.assertEqual([1, 2, 3], self.launched())            # r4 M1: not on one blank read
+        self.now += q.SESSION_GRACE
+        w.tick()
+        self.assertEqual([1, 2, 3, 4], self.launched())
+
+    def test_an_unreadable_terminal_counts_every_member_as_live(self):
+        self.start('o/r#1,2,3,4', parallel=1)
+        w = self.worker()
+        w.tick(); w.tick()
+        with self.store.transaction() as data:
+            for m in data['members'][1:3]:
+                m.update(state='pr-open', phase='pr-open', slotReleased=True, attempt=1, token=str(uuid.uuid4()))
+            data['members'][0]['state'] = 'blocked'
+            data['members'][0]['slotReleased'] = True
+        with patch.object(q.agw, 'tree', side_effect=q.agw.CtlError('no pipe')):
+            w.tick()
+        self.assertEqual([1], self.launched())
+        self.assertFalse(any('sessionGoneSince' in m for m in self.store.load()['members']))   # nothing stamped
+        w.tick()                                    # readable, and none of them has a session
+        self.assertEqual([1], self.launched())      # r4 M1: one blank read admits nobody
+        self.now += q.SESSION_GRACE
+        w.tick()
+        self.assertEqual([1, 4], self.launched())
+
+    def test_one_blank_read_at_the_ceiling_admits_nobody(self):
+        # r4 M1: the ceiling has the same grace as the slots.
+        self.start('o/r#1,2,3,4', parallel=1)
+        w = self.worker()
+        with self.store.transaction() as data:
+            for m in data['members'][:3]:
+                m.update(attempt=1, token=str(uuid.uuid4()), pr=f'https://github.com/o/r/pull/{m["number"]}',
+                         state='pr-open', phase='pr-open', slotReleased=True)
+        self.sessions = {1, 2, 3}
+        w.tick()
+        self.assertEqual([], self.launched())
+        self.sessions = set()                       # agwinterm restarting
+        w.tick()
+        self.assertEqual([], self.launched())
+        self.sessions = {1, 2, 3}                   # back: the stamps go
+        w.tick()
+        self.assertFalse(any('sessionGoneSince' in m for m in self.store.load()['members']))
+        self.sessions = {2, 3}                      # #1's sessions really close
+        w.tick()
+        self.assertEqual([], self.launched())
+        self.now += q.SESSION_GRACE
+        w.tick()
+        self.assertEqual([4], self.launched())
+
+    def test_an_unreadable_tree_changes_no_slot_and_no_stamp(self):
+        # r4 m2: a failed read neither re-takes a released slot nor resets its stamp.
+        self.start('o/r#1,2', parallel=1)
+        w = self.worker()
+        w.tick(); w.tick()
+        self.sessions = {1}
+        self.report(1, 'blocked', reason='x')
+        w.tick()
+        self.report(1, 'resumed')
+        w.tick()
+        self.sessions = set()
+        w.tick()
+        stamp = self.member(1)['sessionGoneSince']
+        self.now += q.SESSION_GRACE
+        w.tick()
+        self.assertTrue(self.member(1)['slotReleased'])
+        with patch.object(q.agw, 'tree', side_effect=q.agw.CtlError('no pipe')):
+            w.tick()
+        self.assertTrue(self.member(1)['slotReleased'])
+        self.assertEqual(stamp, self.member(1)['sessionGoneSince'])
+
+    def test_an_unreadable_tree_holds_a_relay_held_slot_on_a_plain_block(self):
+        # r5 m1: apply_loop releases a plain block; with the tree unreadable that tick the relay's
+        # episode must still hold the slot, since no grace has started.
+        self.start('o/r#1,2', parallel=1)
+        w = self.worker()
+        w.tick(); w.tick()
+        self.sessions = {1}
+        self.relay_episode(1)
+        self.report(1, 'blocked', reason='chooser')
+        with patch.object(q.agw, 'tree', side_effect=q.agw.CtlError('no pipe')):
+            w.tick()
+        self.assertFalse(self.member(1)['slotReleased'])
+        self.assertEqual([1], self.launched())
+
+    def test_a_readable_tree_forgets_an_old_stamp_nobody_asked_about(self):
+        # r5 m3: forget_stale_stamps alone clears #2's stamp - the ceiling is not reached that tick,
+        # and #1's slot watch is what reads the tree.
+        self.start('o/r#1,2,3,4', parallel=1)
+        w = self.worker()
+        w.tick(); w.tick()
+        self.sessions = {1, 2, 3}
+        self.report(1, 'blocked', reason='x')
+        w.tick()
+        self.report(1, 'resumed')
+        with self.store.transaction() as data:
+            for m in data['members'][1:3]:
+                m.update(attempt=1, token=str(uuid.uuid4()), pr=f'https://github.com/o/r/pull/{m["number"]}',
+                         state='pr-open', phase='pr-open', slotReleased=True)
+            data['members'][1]['sessionGoneSince'] = self.now - 10          # an old blank read
+        w.tick()
+        self.assertFalse(self.member(1)['slotReleased'])                    # count >= parallel: no ceiling check
+        self.assertNotIn('sessionGoneSince', self.member(2))
+        before = self.launched()                                            # #2 started while #1 was blocked
+        self.now += q.SESSION_GRACE
+        self.report(1, 'pr-open')
+        self.sessions = set()                                               # one blank read at the ceiling
+        w.tick()
+        self.assertEqual('pending', self.member(4)['state'])
+        self.assertEqual(before, self.launched())
+
+    def test_an_unreadable_relay_record_keeps_a_relay_held_slot(self):
+        # r4 m1: a plain block held by the relay's episode stays held when relay.json cannot be read.
+        self.start('o/r#1,2', parallel=1)
+        w = self.worker()
+        w.tick(); w.tick()
+        self.sessions = {1}
+        self.relay_episode(1)
+        self.report(1, 'blocked', reason='chooser')
+        w.tick()
+        self.assertFalse(self.member(1)['slotReleased'])
+        (Path(self.member(1)['checkout']) / '.workbench/state/relay.json').write_text('{broken', encoding='utf-8')
+        w.tick()
+        self.assertFalse(self.member(1)['slotReleased'])
+        self.assertEqual([1], self.launched())
+
+
+class ToolLimits(unittest.TestCase):
+    """#61: a usage limit recorded by any live member steers new members to the other tool, or pauses
+    the queue when no tool is usable; only the human's -ClearLimit clears it."""
+    terminal, start, gh, worker, member, report = (QueueCase.terminal, QueueCase.start, QueueCase.gh,
+                                                   QueueCase.worker, QueueCase.member, QueueCase.report)
+
+    def setUp(self):
+        QueueCase.setUp(self)
+        self.implementers = []
+        self.start('o/r#1,2,3', parallel=1)
+        self.w = self.worker()
+        self.w.notify, self.w.status = Mock(), Mock()
+        self.w.tick(); self.w.tick()               # #1 active
+        self.implementers.clear()
+
+    def spawn(self, data, m):
+        self.implementers.append((m['number'], data.get('implementer')))
+        return QueueCase.spawn(self, data, m)
+
+    def record(self, n, tool='codex', at=None, kind='warning', relay=False):
+        at = datetime.now(timezone.utc) if at is None else at
+        state = Path(self.member(n)['checkout']) / '.workbench/state'
+        if relay:
+            q.atomic_json(state / 'relay.json', {'limits': {'codex': {
+                'kind': kind, 'tool': tool, 'line': f'{tool} {kind}', 'firstSeen': at.isoformat(timespec='seconds'),
+                'announced': True}}})
+        else:
+            # The launcher writes [DateTime]::UtcNow.ToString('o'): seven fractional digits and a Z.
+            stamp = at.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f') + '7Z'
+            q.atomic_json(state / 'implementer.json', {'tool': 'claude', 'limits': {tool: {
+                'at': stamp, 'line': f'{tool} {kind}', 'kind': kind}}})
+
+    def next_member(self):
+        self.report(1, 'pr-open')
+        self.w.tick()
+
+    def test_a_limited_codex_sends_new_members_to_claude(self):
+        self.record(1)
+        self.next_member()
+        self.assertEqual([(2, 'claude')], self.implementers)
+        limit = self.store.load()['toolLimits']['codex']
+        self.assertEqual(('warning', 1), (limit['kind'], limit['member']))
+        self.assertNotIn('implementer', self.store.load())          # the queue's setting stays the human's
+
+    def test_a_relay_episode_is_read_by_its_tool_not_its_box(self):
+        self.record(1, tool='claude', kind='limited', relay=True)   # a Claude implementer in the codex box
+        self.next_member()
+        self.assertEqual([], self.implementers)
+        self.assertIn('the planner is always Claude', self.store.load()['toolsPaused'])
+        self.w.notify.assert_any_call('queue paused: ' + self.store.load()['toolsPaused'])
+        self.w.status.assert_called_with('blocked')
+
+    def test_failover_off_pauses_instead_of_switching(self):
+        self.config.write_text(json.dumps({'checkoutRoot': str(self.root / 'clones'), 'failover': False}))
+        self.record(1)
+        self.next_member()
+        self.assertEqual([], self.implementers)
+        self.assertIn('failover is off', self.store.load()['toolsPaused'])
+
+    def test_a_claude_queue_is_not_rerouted_by_a_codex_limit(self):
+        self.start('o/r#1', implementer='claude')
+        self.record(1)
+        self.next_member()
+        self.assertEqual([(2, None)], [(n, None if tool == 'claude' else tool) for n, tool in self.implementers])
+
+    def test_clear_limit_forgets_it_and_old_records_stay_ignored(self):
+        self.record(1, at=datetime.now(timezone.utc) - timedelta(minutes=5))
+        self.w.tick()
+        self.assertIn('codex', self.store.load()['toolLimits'])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.start('o/r#1', clear_limit='codex')                # "codex has reset"
+        self.assertIn('cleared the recorded usage limit for codex (codex warning)', out.getvalue())
+        self.assertNotIn('toolLimits', self.store.load())
+        self.assertNotIn('implementer', self.store.load())          # nothing else changes
+        self.next_member()
+        self.assertEqual([(2, None)], self.implementers)             # #1's old failover does not bring it back
+        self.assertNotIn('toolLimits', self.store.load())
+        self.record(2, at=datetime.now(timezone.utc) + timedelta(minutes=1), relay=True)
+        self.report(2, 'pr-open')
+        self.w.tick()
+        self.assertEqual([(2, None), (3, 'claude')], self.implementers)
+
+    def test_clear_limit_claude_resumes_a_codex_queue_without_switching_it(self):
+        with self.store.transaction() as data:
+            data['implementer'] = 'codex'
+        self.record(1, tool='claude', kind='limited', relay=True)
+        self.next_member()
+        self.assertIn('toolsPaused', self.store.load())
+        self.start('o/r#1', clear_limit='claude')
+        self.w.tick()
+        self.assertNotIn('toolsPaused', self.store.load())
+        self.assertEqual('codex', self.store.load()['implementer'])
+        self.assertEqual([(2, 'codex')], self.implementers)
+
+    def test_implementer_alone_never_clears_a_limit(self):
+        self.record(1, at=datetime.now(timezone.utc) - timedelta(minutes=5))
+        self.w.tick()
+        self.start('o/r#1', implementer='codex')
+        self.assertIn('codex', self.store.load()['toolLimits'])
+        self.assertNotIn('toolLimitsClearedAt', self.store.load())
+        self.next_member()
+        self.assertEqual([(2, 'claude')], self.implementers)         # still routed away from the limit
+
+    def test_dry_run_shows_the_clear_and_writes_nothing(self):
+        self.record(1)
+        self.w.tick()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.start('o/r#1', clear_limit='codex', dry_run=True)
+        shown = json.loads(out.getvalue())
+        self.assertEqual(('codex', 'codex warning'), (shown['clearLimit']['tool'], shown['clearLimit']['recorded']['line']))
+        self.assertIn('codex', self.store.load()['toolLimits'])
+
+    def test_a_transient_read_error_does_not_alert(self):
+        # r1 m1: the error count resets on success, and each operation has its own key.
+        self.report(1, 'blocked', reason='x')
+        path = Path(self.member(1)['checkout']) / '.workbench/state/relay.json'
+        for broken in (True, False, True, True):
+            path.write_text('{broken' if broken else '{}', encoding='utf-8')
+            self.w.tick()
+        self.assertEqual([], [c for c in self.w.notify.call_args_list if 'limits #1' in c.args[0]
+                              or 'environment #1' in c.args[0]])
+        self.assertEqual(2, self.w.errors['environment #1'])
+
+    def test_malformed_tool_limits_are_refused(self):
+        for bad in ({'toolLimits': {'aider': {}}}, {'toolLimits': {'codex': {'at': 'x'}}},
+                    {'toolLimitsClearedAt': {'codex': 'yesterday'}}, {'toolsPaused': 3}, {'ramPaused': 3}):
+            with self.subTest(bad=bad):
+                data = q.read_json(self.store.path)
+                q.atomic_json(self.store.path, dict(data, **bad))
+                with self.assertRaises(q.StateError):
+                    self.store.load()
+                q.atomic_json(self.store.path, data)
+
+
+class MemoryGuard(unittest.TestCase):
+    """#61: below minFreeRamGB the conductor admits nothing and fails nothing, like the disk guard."""
+    terminal, start, gh, spawn, worker, member = (QueueCase.terminal, QueueCase.start, QueueCase.gh,
+                                                  QueueCase.spawn, QueueCase.worker, QueueCase.member)
+
+    def setUp(self):
+        QueueCase.setUp(self)
+        self.start('o/r#1,2,3', parallel=2)
+        self.w = self.worker()
+        self.w.notify = Mock()
+        self.w.status = Mock()
+
+    def test_low_memory_pauses_admission_and_resumes(self):
+        self.ram = 1.1 * q.GIB
+        for _ in range(3):
+            self.w.tick()
+        self.assertEqual([], self.launches)
+        self.assertEqual('low memory: 1.1 GB free < 3 GB', self.store.load()['ramPaused'])
+        self.w.notify.assert_called_once_with('queue paused: low memory: 1.1 GB free < 3 GB')
+        self.w.status.assert_called_once_with('blocked')
+        self.ram = 8 * q.GIB
+        self.w.tick()
+        self.assertEqual([1, 2], [n for n, _, _ in self.launches])
+        self.assertNotIn('ramPaused', self.store.load())
+        self.assertEqual('queue resumed: memory is back', self.w.notify.call_args.args[0])
+        self.w.status.assert_called_with('active')
+
+    def test_an_orphaned_launch_is_not_respawned_while_memory_is_low(self):
+        with self.store.transaction() as data:
+            data['members'][0].update(state='launching', attempt=1, token=str(uuid.uuid4()), result=None,
+                                      startedAt=self.now - 700, slotReleased=False)
+        self.ram = 1 * q.GIB
+        self.w.tick()
+        self.assertEqual([], self.launches)
+        self.assertEqual('launching', self.member(1)['state'])
+        self.ram = 8 * q.GIB
+        self.w.tick()
+        self.assertIn(1, [n for n, _, _ in self.launches])
+        self.assertNotEqual('failed', self.member(1)['state'])
+
+    def test_disk_and_memory_pauses_share_one_status(self):
+        self.ram, self.free = 1 * q.GIB, 5 * q.GIB
+        self.w.tick()
+        self.ram = 8 * q.GIB
+        self.w.tick()                                # memory is back, the disk is still low
+        self.assertEqual('blocked', self.w.status.call_args.args[0])
+        self.assertEqual([], self.launches)
+
+    def test_the_threshold_comes_from_the_config(self):
+        self.ram = 2 * q.GIB
+        for value, admitted in ((0, True), (1.5, True), (4, False)):
+            with self.subTest(value=value):
+                self.launches.clear()
+                with self.store.transaction() as data:
+                    for m in data['members']:
+                        m.update(state='pending', attempt=0, slotReleased=False)
+                self.config.write_text(json.dumps({'checkoutRoot': str(self.root / 'clones'), 'minFreeRamGB': value}))
+                self.w.tick()
+                self.assertEqual(admitted, bool(self.launches))
+
+    def test_an_invalid_threshold_pauses_rather_than_admits(self):
+        for value in (-1, 'x', True):
+            with self.subTest(value=value):
+                self.config.write_text(json.dumps({'checkoutRoot': str(self.root / 'clones'), 'minFreeRamGB': value}))
+                self.w.tick()
+                self.assertEqual([], self.launches)
+                self.assertIn('minFreeRamGB', self.store.load()['ramPaused'])
+
+    def test_free_ram_reads_this_machine(self):
+        free = REAL_FREE_RAM()
+        self.assertTrue(free is None or 0 < free < 1024 * q.GIB, free)
+        if os.name == 'nt':
+            self.assertIsNotNone(free)
+
+
 class LaunchBackoff(unittest.TestCase):
     terminal, start, gh, worker, member = (QueueCase.terminal, QueueCase.start, QueueCase.gh,
                                           QueueCase.worker, QueueCase.member)
@@ -2129,7 +2689,7 @@ class PriorityOrder(unittest.TestCase):
     def admit_all(self, worker, count):
         for _ in range(count):
             worker.tick()
-            self.now += 20
+            self.now += 20 + q.SESSION_GRACE            # these members' sessions are gone (#61 ceiling)
             launched = self.launches[-1][0]
             self.report(launched)
             worker.tick()

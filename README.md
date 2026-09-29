@@ -542,7 +542,21 @@ safety reason, and 2 on a usage or GitHub error.
 drive of `checkoutRoot` against `minFreeGB` (default 20, in GiB as Explorer shows them; 0 turns it
 off). Below it the queue admits nothing, no member changes state, the queue file gets
 `diskPaused: "low disk: ..."`, and its session shows blocked with a notification. The next tick
-checks again and resumes when there is space.
+checks again and resumes when there is space. The memory guard works the same way: below
+`minFreeRamGB` (default 3 GiB) of free memory it records `ramPaused: "low memory: ..."`, and it
+resumes by itself.
+
+**Blocked members and the live ceiling.** A member blocked on a question for you frees its slot,
+so the next issue starts. A member blocked by its environment keeps its slot while its issue
+session is open: a usage limit it could not fail over, low disk or low memory. The planner reports
+that with `wb.py loop-state blocked --environmental`, and a limit its relay announced counts too.
+A member that resumes takes a slot again. It gives the slot back once its issue session has been
+gone for two minutes, and takes it again if the session comes back. Whatever the slots say, the queue admits nothing while
+`parallel + 2` members have live sessions: launching, active, blocked, and open-PR or
+close-pending members whose issue session is still in the terminal. A
+session counts as gone only after two minutes missing, and an unreadable terminal counts every
+member as live. So with `-Parallel 1`,
+three PRs waiting for your merge stop new launches until you merge one or close its sessions.
 
 **Queue launch failures.** A transient launcher-start failure, launcher exit without a result,
 launcher timeout, terminal, pane, agent-start or relay failure returns the member to
@@ -575,10 +589,15 @@ implementer, the planner runs `github-workbench <issue> -Failover`, which:
 
 A tool with a recorded limit is never switched back to automatically. Once its limit has reset,
 clear it with `github-workbench <issue> -Implementer <tool>`. Codex's "Approaching rate limits"
-chooser is only reported; nobody answers it. The planner's own limit cannot be failed over: you
-get the notification, and the loop waits. Set `"failover": false` to have limits only reported.
-A queue's later members still start with the queue's tool; relaunch the queue with `-Implementer`
-to change that. The limit strings come from the installed binaries
+chooser (under 10% of its limit left) fails over the same way. Nobody answers it, and it counts
+only at the bottom of the pane, where the chooser replaces the composer. The planner's own limit
+cannot be failed over: you get the notification, and the loop waits. Set `"failover": false` to
+have limits only reported. In a queue, a limit that any live member recorded sends later members
+to Claude (with `failover` on). If Claude is limited, or failover is off, the queue pauses with
+`toolsPaused: "tool limits: ..."`. Once the limit has reset, clear it for the queue with
+`-Queue <spec> -ClearLimit <tool>`. That changes nothing else: the queue's `-Implementer` stays as
+it is, and setting `-Implementer` never clears a limit. Records made before the clear are ignored
+from then on, and `-DryRun` shows the record it would clear. The limit strings come from the installed binaries
 (`tests/fixtures/limits/`, with the command that extracted them).
 
 ### Auto-merge (opt-in)
@@ -691,6 +710,7 @@ the autonomous close can close it. revmux and revdiff rounds that fail also mail
 | `autonomous` | `false` | full autonomy: merge, file follow-up issues, close the sessions after the merge; implies `autoMerge` |
 | `cleanup` | `"merged"` | after an autonomous close: `merged` deletes the checkout when it is safe, `build` deletes only its build outputs, `off` keeps it (see Cleaning up checkouts) |
 | `minFreeGB` | `20` | the queue admits no member while the checkout drive has less free space (GiB); `0` turns the guard off |
+| `minFreeRamGB` | `3` | the queue admits no member while less memory is free (GiB); `0` turns the guard off |
 | `stallMinutes` | `15` | minutes a loop may sit idle with nothing to wake it before the relay mails the planner a stall pointer (see Stalls); `0` turns the watch off |
 | `autoMerge` | `false` | new checkouts let the planner merge its own PR when every auto-merge condition holds; `-AutoMerge` / `-NoAutoMerge` change it per checkout or queue |
 

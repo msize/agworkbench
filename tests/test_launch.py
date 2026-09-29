@@ -1366,6 +1366,18 @@ class QueueEntry(LauncherFixtures):
         self.assertIn('--autonomous', seen['args'])
         self.assertEqual('bugs', seen['spec'])
 
+    def test_clear_limit_reaches_the_conductor_and_belongs_to_queue(self):
+        # #61 r1 M1: clearing a queue's recorded limit is its own switch, not -Implementer.
+        seen = self.conductor_start('bugs', '-ClearLimit', 'claude')
+        self.assertEqual(['--clear-limit', 'claude'], seen['args'][seen['args'].index('--clear-limit'):][:2])
+        self.assertNotIn('--implementer', seen['args'])
+        for extra in (['o/repo#7', '-ClearLimit', 'codex'], ['-Queue', 'bugs', '-Repo', 'o/repo', '-ClearLimit', 'gpt']):
+            with self.subTest(extra=extra):
+                result = subprocess.run([PWSH, '-NoProfile', '-File', str(self.entry_lib / 'github-workbench.ps1'), *extra],
+                                        env=self.env, cwd=ROOT, capture_output=True, text=True, timeout=45)
+                self.assertEqual(2, result.returncode, result.stdout + result.stderr)
+                self.assertIn('-ClearLimit takes codex or claude and belongs to -Queue', result.stdout)
+
     def test_a_query_spec_reaches_the_conductor_exactly_under_both_shells(self):
         # #38: 5.1 strips double quotes from a native argument; the spec goes through the environment.
         import labelquery
@@ -3102,7 +3114,8 @@ class AutoMergeLaunch(LauncherFixtures):
         for key, value, ok in (('cleanup', 'merged', True), ('cleanup', 'off', True), ('cleanup', 'Merged', False),
                                ('cleanup', 'all', False), ('cleanup', 1, False), ('minFreeGB', 0, True),
                                ('minFreeGB', 20.5, True), ('minFreeGB', -1, False), ('minFreeGB', '20', False),
-                               ('minFreeGB', True, False), ('stallMinutes', 0, True), ('stallMinutes', 7.5, True),
+                               ('minFreeGB', True, False), ('minFreeRamGB', 0, True), ('minFreeRamGB', 1.5, True),
+                               ('minFreeRamGB', -1, False), ('minFreeRamGB', '3', False), ('stallMinutes', 0, True), ('stallMinutes', 7.5, True),
                                ('stallMinutes', -1, False), ('stallMinutes', '15', False), ('stallMinutes', True, False)):
             with self.subTest(key=key, value=value):
                 self.config_path.write_text(json.dumps({'checkoutRoot': str(self.temp), key: value}), encoding='utf-8')
@@ -3173,12 +3186,12 @@ class FailoverLaunch(LauncherFixtures):
         self.scenario['text'][RELAY_ID] = 'PS C:\\relay> '
         self.save_scenario()
 
-    def relay_record(self, text, age=120):
+    def relay_record(self, text, age=120, kind='limited'):
         sys.path.insert(0, str(LIB))
         import limits
         path = self.checkout / '.workbench/state/relay.json'
         data = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
-        data['limits'] = {'codex': {'kind': 'limited', 'tool': 'codex', 'tail': limits.tail_hash(text),
+        data['limits'] = {'codex': {'kind': kind, 'tool': 'codex', 'tail': limits.tail_hash(text),
                                     'since': time.time() - age, 'announced': True}}
         path.write_text(json.dumps(data), encoding='utf-8')
 
@@ -3231,12 +3244,13 @@ class FailoverLaunch(LauncherFixtures):
     def stopped_pids(self):
         return [int(x) for x in self.stopped.read_text(encoding='utf-8-sig').split()] if self.stopped.exists() else []
 
-    def assert_switched_to_claude(self, result):
+    def assert_switched_to_claude(self, result, line='hit your usage limit', kind='limited'):
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
         record = self.state('implementer.json')
         self.assertEqual('claude', record['tool'])
         self.assertIn('codex', record['limits'])
-        self.assertIn('hit your usage limit', record['limits']['codex']['line'])
+        self.assertIn(line, record['limits']['codex']['line'])
+        self.assertEqual(kind, record['limits']['codex']['kind'])
         typed = self.typed_right()
         self.assertEqual('Clear-Host\n', typed[-2])
         self.assertIn('pane-implementer-claude.ps1', typed[-1])
@@ -3284,7 +3298,36 @@ class FailoverLaunch(LauncherFixtures):
         self.assert_switched_to_claude(result)
         self.assertIn('sampling the pane', self.log())
 
+    def test_a_codex_on_its_warning_chooser_is_stopped_and_recorded_as_a_warning(self):
+        # #61: the chooser waits for an answer nobody gives; it fails over like the hard limit.
+        text = self.frame('codex-warning-chooser')
+        self.right(text)
+        self.relay_record(text, kind='warning')
+        result = self.failover(timing="Stable=90; Confirm=0; Sample=60; Step=30; ShellWait=2")
+        self.assert_switched_to_claude(result, line='Heads up, you have less than 10%', kind='warning')
+        self.assertEqual([self.CODEX_PID], self.stopped_pids())
+        self.assertIn('relay saw this frame unchanged', self.log())
+
+    def test_a_warning_chooser_without_relay_history_is_sampled(self):
+        self.right(self.frame('codex-warning-chooser-no-heads-up'))
+        result = self.failover()
+        self.assert_switched_to_claude(result, line='Approaching rate limits', kind='warning')
+        self.assertIn('sampling the pane', self.log())
+
     # --- refusals: nothing stopped, nothing recorded -------------------------------------------
+
+    def test_a_relay_record_of_another_kind_is_not_trusted(self):
+        text = self.frame('codex-warning-chooser')
+        self.right(text)
+        self.relay_record(text, kind='limited')
+        result = self.failover()
+        self.assert_switched_to_claude(result, line='Heads up', kind='warning')
+        self.assertIn('sampling the pane', self.log())
+
+    def test_a_chooser_dumped_in_tool_output_is_refused(self):
+        self.right(self.frame('codex-warning-chooser-in-tool-output'))
+        self.assert_refused(self.failover(), 'the codex pane is neither showing')
+        self.assertEqual([], self.stopped_pids())
 
     def test_a_working_pane_is_refused(self):
         self.right(self.frame('codex-working'))

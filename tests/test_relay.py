@@ -2008,13 +2008,24 @@ class UsageLimits(DeliveryFixture):
         self.r.retire(7)
         self.assertNotIn('limits', self.r.state)
 
-    def test_a_warning_is_announced_but_mail_is_not_held_for_it(self):
+    def test_a_warning_fails_over_like_a_limit_and_holds_mail(self):
+        # #61: the chooser is a limit episode; the planner fails over, the human is not asked.
         self.check('codex-warning-chooser', times=2)
-        self.assertEqual('usage limit: codex (codex) warning', self.mails()[0]['subject'])
-        self.assertIn('Never answer it', self.mails()[0]['body'])
-        self.pane.return_value = CODEX_IDLE
+        mail = self.mails()[0]
+        self.assertEqual('usage limit: codex (codex) warning', mail['subject'])
+        self.assertIn('Never answer the chooser', mail['body'])
+        self.assertIn('-Failover', mail['body'])
+        self.assertNotIn('tell the human', mail['body'])
         self.tick(0)
-        self.send.assert_called_once()
+        self.send.assert_not_called()
+        self.assertEqual('usage limit', self.r.holds[('codex', 'm1')].reason)
+
+    def test_a_chooser_already_on_screen_at_start_is_announced(self):
+        # #61 B1: Codex is typed before the relay starts, and the modal chooser never leaves.
+        self.r.limit_baseline = {}                   # this relay has just started
+        self.check('codex-warning-chooser', times=2)
+        self.assertEqual(['usage limit: codex (codex) warning'], [m['subject'] for m in self.mails()])
+        self.assertEqual(set(), self.r.limit_baseline['codex'])
 
     def test_a_limit_row_already_on_screen_at_start_is_ignored_until_it_leaves(self):
         self.peer = relay.Peer('codex', 'claude', 'codex-pane')
