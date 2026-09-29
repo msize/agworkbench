@@ -80,8 +80,24 @@ CODEX_CONT_RE = re.compile(r"^ {2}\s*(\S.*?)\s*$")
 # Codex indents its footer rows by two spaces. Only the final row is stripped: a multi-row overlay
 # and an indented modal choice have the same shape, so the guard fails closed on both.
 FOOTER_RE = re.compile(r"^ {2}\S")
-# A highlighted chooser row - a permission prompt, a trust dialog, a picker.
-CHOOSER_RE = re.compile(r"^\s*[>❯›]\s+\d+\.\s+\S")
+# A highlighted chooser row - a permission prompt, a trust dialog, a picker. Kimi Code marks its
+# approval choice with `▶`.
+CHOOSER_RE = re.compile(r"^\s*[>❯›▶]\s+\d+\.\s+\S")
+# Kimi Code's dialogs carry a key-hint row: its approval prompt ("↑/↓ select · 1/2/3/4 choose") and
+# its trust dialog ("↑↓ navigate · Enter select · Esc exit"), whose choices have no numbers.
+KIMI_DIALOG_HINT_RE = re.compile(r"^\s*(?:↑/↓ select · |↑↓ navigate · Enter select)")
+
+# Kimi Code draws its composer as a rounded box: `╭───╮`, `│ > text │` with wrapped rows indented
+# under the text, `╰───╯`, then a footer ("Ask When Needed ... context: N%"). Shell mode titles the
+# top border (`╭ ! shell mode ──╮`) and draws `!` for `>`, so it never parses as a composer.
+KIMI_TOP_RE = re.compile(r"^\s*╭─+╮\s*$")
+KIMI_ANY_TOP_RE = re.compile(r"^\s*╭")
+KIMI_BOTTOM_RE = re.compile(r"^\s*╰─+╯\s*$")
+KIMI_ROW_RE = re.compile(r"^\s*│ (.*?)\s*│\s*$")
+KIMI_FOOTER_ROWS = 3     # at most this many rows (its footer) below the composer's bottom border
+# The row above a running turn's composer starts with its spinner: a braille frame ("⠹ Thinking…")
+# or a moon phase ("🌗 · Tip: ..."). Its retry notice ("Retrying (1/10) · rate_limit") is that row too.
+KIMI_SPINNER_RE = re.compile(r"^\s*[⠀-⣿\U0001F311-\U0001F318]\s")
 
 # Placeholder text an EMPTY composer draws. Anything else in the composer is treated as a draft.
 #
@@ -103,6 +119,8 @@ CODEX_HINTS = (
     re.compile(r"Ask Codex to do anything\s*"),
     re.compile(r"\s*"),
 )
+# Kimi Code's empty composer draws no placeholder at all.
+KIMI_HINTS = (re.compile(r"\s*"),)
 
 
 @dataclass(frozen=True)
@@ -120,6 +138,10 @@ PROFILES = {
     # Claude Code has no queue-only key, so it takes Return - which lands in whatever turn is
     # running. Send to Claude when you have finished a thought, not in the middle of one.
     "claude": Profile("claude", "Claude", "\n", CLAUDE_HINTS),
+    # Kimi Code takes Return. A Return that arrives within 120 ms of a burst of typed characters is
+    # taken as pasted text and becomes a newline in the composer; send() types the text and the key
+    # in separate calls with SETTLE between them, well past that window.
+    "kimi": Profile("kimi", "Kimi", "\n", KIMI_HINTS),
 }
 
 
@@ -147,9 +169,10 @@ def pause(seconds: float) -> None:
 
 
 def is_busy(text: str) -> bool:
-    """Current agent activity, including Claude's elapsed-time/token spinner row."""
+    """Current agent activity, including Claude's elapsed-time/token spinner row and the spinner row
+    above Kimi Code's composer."""
     tail = "\n".join(text.splitlines()[-BOX_LINES:]).lower()
-    return "esc to interrupt" in tail or bool(CLAUDE_BUSY_RE.search(tail))
+    return "esc to interrupt" in tail or bool(CLAUDE_BUSY_RE.search(tail)) or kimi_busy(text)
 
 
 def compact(text: str) -> str:
@@ -270,6 +293,67 @@ def codex_composer(text: str) -> str | None:
     return " ".join(row for row in rows if row).strip()
 
 
+def kimi_box(text: str) -> tuple[list[str], int, int] | None:
+    """(the pane's last BOX_LINES rows, top index, bottom index) of Kimi Code's composer box at the
+    bottom of the pane: nothing but its footer below it, and only box rows between its borders.
+    None when that box is not there (a dialog replaced it, shell mode, another tool's pane)."""
+    lines = text.splitlines()[-BOX_LINES:]
+    while lines and not lines[-1].strip():
+        lines.pop()
+    bottom = next((i for i in range(len(lines) - 1, -1, -1) if KIMI_BOTTOM_RE.match(lines[i])), None)
+    if bottom is None or len([row for row in lines[bottom + 1:] if row.strip()]) > KIMI_FOOTER_ROWS:
+        return None
+    if any(KIMI_ANY_TOP_RE.match(row) or KIMI_ROW_RE.match(row) for row in lines[bottom + 1:]):
+        return None
+    top = bottom - 1
+    while top >= 0 and KIMI_ROW_RE.match(lines[top]):
+        top -= 1
+    if top < 0 or top == bottom - 1 or not KIMI_TOP_RE.match(lines[top]):
+        return None
+    return lines, top, bottom
+
+
+def kimi_composer(text: str) -> str | None:
+    """Kimi Code's composer content: the `> ` row plus its wrapped rows, joined. None when the box is
+    not visible, or holds anything the parser does not recognise (shell mode, a picker): an unread
+    frame must refuse, not send."""
+    box = kimi_box(text)
+    if box is None:
+        return None
+    lines, top, bottom = box
+    rows = [KIMI_ROW_RE.match(line).group(1) for line in lines[top + 1:bottom]]
+    first = re.match(r"^>(?: (.*))?$", rows[0])
+    if not first:
+        return None
+    parts = [(first.group(1) or "").strip()]
+    for row in rows[1:]:
+        if row.strip() and not row.startswith("  "):
+            return None           # not a wrapped row of the text
+        parts.append(row.strip())
+    return " ".join(part for part in parts if part).strip()
+
+
+def kimi_busy(text: str) -> bool:
+    """A Kimi Code turn is running: its spinner row sits right above the composer box."""
+    box = kimi_box(text)
+    if box is None:
+        return False
+    lines, top, _ = box
+    above = next((row for row in reversed(lines[:top]) if row.strip()), "")
+    return bool(KIMI_SPINNER_RE.match(above))
+
+
+def composer_content(tool: str, text: str) -> str | None:
+    """The composer content for whichever tool runs the pane; None when it cannot be read."""
+    if tool == 'claude':
+        return claude_composer(text)
+    if tool == 'codex':
+        return codex_composer(text)
+    if tool == 'kimi':
+        return kimi_composer(text)
+    return None
+
+
 def looks_empty(profile: Profile, content: str) -> bool:
     """True only when the composer holds nothing but a placeholder. fullmatch, never match: a
     prefix match calls "placeholder + a modal choice list" empty, and then peer-chat types."""
@@ -279,7 +363,7 @@ def looks_empty(profile: Profile, content: str) -> bool:
 def composer_state(pane: str, profile: Profile, text: str) -> tuple[str | None, str, str]:
     """Bracket the cursor read with matching composer snapshots before trusting either."""
     body = parse_claude_composer(text) if profile.tool == 'claude' else None
-    content = body.content if body else (codex_composer(text) if profile.tool == 'codex' else None)
+    content = body.content if body else (composer_content(profile.tool, text) if profile.tool != 'claude' else None)
     state = 'draft'
     if content is None:
         state = 'missing'
@@ -293,7 +377,7 @@ def composer_state(pane: str, profile: Profile, text: str) -> tuple[str | None, 
             pass  # Unavailable or malformed cursor data retains the text-only refusal.
     fresh = agw.pane_text(pane)
     fresh_body = parse_claude_composer(fresh) if profile.tool == 'claude' else None
-    fresh_content = fresh_body.content if fresh_body else (codex_composer(fresh) if profile.tool == 'codex' else None)
+    fresh_content = fresh_body.content if fresh_body else (composer_content(profile.tool, fresh) if profile.tool != 'claude' else None)
     if dialog_visible(text) or dialog_visible(fresh):
         state = 'dialog'
     elif (body, content) != (fresh_body, fresh_content):
@@ -303,7 +387,7 @@ def composer_state(pane: str, profile: Profile, text: str) -> tuple[str | None, 
 
 def dialog_visible(text: str) -> bool:
     lines = text.splitlines()[-25:]
-    return any(CHOOSER_RE.match(line) for line in lines)
+    return any(CHOOSER_RE.match(line) or KIMI_DIALOG_HINT_RE.match(line) for line in lines)
 
 
 # Control characters that survive whitespace folding. NUL is the dangerous one: agwinterm's
@@ -345,7 +429,7 @@ def resolve_target(to: str, pane_opt: str | None, session_opt: str | None) -> tu
             raise Refused(f"no pane {pane_opt} in this agwinterm window")
         tool = to if to in PROFILES else (hub.lookup(to) or {}).get("tool", "")
         if tool not in PROFILES:
-            raise Refused(f"--pane needs --to claude|codex (or a registered box); got {to!r}")
+            raise Refused(f"--pane needs --to claude|codex|kimi (or a registered box); got {to!r}")
         return pane_opt, PROFILES[tool], to
 
     entry = hub.lookup(to)
@@ -362,7 +446,7 @@ def resolve_target(to: str, pane_opt: str | None, session_opt: str | None) -> tu
         return pane, PROFILES[tool], to
 
     if to not in PROFILES:
-        raise Refused(f"unknown target {to!r}: not a registered box and not claude|codex")
+        raise Refused(f"unknown target {to!r}: not a registered box and not claude|codex|kimi")
 
     # No registry entry: fall back to the split this process sits in, one peer per pane.
     if not mine:
@@ -579,7 +663,7 @@ def read_message(args: argparse.Namespace) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="type one line into the peer agent's composer")
-    parser.add_argument("--to", required=True, help="a registered box name, or claude|codex")
+    parser.add_argument("--to", required=True, help="a registered box name, or claude|codex|kimi")
     parser.add_argument("--pane", help="explicit target pane id (from `agwintermctl tree --json`)")
     parser.add_argument("--session", help="session whose split to use when --to is a bare tool name")
     source = parser.add_mutually_exclusive_group()

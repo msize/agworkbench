@@ -1,0 +1,19 @@
+ boris on  ~/AppData/Local/Temp/claude/C--Users-boris-source-workbench-agworkbench-issue-65/1f04f780-cf8b-4e04-aa4c-732564abee4a/scratchpad/kimiframes
+# pwsh -NoLogo -ExecutionPolicy Bypass -File ./run2.ps1
+Use 'Show-Help' to list all available functions
+WARNING: oh-my-posh theme not found at C:\Users\boris\cobalt2.omp.json.
+ ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Trust this folder?
+  ↑↓ navigate · Enter select · Esc exit
+
+  C:\Users\boris\AppData\Local\Temp\claude\C--Users-boris-source-workbench-agworkbench-issue-65\1f04f780-cf8b-4e04-aa4c-732564abee4a\scratchpad\kimiframes\proj2
+
+  Project-level MCP servers are disabled until you explicitly choose Trust. Trust starts the listed project MCP targets and remembers this folder.
+
+   ❯ Trust this folder
+     Enable project MCP servers. Remembered for this folder.
+
+     Don't trust
+     Exit Kimi Code. Asked again next launch.
+
+ ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────

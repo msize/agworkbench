@@ -1,0 +1,28 @@
+ boris on  ~/AppData/Local/Temp/claude/C--Users-boris-source-workbench-agworkbench-issue-65/1f04f780-cf8b-4e04-aa4c-732564abee4a/scratchpad/kimiframes
+# pwsh -NoLogo -ExecutionPolicy Bypass -File ./run2.ps1
+Use 'Show-Help' to list all available functions
+WARNING: oh-my-posh theme not found at C:\Users\boris\cobalt2.omp.json.
+
+ ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │                                                                                                                                                                          │
+ │  ▐█▛█▛█▌  Welcome to Kimi Code!                                                                                                                                          │
+ │  ▐█████▌  Send /help for help information.                                                                                                                               │
+ │                                                                                                                                                                          │
+ │  Directory: C:\Users\boris\AppData\Local\Temp\claude\C--Users-boris-source-workbench-agworkbench-issue-65\1f04f780-cf8b-4e04-aa4c-732564abee4a\scratchpad\kimiframes\pro…│
+ │  Session:                                                                                                                                                                │
+ │  Model:     K2.8 Preview                                                                                                                                                 │
+ │  Version:   2.1.1                                                                                                                                                        │
+ │                                                                                                                                                                          │
+ ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ✦ Kimi Code Desktop is here — Everything you love about Kimi Code, now on desktop
+   Run /desktop or visit https://www.kimi.com/code to install
+
+   No session yet — one will be created on your first message.
+
+ ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │ > reply with the single word ok please                                                                                                                                   │
+ │                                                                                                                                                                          │
+ ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ Ask When Needed  K2.8 Preview thinking: max  C:\Users\boris\AppData\Local\Temp\claude\C--Users-boris-source-workbench-agworkbench-issue-65\1f04f780-cf8b-4e04-aa4c-732564ab…
+                                                                                                                                                           context: 0% (0/1M)

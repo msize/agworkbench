@@ -29,3 +29,18 @@ the real #68 pane on 2026-09-24. Two frames are cut from it, with no row retyped
 `codex-warning-chooser-in-tool-output.txt` is the whole frame printed by a `cat` inside Codex, with
 the composer below it - the chooser counts only at the bottom of the pane. When a real limit frame is seen, add it here verbatim and keep the
 constructed one only if it still adds a case.
+
+## Kimi Code (#65)
+
+`strings-kimi.txt` comes from the same script (`--kimi ~/.kimi-code/bin/kimi.exe`, Kimi Code 2.1.1,
+2026-09-29). It holds the quota code and message patterns Kimi itself matches
+(`KIMI_QUOTA_EXHAUSTED_*`), the way a session error is drawn (`showStatus(\`Error: ${message}\`)`
+with `[${error.code}] ${error.message}`, then the report hint `If this persists, run
+/export-debug-zip ...`), the retry label and the provider error codes.
+
+A Kimi limit could not be provoked, so every `kimi-*.txt` frame is **synthesised**: the rows around
+the error are the captured `../kimi/status-error.txt` frame (a status error really is glued to the
+item above it, with no blank row), and the error and hint rows follow the templates above. Only the
+provider's message around the quota words is invented, and `kimi-limited-usage.txt`'s wording
+("weekly usage limit") is a guess at how a plan limit would read. When a real Kimi limit frame is
+seen, add it here verbatim.

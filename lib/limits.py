@@ -13,7 +13,14 @@ greps, test output and fixture dumps - so a phrase counts only by POSITION, neve
   it), and that item is not a tool result (a `⎿` row whose parent is a `● Tool(...)` call).
 - Codex alive: the phrase starts a row of the last block above the composer, and that row is not
   tool output (`└`, `│`, `├`).
-- Either tool exited: the last row is a shell prompt and the phrase starts one of the rows just
+- Kimi Code alive (#65): its idle composer box is at the bottom (no spinner row above it), and the
+  last rows above the box are a session error - `Error: [<code>] <message>`, possibly wrapped -
+  followed by the report hint Kimi always draws after one ("If this persists, run
+  `/export-debug-zip`..."). The message must name a quota or usage limit: a bare
+  `[provider.rate_limit]` is a transient 429 that Kimi already retried, not a reason to fail over.
+  Kimi draws that status row with no glyph and no blank row above it, at the same indent as a
+  message continuation, so the hint row below it is what places it.
+- Any tool exited: the last row is a shell prompt and the phrase starts one of the rows just
   above it, in the output since the previous prompt.
 
 A limit row starts with the phrase right after the ONE glyph that tool draws its own notices
@@ -38,7 +45,7 @@ WINDOW = 20      # rows considered: the last 20 non-empty rows of the frame
 
 APOSTROPHES = re.compile("[\u2018\u2019\u02bc]")
 # The glyph each tool draws its own limit notice with (r17: an agent's reply glyph never counts).
-LIMIT_GLYPH = {"claude": r"⎿\s+", "codex": r"■\s+"}
+LIMIT_GLYPH = {"claude": r"⎿\s+", "codex": r"■\s+", "kimi": r""}
 WARNING_GLYPH = r"(?:⚠\s+)?"
 FORBIDDEN_TOOL_OUTPUT = ("└", "│", "├")
 # Claude Code starts an item (a message, a tool call, a tool result, a notice) with one of these;
@@ -60,6 +67,13 @@ LIMITED = {
         r"usage credit limit reached\b",
         r"Out of usage credits\b",
     ],
+    # Kimi's quota code and message patterns (KIMI_QUOTA_EXHAUSTED_*, see strings-kimi.txt), plus the
+    # words a plan's usage limit would use, anywhere in the session error's message.
+    "kimi": [
+        r"Error: \[provider\.[a-z_]+\] .*?(?:exceeded_current_quota_error|exceeded your current (?:token )?quota"
+        r"|insufficient balance|check your account balance|recharge your account|please recharge"
+        r"|account (?:is )?in arrears|usage limit|(?:weekly|daily|monthly|hourly|5-hour|plan) limit)",
+    ],
 }
 WARNING_CODEX = [r"Approaching rate limits\b", r"Heads up, you have less than \d+% of your \w+ limit left\b",
                  r"Switch to \S+ for lower credit usage\?"]
@@ -75,6 +89,15 @@ SHELL_PS_COMMAND_RE = re.compile(r"^PS [A-Za-z]:\\[^>]*>")   # a prompt, with or
 SHELL_GLYPH_RE = re.compile(r"^\s*❯\s*$")
 SHELL_TIMING_RE = re.compile(r"(\d+(\.\d+)?(ms|s)|\d\d:\d\d(:\d\d)?)\s*$")
 BUSY_RE = re.compile(r"esc to interrupt|…\s*\((?:\d+h )?(?:\d+m )?\d+s\s*·", re.IGNORECASE)
+# Kimi Code: its composer box, the spinner row a running turn draws right above it (its
+# "Retrying (n/10)" label too), the session error row and the hint row that always follows it.
+KIMI_BOTTOM_RE = re.compile(r"^\s*╰─+╯\s*$")
+KIMI_TOP_RE = re.compile(r"^\s*╭")
+KIMI_ROW_RE = re.compile(r"^\s*│ ")
+KIMI_SPINNER_RE = re.compile(r"^\s*[⠀-⣿\U0001F311-\U0001F318]\s")
+KIMI_ERROR_RE = re.compile(r"^\s{1,4}Error: \[")
+KIMI_HINT_RE = re.compile(r"^\s*If this persists, run `/export-debug-zip`")
+KIMI_ITEM_RE = re.compile(r"^\s*[●✗✨$]\s")
 
 
 @dataclass(frozen=True)
@@ -215,6 +238,37 @@ def _codex_warning(rows: list[str]) -> Limit | None:
     return Limit("warning", found.strip()) if found else None
 
 
+def _kimi(rows: list[str]) -> Limit | None:
+    filled = [i for i, row in enumerate(rows) if row.strip()]
+    bottom = next((i for i in reversed(filled) if KIMI_BOTTOM_RE.match(rows[i])), None)
+    if bottom is None or sum(1 for i in filled if i > bottom) > 3:
+        return None                        # no composer at the bottom: a dialog, or not Kimi at all
+    top = bottom - 1
+    while top >= 0 and KIMI_ROW_RE.match(rows[top]):
+        top -= 1
+    if top < 0 or top == bottom - 1 or not KIMI_TOP_RE.match(rows[top]):
+        return None
+    above = rows[:top]
+    while above and not above[-1].strip():
+        above = above[:-1]
+    if not above or KIMI_SPINNER_RE.match(above[-1]):
+        return None                        # a running turn, or its retries: any error on screen is old
+    # The hint is the last row, or the last two when it wraps.
+    hint = next((i for i in range(len(above) - 1, max(len(above) - 3, -1), -1) if KIMI_HINT_RE.match(above[i])), None)
+    if hint is None or any(not row.strip() or KIMI_ITEM_RE.match(row) for row in above[hint + 1:]):
+        return None
+    for start in range(hint - 1, max(hint - 5, -1), -1):
+        row = above[start]
+        if KIMI_ERROR_RE.match(row):
+            message = " ".join(part.strip() for part in above[start:hint])
+            if _starts_with(message, LIMITED["kimi"], LIMIT_GLYPH["kimi"]):
+                return Limit("limited", row.strip())
+            return None
+        if not row.strip() or KIMI_ITEM_RE.match(row):
+            return None                    # the hint follows something else: not a session error
+    return None
+
+
 def classify(text: str, tool: str) -> Limit | None:
     if tool not in LIMITED:
         raise ValueError(f"unknown tool {tool!r}")
@@ -225,6 +279,8 @@ def classify(text: str, tool: str) -> Limit | None:
         return _exited(rows, tool)
     if tool == "codex":
         return _codex_warning(rows) or _codex(rows)
+    if tool == "kimi":
+        return _kimi(rows)
     return _claude(rows)
 
 

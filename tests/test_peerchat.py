@@ -487,3 +487,126 @@ class CapturedBusyFrames(unittest.TestCase):
                 frame = CLAUDE_RUNNING.replace('2m 30s · ↓ 4.9k tokens', activity)
                 self.assertTrue(relay.is_busy(frame))
         self.assertFalse(relay.is_busy(CLAUDE_IDLE))
+
+
+KIMI_FRAMES = Path(__file__).resolve().parent / 'fixtures' / 'kimi'
+
+
+def kimi_frame(name):
+    """A frame captured from a live Kimi Code 2.1.1 pane in agwinterm (see fixtures/kimi/README.md)."""
+    return (KIMI_FRAMES / f'{name}.txt').read_text(encoding='utf-8')
+
+
+def kimi(content, frame='idle-after-turn'):
+    """The captured idle frame with `content` in its composer's `>` row."""
+    lines = kimi_frame(frame).splitlines()
+    row = next(i for i, line in enumerate(lines) if line.lstrip().startswith('│ >'))
+    lines[row] = ' │ > ' + content + ' │'
+    return '\n'.join(lines)
+
+
+class KimiComposer(unittest.TestCase):
+    """#65: Kimi Code's composer, read from frames captured in agwinterm (UTF-8 console)."""
+
+    def test_captured_frames_classify(self):
+        cases = {
+            'idle-fresh': '', 'idle-after-turn': '', 'status-error': '',
+            'running-thinking': '', 'running-tool': '',
+            'draft-wrapped': ('Run the shell command: sleep 25 && echo slept. Then reply with exactly the word '
+                              'done. This sentence pads the draft so that it wraps across more than one row of '
+                              'the composer box, which is what the parser must join back together correctly '
+                              'without losing any text at all.'),
+            # A Return typed in the same burst as the text became a newline: an empty wrapped row.
+            'burst': 'reply with the single word ok please',
+            'approval': None, 'trust-dialog': None, 'shell-mode': None,
+        }
+        for name, expected in cases.items():
+            with self.subTest(frame=name):
+                self.assertEqual(expected, peerchat.kimi_composer(kimi_frame(name)))
+                self.assertEqual(expected, peerchat.composer_content('kimi', kimi_frame(name)))
+
+    def test_running_turns_are_busy_and_idle_ones_are_not(self):
+        for name, expected in [('running-thinking', True), ('running-tool', True), ('idle-fresh', False),
+                               ('idle-after-turn', False), ('status-error', False), ('draft-wrapped', False)]:
+            with self.subTest(frame=name):
+                self.assertEqual(expected, peerchat.is_busy(kimi_frame(name)))
+                self.assertEqual(expected, relay.is_busy(kimi_frame(name)))
+        retrying = kimi_frame('running-thinking').replace('⠹ Thinking… · Tip:', '⠼ Retrying (2/10) · rate_limit · in 4s ·')
+        self.assertTrue(peerchat.is_busy(retrying))
+        # The other tools' frames never look like a Kimi turn.
+        self.assertFalse(peerchat.kimi_busy(CLAUDE_IDLE) or peerchat.kimi_busy(CODEX_IDLE))
+
+    def test_dialogs_are_dialogs(self):
+        for name, expected in [('approval', True), ('trust-dialog', True), ('idle-after-turn', False),
+                               ('running-tool', False), ('draft-wrapped', False)]:
+            with self.subTest(frame=name):
+                self.assertEqual(expected, peerchat.dialog_visible(kimi_frame(name)))
+
+    def test_a_box_that_is_not_at_the_bottom_or_not_a_composer_is_missing(self):
+        idle = kimi_frame('idle-after-turn')
+        self.assertIsNone(peerchat.kimi_composer(idle + '\n' + '\n'.join(f'row {n}' for n in range(5))))
+        # The welcome panel is a box too, but its first row is not the `>` row.
+        welcome = kimi_frame('idle-fresh').split('✦')[0]
+        self.assertIsNone(peerchat.kimi_composer(welcome))
+        self.assertIsNone(peerchat.kimi_composer(idle.replace(' │ >', ' │ ! echo x', 1)))
+        unknown = idle.replace(' │ >', ' │ >\n │ 1. Yes │', 1)
+        self.assertIsNone(peerchat.kimi_composer(unknown))
+
+
+class KimiSubmission(unittest.TestCase):
+    def setUp(self):
+        self.clock = Clock()
+
+    def send(self, fake, text=TEXT):
+        stamps = []
+        typed = fake.type_into
+
+        def type_into(pane, keys):
+            stamps.append((self.clock.now(), keys))
+            typed(pane, keys)
+
+        with patch.object(agw, 'pane_text', fake.pane_text), patch.object(agw, 'type_into', type_into), \
+                patch.object(agw, 'cursor_column', fake.cursor_column), \
+                patch.object(agw, 'request', side_effect=AssertionError('real terminal request')), \
+                patch.object(peerchat, 'now', self.clock.now), patch.object(peerchat, 'pause', self.clock.pause):
+            return peerchat.send('pane', peerchat.PROFILES['kimi'], text, dry_run=False, retry=False), stamps
+
+    def fake(self, **kwargs):
+        idle = kimi_frame('idle-after-turn')
+
+        class Fake(FakeAgw):
+            def pane_text(inner, pane):
+                inner.reads += 1
+                if inner.frames:
+                    return inner.frames.pop(0) if len(inner.frames) > 1 else inner.frames[0]
+                return kimi(inner.keys[0]) if len(inner.keys) == 1 else idle
+
+        return Fake('kimi', **kwargs)
+
+    def test_text_then_return_well_after_the_paste_burst_window(self):
+        fake = self.fake()
+        outcome, stamps = self.send(fake)
+        self.assertEqual('submitted', outcome)
+        self.assertEqual([TEXT, '\n'], fake.keys)
+        # A Return within 120 ms of a typed burst becomes a newline in Kimi's composer (captured in
+        # fixtures/kimi/burst.txt); the key goes in its own call, at least 150 ms after the text.
+        self.assertGreaterEqual(stamps[1][0] - stamps[0][0], 0.15)
+        self.assertEqual("\n", peerchat.PROFILES['kimi'].submit)
+
+    def test_running_dialog_draft_and_shell_frames_are_refused_before_typing(self):
+        for name, frame, reason in [
+                ('running', kimi_frame('running-tool'), None),
+                ('approval', kimi_frame('approval'), 'dialog'),
+                ('trust', kimi_frame('trust-dialog'), 'dialog'),
+                ('draft', kimi_frame('draft-wrapped'), 'not empty'),
+                ('shell', kimi_frame('shell-mode'), 'no Kimi composer')]:
+            with self.subTest(frame=name):
+                fake = self.fake(frames=[frame])
+                if name == 'running':
+                    # peerchat itself only proves an empty box; the relay refuses a running turn first.
+                    self.assertTrue(relay.is_busy(frame))
+                    continue
+                with self.assertRaises(peerchat.Refused) as caught:
+                    self.send(fake)
+                self.assertIn(reason, str(caught.exception))
+                self.assertEqual([], fake.keys)
