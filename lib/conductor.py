@@ -174,9 +174,11 @@ def claims_lock(root, repo):
     other transactions never take it: they change states or remove members. That releases claims,
     with one exception: a `closed` member (a no-PR close) accepts its loop's `resumed` report after a
     reopen (apply_loop) and so claims again without this lock. A closed member therefore still counts
-    as a claim while its close is pending or stuck (`claims`); only one whose close has finished can
-    be revived after another queue took its issue, and then the conductor only records the old loop's
-    report - a closed member is never relaunched."""
+    as a claim while its close is pending or stuck, or while its issue session is open in its queue's
+    workspace (`claims`, `live_closed`) - a reopened no-PR loop, or one left open with autonomy off.
+    Only a loop whose sessions are gone and whose close is over can be revived after another queue
+    took its issue, and then the conductor only records the old loop's report - a closed member is
+    never relaunched."""
     owner, name = repo.split('/')
     return Lock(Path(root) / owner / f'{name}.claims.lock', 30)
 
@@ -215,14 +217,32 @@ def repo_workspaces(repo, siblings, own=None):
     return list(dict.fromkeys([repo.split('/')[1], *(queue_workspace(d) for d in siblings), *([own] if own else [])]))
 
 
-def claims(siblings):
+def closing(m):
+    return bool(m.get('closePending') or m.get('closeStuck'))
+
+
+def live_closed(repo, siblings, fresh, tree=None):
+    """{sibling workspace (case-folded): issue numbers with a live issue session} - read only when a
+    sibling has a closed member among `fresh` that no close flag already keeps claimed (#66 r2 m2).
+    A terminal that cannot be read raises: never "unclaimed"."""
+    wanted = [d for d in siblings if any(m['state'] == 'closed' and m['number'] in fresh and not closing(m)
+                                         for m in d['members'])]
+    if not wanted:
+        return {}
+    tree = agw.tree() if tree is None else tree
+    return {queue_workspace(d).casefold(): session_numbers(repo, tree, [queue_workspace(d)]) for d in wanted}
+
+
+def claims(siblings, live=None):
     """{issue number: queue name} for every sibling member that is not merged or closed: a pending,
-    live, blocked or failed member holds its issue (#66), and so does a closed one whose close is
-    still pending or stuck, since its loop can still come back (see claims_lock)."""
+    live, blocked or failed member holds its issue (#66). So does a closed one whose close is still
+    pending or stuck, or whose issue session is open in its queue's workspace (`live`, from
+    live_closed), since its loop can still come back (see claims_lock)."""
+    live = live or {}
     return {m['number']: data.get('name') or 'main'
             for data in siblings for m in data['members']
             if m['state'] not in TERMINAL_STATES or
-            (m['state'] == 'closed' and (m.get('closePending') or m.get('closeStuck')))}
+            (m['state'] == 'closed' and (closing(m) or m['number'] in live.get(queue_workspace(data).casefold(), ())))}
 
 
 def skip_claimed(skipped, claimed, fresh):
@@ -394,8 +414,8 @@ def skip_reasons(numbers, repo, root, queue_path, prs, sessions, name=None):
     reasons = {}
     for n in numbers:
         for q in dict.fromkeys((name, None)):
-            # A named checkout is found by its membership from inside it (#66 r1 M1); a plain one by name.
-            reason = checkout_reason(Path(root) / checkout_name(repo, n, q), repo, n, queue_path, named=q is not None)
+            # The queue's own named checkout (#66), then the plain one a manual launch or the main queue uses.
+            reason = checkout_reason(Path(root) / checkout_name(repo, n, q), repo, n, queue_path, q)
             if reason:
                 break
         if n in prs:
@@ -407,7 +427,7 @@ def skip_reasons(numbers, repo, root, queue_path, prs, sessions, name=None):
     return reasons
 
 
-def checkout_reason(checkout, repo, n, queue_path, named=False):
+def checkout_reason(checkout, repo, n, queue_path, name=None):
     state = checkout / '.workbench' / 'state'
     membership = state / 'queue-member.json'
     if checkout_locked(checkout):
@@ -418,9 +438,13 @@ def checkout_reason(checkout, repo, n, queue_path, named=False):
         except (OSError, ValueError):
             owner = None
         if owner is None or Path(owner).resolve() != Path(queue_path).resolve():
-            where = ' from inside it' if named else ''
+            if name:
+                # A named checkout without this queue's membership cannot be resumed by one (#66 r2 m3).
+                return (f'checkout exists without a queue membership this queue can use ({checkout}); '
+                        f'delete it (a member of this queue is relaunched with '
+                        f'github-workbench -Queue <spec> -QueueName {name} -Retry)')
             return (f'checkout exists from an earlier loop ({checkout}); resume with '
-                    f'github-workbench {repo}#{n}{where} or delete it')
+                    f'github-workbench {repo}#{n} or delete it')
     return None
 
 
@@ -881,12 +905,13 @@ def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=Fa
     # claims that decide are read again under the claims lock, right before the write.
     siblings = sibling_queues(root, repo, store.path)
     check_workspace(workspace, siblings)
+    live = live_closed(repo, siblings, fresh)          # a terminal lookup: before any lock
     if label:
         # Only a label spec is filtered: an explicit list is what the human named. Before any write.
         skipped.update(in_hand(repo, fresh, checkout_root((existing or {}).get('config') or config_path()),
                                store.path, gh, name=name, workspaces=repo_workspaces(repo, siblings, workspace)))
     # A claim holds against an explicit list too: two queues never both work on one issue.
-    skip_claimed(skipped, claims(siblings), fresh)
+    skip_claimed(skipped, claims(siblings, live), fresh)
     numbers = [n for n in numbers if n not in skipped]
     if dry_run:
         live = store.running() if store.worker_lock.exists() else False
@@ -906,7 +931,7 @@ def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=Fa
     with claims_lock(root, repo):
         siblings = sibling_queues(root, repo, store.path)
         check_workspace(workspace, siblings)
-        claimed = claims(siblings)
+        claimed = claims(siblings, live)
         with Lock(store.state_lock):
             if store.path.exists():
                 data = store._load()
@@ -1334,10 +1359,11 @@ class Worker:
                 skipped = in_hand(data['repo'], fresh, checkout_root(data['config']), self.store.path, self.gh,
                                   name=data.get('name'),
                                   workspaces=repo_workspaces(data['repo'], siblings, queue_workspace(data)))
+                live = live_closed(data['repo'], siblings, fresh)
                 accepted = False
                 # The claims (#66) decide under the repo's claims lock, taken before our state lock.
                 with claims_lock(root, data['repo']):
-                    skip_claimed(skipped, claims(sibling_queues(root, data['repo'], self.store.path)), fresh)
+                    skip_claimed(skipped, claims(sibling_queues(root, data['repo'], self.store.path), live), fresh)
                     with self.store.transaction() as current:
                         if current['watch'] and watch_key(current) == watch_key(data):
                             known = {m['number'] for m in current['members']}

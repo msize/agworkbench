@@ -3242,6 +3242,39 @@ class NamedQueues(unittest.TestCase):
         self.start('o/r#1,2,3,4,5,6', name='kimi')
         self.assertEqual([1, 2], self.numbers(self.kimi))
 
+    def test_a_closed_member_whose_session_is_open_still_claims(self):
+        # r2 m2: a reopened no-PR loop (or one left open with autonomy off) has no close flag once the
+        # relay gives up its close; its open issue session keeps the claim, for an explicit list too.
+        self.start('o/r#1,2', name='kimi')
+        with self.kimi.transaction() as data:
+            for m in data['members']:
+                m['state'] = 'closed'
+        self.tree = {'workspaces': [{'name': 'r-kimi', 'sessions': [{'id': 's1', 'name': '#1 fix'},
+                                                                    {'id': 's2', 'name': '#2 relay'}]},
+                                    {'name': 'r', 'sessions': [{'id': 's3', 'name': '#2 fix'}]}]}
+        self.start('o/r#1,2')                        # #2's issue session is in r, not in the kimi workspace
+        self.assertEqual([2], self.numbers(self.store))
+        self.assertIn('#1 skipped: claimed by queue kimi', self.output())
+        with patch.object(q.agw, 'tree', side_effect=q.agw.CtlError('agwinterm is not running')):
+            with self.assertRaises(q.agw.CtlError):       # an unread terminal is never "unclaimed"
+                q.start_queue('o/r#1', root=self.queues, name='gpt')
+        self.assertFalse(q.queue_path(self.queues, 'o/r', 'gpt').exists())
+
+    def test_the_rescan_keeps_a_closed_member_with_an_open_session_claimed(self):
+        self.start('o/r#1', name='kimi')
+        with self.kimi.transaction() as data:
+            data['members'][0]['state'] = 'closed'
+        self.start_bugs('o/r#9', watch=False)
+        self.start_bugs('bugs', watch=True)
+        with self.store.transaction() as data:
+            data['members'] = []
+        self.tree = {'workspaces': [{'name': 'r-kimi', 'sessions': [{'id': 's1', 'name': '#1 fix'}]}]}
+        worker = q.Worker(self.store, self.store.load()['owner']['token'], gh=self.fake_gh, clock=lambda: self.now)
+        with patch.object(q, 'gh_json', self.fake_gh), patch.object(q.agw, 'tree', side_effect=lambda: self.tree):
+            worker.refresh_remote()
+        self.assertEqual('claimed by queue kimi', worker.last_skips[1])
+        self.assertNotIn(1, self.numbers(self.store))
+
     def test_a_claim_wins_over_an_in_hand_reason_at_start_and_on_a_rescan(self):
         # r1 m4: the main queue's member's own checkout is not something the kimi queue should tell
         # the human to resume or delete.
@@ -3259,12 +3292,13 @@ class NamedQueues(unittest.TestCase):
             worker.refresh_remote()
         self.assertEqual('claimed by queue main', worker.last_skips[4])
 
-    def test_a_named_checkouts_skip_says_to_resume_from_inside_it(self):
-        # r1 i1: a named checkout is found by its membership from inside it (M1).
+    def test_a_named_checkout_without_this_queues_membership_is_to_be_deleted(self):
+        # r2 m3: the skip fires exactly when no membership makes the checkout resumable.
         (self.root / 'clones/r-kimi-issue-3/.workbench/state').mkdir(parents=True)
         self.start_bugs('bugs', name='kimi')
-        self.assertIn('#3 skipped: checkout exists from an earlier loop', self.output())
-        self.assertIn('resume with github-workbench o/r#3 from inside it or delete it', self.output())
+        self.assertIn('(kimi) #3 skipped: checkout exists without a queue membership this queue can use', self.output())
+        self.assertIn('delete it (a member of this queue is relaunched with github-workbench -Queue <spec> '
+                      '-QueueName kimi -Retry)', self.output())
         (self.root / 'clones/r-issue-3/.workbench/state').mkdir(parents=True)
         self.start_bugs('bugs')                       # kimi claims 1, 2, 4, 5; #3 is the main queue's to judge
         self.assertIn('resume with github-workbench o/r#3 or delete it', self.output())

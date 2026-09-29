@@ -207,7 +207,9 @@ github-workbench -Queue 'where: priority IN [P2]' -Repo yeroo/docxy -QueueName k
   queue name is 1-32 of `a-z 0-9 -`; `main` is reserved.
 - **Exclusive claims:** an issue that is a member of one queue of the repo, in any state but merged
   or closed (a failed one included, since `-Retry` revives it), is skipped by every other queue with
-  `#N skipped: claimed by queue <name>`. That holds for explicit lists and watch rescans too. The
+  `#N skipped: claimed by queue <name>`. A closed member claims too while its close is still pending
+  or stuck, or while its issue session is open in its queue's workspace, since its loop can come
+  back (a reopened issue); reading the terminal for that fails the add rather than guess. That holds for explicit lists and watch rescans too. The
   check and the write happen under one repo-wide lock, so two queues adding the same issue at the same
   moment admit it once. A queue file of the repo that cannot be read stops the add rather than
   counting as "no claim". The in-hand skips also look in every queue's workspace and in the plain
