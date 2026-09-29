@@ -1500,7 +1500,8 @@ class Worker:
 
     def live_numbers(self, repo):
         """Issue numbers with a live issue session, read once per tick and only when needed; None when
-        the terminal cannot be read (then every member counts as live)."""
+        the terminal cannot be read. session_live passes None on: the ceiling then counts every member
+        as live, and slot decisions hold a slot whose grace has not started and otherwise change nothing."""
         if self.tick_sessions is _UNREAD:
             try:
                 self.tick_sessions = session_numbers(repo, agw.tree())
@@ -1547,10 +1548,13 @@ class Worker:
         session_live, released once it is not, taken back when the session is seen again. An
         unreadable terminal changes nothing. Used for environmental blocks, and for active members
         with a PR or a resumed loop, whose slots refresh_stale never reclaims (it skips members with
-        a PR, and an open issue without one stays active)."""
+        a PR, and an open issue without one stays active). An unreadable terminal holds the slot while
+        no grace has started (the session was last seen) and otherwise changes nothing."""
         live = self.session_live(data, m)
         if live is not None:
             m['slotReleased'] = not live
+        elif 'sessionGoneSince' not in m:
+            m['slotReleased'] = False
 
     def forget_stale_stamps(self, data):
         """After a readable tree, a member whose session is there has no gone-since stamp, whether or

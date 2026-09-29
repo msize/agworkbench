@@ -2136,6 +2136,46 @@ class EnvironmentalBlocks(unittest.TestCase):
         self.assertTrue(self.member(1)['slotReleased'])
         self.assertEqual(stamp, self.member(1)['sessionGoneSince'])
 
+    def test_an_unreadable_tree_holds_a_relay_held_slot_on_a_plain_block(self):
+        # r5 m1: apply_loop releases a plain block; with the tree unreadable that tick the relay's
+        # episode must still hold the slot, since no grace has started.
+        self.start('o/r#1,2', parallel=1)
+        w = self.worker()
+        w.tick(); w.tick()
+        self.sessions = {1}
+        self.relay_episode(1)
+        self.report(1, 'blocked', reason='chooser')
+        with patch.object(q.agw, 'tree', side_effect=q.agw.CtlError('no pipe')):
+            w.tick()
+        self.assertFalse(self.member(1)['slotReleased'])
+        self.assertEqual([1], self.launched())
+
+    def test_a_readable_tree_forgets_an_old_stamp_nobody_asked_about(self):
+        # r5 m3: forget_stale_stamps alone clears #2's stamp - the ceiling is not reached that tick,
+        # and #1's slot watch is what reads the tree.
+        self.start('o/r#1,2,3,4', parallel=1)
+        w = self.worker()
+        w.tick(); w.tick()
+        self.sessions = {1, 2, 3}
+        self.report(1, 'blocked', reason='x')
+        w.tick()
+        self.report(1, 'resumed')
+        with self.store.transaction() as data:
+            for m in data['members'][1:3]:
+                m.update(attempt=1, token=str(uuid.uuid4()), pr=f'https://github.com/o/r/pull/{m["number"]}',
+                         state='pr-open', phase='pr-open', slotReleased=True)
+            data['members'][1]['sessionGoneSince'] = self.now - 10          # an old blank read
+        w.tick()
+        self.assertFalse(self.member(1)['slotReleased'])                    # count >= parallel: no ceiling check
+        self.assertNotIn('sessionGoneSince', self.member(2))
+        before = self.launched()                                            # #2 started while #1 was blocked
+        self.now += q.SESSION_GRACE
+        self.report(1, 'pr-open')
+        self.sessions = set()                                               # one blank read at the ceiling
+        w.tick()
+        self.assertEqual('pending', self.member(4)['state'])
+        self.assertEqual(before, self.launched())
+
     def test_an_unreadable_relay_record_keeps_a_relay_held_slot(self):
         # r4 m1: a plain block held by the relay's episode stays held when relay.json cannot be read.
         self.start('o/r#1,2', parallel=1)
