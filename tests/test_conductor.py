@@ -3232,12 +3232,52 @@ class NamedQueues(unittest.TestCase):
         self.assertIn('#3 skipped: claimed by queue kimi', out)
 
     def test_only_merged_and_closed_members_release_their_issue(self):
-        self.start('o/r#1,2,3,4')
+        self.start('o/r#1,2,3,4,5,6')
         with self.store.transaction() as data:
-            for m, state in zip(data['members'], ('merged', 'closed', 'failed', 'pr-open')):
+            for m, state in zip(data['members'], ('merged', 'closed', 'failed', 'pr-open', 'closed', 'closed')):
                 m['state'] = state
-        self.start('o/r#1,2,3,4', name='kimi')
+            # r1 m3: a closed member whose close is still pending or stuck can be revived by its loop.
+            data['members'][4]['closePending'] = True
+            data['members'][5]['closeStuck'] = 'the relay is alive but its close has been pending'
+        self.start('o/r#1,2,3,4,5,6', name='kimi')
         self.assertEqual([1, 2], self.numbers(self.kimi))
+
+    def test_a_claim_wins_over_an_in_hand_reason_at_start_and_on_a_rescan(self):
+        # r1 m4: the main queue's member's own checkout is not something the kimi queue should tell
+        # the human to resume or delete.
+        self.start_bugs('o/r#4')
+        q.atomic_json(self.root / 'clones/r-issue-4/.workbench/state/queue-member.json',
+                      {'queue': str(self.store.path), 'repo': 'o/r', 'number': 4})
+        self.start_bugs('bugs', name='kimi', watch=True)
+        out = self.output()
+        self.assertIn('(kimi) #4 skipped: claimed by queue main', out)
+        self.assertNotIn('#4 skipped: checkout exists', out)
+        with self.kimi.transaction() as data:
+            data['members'] = []
+        worker = q.Worker(self.kimi, self.kimi.load()['owner']['token'], gh=self.fake_gh, clock=lambda: self.now)
+        with patch.object(q, 'gh_json', self.fake_gh), patch.object(q.agw, 'tree', side_effect=lambda: self.tree):
+            worker.refresh_remote()
+        self.assertEqual('claimed by queue main', worker.last_skips[4])
+
+    def test_a_named_checkouts_skip_says_to_resume_from_inside_it(self):
+        # r1 i1: a named checkout is found by its membership from inside it (M1).
+        (self.root / 'clones/r-kimi-issue-3/.workbench/state').mkdir(parents=True)
+        self.start_bugs('bugs', name='kimi')
+        self.assertIn('#3 skipped: checkout exists from an earlier loop', self.output())
+        self.assertIn('resume with github-workbench o/r#3 from inside it or delete it', self.output())
+        (self.root / 'clones/r-issue-3/.workbench/state').mkdir(parents=True)
+        self.start_bugs('bugs')                       # kimi claims 1, 2, 4, 5; #3 is the main queue's to judge
+        self.assertIn('resume with github-workbench o/r#3 or delete it', self.output())
+
+    def test_a_default_workspace_too_long_to_load_is_refused_before_writing(self):
+        # r1 m5: `<repo>-<name>` can exceed a workspace name's 64 characters.
+        repo = 'o/' + 'r' * 40
+        with self.assertRaises(q.UsageError) as refused:
+            self.start(f'{repo}#1', name='k' * 30)
+        self.assertIn('pass -Workspace', str(refused.exception))
+        self.assertEqual([], list((self.queues / 'o').glob('*.json')) if (self.queues / 'o').exists() else [])
+        self.start(f'{repo}#1', name='k' * 30, workspace='long-lab')
+        self.assertEqual('long-lab', q.Store(q.queue_path(self.queues, repo, 'k' * 30)).load()['workspace'])
 
     def test_the_second_add_waits_for_the_claims_lock_and_sees_the_first(self):
         # The main queue's add holds the claims lock; the kimi queue's add of the same issue waits
