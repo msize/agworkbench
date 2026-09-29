@@ -669,9 +669,18 @@ from then on, and `-DryRun` shows the record it would clear. The limit strings c
 `github-workbench <issue> -AutoMerge`, `-Queue <spec> -AutoMerge`, or `"autoMerge": true` in
 `~/.agworkbench.json` lets the planner merge its own PR. It does so only when all of these hold:
 - the last review round is clean, with every finding fixed or disputed with evidence and none
-  deferred;
+  deferred - or review **stopped** at a round with no Major (below), and its remaining minors are
+  filed as follow-ups;
 - the whole suite passed on the PR's head commit;
 - `wb.py merge-check --pr <N> --head <sha>` prints `ok`.
+
+Review stops once a verified revmux round has no Blocker, Critical or Major finding (#64): that
+round's fix is the last, its Minor findings are fixed if cheap and otherwise go to the PR's
+"Leftovers from #N" issue, and no further revmux round runs. The planner records each round with
+`wb.py review-round --round K`, which prints `continue`, `stop`, `clean` or `cap` (round 5 or later).
+A degraded round never stops review. The planner files a stop's deferred minors right after it
+opens the PR, whether or not auto-merge is on. `wb.py review-round --summary` prints the line the PR body and
+the merge note carry, e.g. `review stopped: round 2 had no Major; 3 minor finding(s) in <URL>`.
 
 That check is read-only. It requires:
 - the PR is open, mergeable and `CLEAN` (`UNKNOWN` is retried once);
@@ -679,6 +688,9 @@ That check is read-only. It requires:
 - there is no unread mail from you (`human`) or from GitHub;
 - the relay has seen the PR open;
 - the PR head is the tested commit;
+- the newest revmux report has a recorded decision, and the last one is not `continue`, nor a `cap` (a
+  Major or a degraded run at round 5 or later) unless `stopWhenNoMajor` was off; after any `stop`,
+  every recorded follow-up is filed;
 - **no hold**: a label (`do-not-merge`, `hold`, `wip`), the title, or any unmarked description,
   comment, review or line comment containing `hold`, `wait`, `waiting`, `wip`, or `do not merge` in
   any spelling (`don't`, `dont`, `do-not-merge`, typographic apostrophes, markdown emphasis, any
@@ -774,6 +786,7 @@ the autonomous close can close it. revmux and revdiff rounds that fail also mail
 | `bugLabel` | `"bug"` | the label `-Queue bugs` stands for (non-empty, no comma) |
 | `triage` | none | per product repo: `{"owner/repo": {"specRepos": [...], "model": "..."}}`, the private spec repos `-Triage` judges against (see Issue triage) |
 | `followUp` | `{"dedupe": true, "bumpAt": {"P2": 2, "P1": 3, "P0": 5}}` | `dedupe: false` skips duplicate matching: separate items keep #27's filing, leftovers still share one issue per PR (per item without `--pr`); `bumpAt` is the total number of reports that raises a matched issue to each priority |
+| `review` | `{"stopWhenNoMajor": true, "minRounds": 1}` | `stopWhenNoMajor: false` keeps reviewing until a round has no findings at all (up to five); `minRounds` (1-5) is the first round that may stop review |
 | `autonomous` | `false` | full autonomy: merge, file follow-up issues, close the sessions after the merge; implies `autoMerge` |
 | `cleanup` | `"merged"` | after an autonomous close: `merged` deletes the checkout when it is safe, `build` deletes only its build outputs, `off` keeps it (see Cleaning up checkouts) |
 | `minFreeGB` | `20` | the queue admits no member while the checkout drive has less free space (GiB); `0` turns the guard off |

@@ -85,6 +85,11 @@ Claude sends `FIX r<K>` with verified findings. Answer **every** finding with ex
 
 Silence on a finding is not an answer. Reply `FIXED <short sha>` with the per-finding list.
 
+A `FIX r<K> (final)` round has no revmux round after it: that round had no Blocker, Critical or
+Major finding, so review stops once it is fixed (#64). Fix the cheap Minor and Immaterial findings;
+mark the rest `deferred` with a reason, and Claude records each one as a follow-up for the leftovers
+issue. A Major never arrives in a final round.
+
 Human feedback arrives the same way, relayed by Claude. It is not up for dispute in the same way:
 if you think the human is wrong, say why once, clearly, and let Claude take it to them.
 

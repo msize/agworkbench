@@ -13,6 +13,8 @@
   wb.py loop-state done --pr 30 --sha <sha>                       # the planner's last act (#27)
   wb.py loop-state done --no-pr --reason "duplicate"               # closed issue needing no change (#53)
   wb.py loop-state blocked --environmental --reason "codex limited" # a block the human cannot answer (#61)
+  wb.py review-round --round 2                                    # a verified revmux round's decision (#64)
+  wb.py review-round --summary                                    # why review ended, for the PR body / merge note
   wb.py merge-check --pr 12 --head <sha>                          # read-only auto-merge gate (#23)
   wb.py wait-ci --pr 12 --head <sha>                              # background: until CI on the head is done (#32)
   wb.py update-check --reviewed <sha> --base <sha>                # an UPDATE round is one merge of the base (#32)
@@ -227,9 +229,15 @@ def failover_setting() -> bool:
 
 def cmd_settings(args: argparse.Namespace) -> int:
     settings = checkout_settings(checkout())
+    try:
+        review = followup.review_settings(followup.read_config())
+        review_line = (f"stopWhenNoMajor={'true' if review['stopWhenNoMajor'] else 'false'} "
+                       f"minRounds={review['minRounds']}")
+    except followup.SettingsError:
+        review_line = "stopWhenNoMajor=invalid minRounds=invalid"    # review-round refuses with the reason
     print(f"implementer={settings['implementer']} revmuxProfile={settings['revmuxProfile']} "
           f"autoMerge={'true' if settings['autoMerge'] else 'false'} "
-          f"autonomous={'true' if settings['autonomous'] else 'false'} "
+          f"autonomous={'true' if settings['autonomous'] else 'false'} {review_line} "
           f"failover={'true' if failover_setting() else 'false'}")
     return 0
 
@@ -496,9 +504,11 @@ def check_head(pr: dict, head: str) -> list[str]:
 
 
 def check_follow_ups(root: Path) -> list[str]:
-    """Autonomous only (#27): every recorded follow-up is filed, and no Major+ review finding is
-    deferred - disputed or not (r18: only Minor/Immaterial findings and plan items may be)."""
-    if not checkout_settings(root)["autonomous"]:
+    """Autonomous (#27), or any recorded review stop, which defers minors (#64): every recorded
+    follow-up is filed, and no Major+ review finding is deferred - disputed or not (r18: only
+    Minor/Immaterial findings and plan items may be)."""
+    stopped = any(entry["decision"] == "stop" for entry in load_review_rounds(root))
+    if not (checkout_settings(root)["autonomous"] or stopped):
         return []
     failures = []
     for item in load_follow_ups(root):
@@ -514,7 +524,203 @@ def check_follow_ups(root: Path) -> list[str]:
 def merge_failures(pr: dict, inline: list[dict], head: str, root: Path, checks: dict | None = None) -> list[str]:
     return (check_state(pr, checks) + check_reviews(pr) + check_labels_and_title(pr) + check_holds(pr, inline) +
             check_mail() + check_relay(root, int(pr.get("number") or 0)) + check_head(pr, head) +
-            check_follow_ups(root))
+            check_review(root) + check_follow_ups(root))
+
+
+# --- review rounds (#64) -------------------------------------------------------------------------
+# After verifying a revmux report the planner records the round's decision: another round, stop (no
+# verified Major: this round's fix is the last), clean, or the cap. merge-check reads the record, so
+# a review that still owes a round cannot be merged, and a stop's deferred minors must be filed.
+
+REVIEW_CAP = 5
+SEVERE_SECTIONS = ("blocker", "critical", "major")
+MINOR_SECTIONS = ("minor", "immaterial")
+APART_SECTIONS = ("pre-existing", "open questions")      # counted, but they decide nothing
+REVIEW_DECISIONS = ("continue", "stop", "clean", "cap")
+
+
+class ReportError(ValueError):
+    """A revmux report this cannot trust: exit 2, nothing recorded."""
+
+
+def parse_revmux_report(text: str) -> dict:
+    """Finding counts per `## ` section (`### ` headings inside it), and whether the run was degraded:
+    a `## Sources` status that is not `ok` (`ok, nothing raised` is), or revmux's own DEGRADED line.
+    A report without a Sources row is incomplete - revmux writes it last, so a crashed run has none."""
+    counts = {name: 0 for name in SEVERE_SECTIONS + MINOR_SECTIONS + APART_SECTIONS}
+    known, section, statuses, flagged = False, None, [], False
+    for line in text.splitlines():
+        # revmux's own line, outside any finding: a finding that quotes the phrase is not a degraded run.
+        if section not in counts and re.match(r"[\s>*_]*This run is DEGRADED", line):
+            flagged = True
+        if line.startswith("## "):
+            section = line[3:].strip().casefold()
+            known = known or section in counts
+            continue
+        if section in counts and line.startswith("### "):
+            counts[section] += 1
+        elif section == "sources" and line.lstrip().startswith("|"):
+            cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+            if cells[-1].casefold() == "status" or all(set(cell) <= set("-: ") for cell in cells):
+                continue
+            statuses.append(cells[-1])
+    if not statuses:
+        raise ReportError("report incomplete: no ## Sources table")
+    if not known and "No findings." not in text:
+        raise ReportError("report incomplete: no findings section and no 'No findings.'")
+    degraded = flagged or any(not re.match(r"ok(?:,|$)", status, re.I) for status in statuses)
+    return {"counts": counts, "degraded": degraded}
+
+
+def review_decision(round_: int, severe: int, minor: int, degraded: bool, settings: dict) -> str:
+    another = "cap" if round_ >= REVIEW_CAP else "continue"
+    if degraded:
+        return another                 # a partial review is never clean, and never stops review
+    if severe == 0 and minor == 0:
+        return "clean"
+    if severe > 0 or not settings["stopWhenNoMajor"] or round_ < settings["minRounds"]:
+        return another
+    return "stop"
+
+
+def review_rounds_path(root: Path) -> Path:
+    return root / ".workbench" / "state" / "review-rounds.json"
+
+
+def load_review_rounds(root: Path) -> list[dict]:
+    try:
+        entries = json.loads(review_rounds_path(root).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(entries, list):
+        return []
+    return [entry for entry in entries if isinstance(entry, dict) and type(entry.get("round")) is int
+            and entry.get("decision") in REVIEW_DECISIONS]
+
+
+def last_review_round(root: Path) -> dict | None:
+    """The highest recorded round, not the last written: an earlier round may be re-recorded."""
+    return max(load_review_rounds(root), key=lambda entry: entry["round"], default=None)
+
+
+def check_review(root: Path) -> list[str]:
+    """A revmux report with no recorded decision, or a last round that owes another round (#64).
+    A checkout that ran no revmux round is not checked; a loop that was already reviewing when #64
+    landed records its rounds like any other (every K can be recorded)."""
+    reports = [int(match[1]) for path in (root / ".workbench" / "review").glob("revmux-r*.md")
+               if (match := re.fullmatch(r"revmux-r(\d+)\.md", path.name))]
+    last = last_review_round(root)
+    newest = max(reports, default=0)
+    if newest > (last["round"] if last else 0):
+        return [f"review: revmux round {newest} has no recorded decision - run wb.py review-round --round {newest}"]
+    if not last:
+        return []
+    k, severe = last["round"], int(last.get("severe") or 0)
+    if last["decision"] == "continue":
+        if last.get("degraded"):
+            return [f"review: round {k} was degraded; another revmux round is due"]
+        if severe:
+            return [f"review: round {k} had {severe} Major finding(s); another revmux round is due"]
+        return [f"review: round {k} decided continue (stopWhenNoMajor={str(last.get('stopWhenNoMajor')).lower()}, "
+                f"minRounds={last.get('minRounds')}); another revmux round is due"]
+    if last["decision"] == "cap" and last.get("stopWhenNoMajor") is not False:
+        if last.get("degraded"):
+            return [f"review: round {k} ended at the cap (degraded) - this is the human's"]
+        return [f"review: round {k} had a Major at the cap - this is the human's"]
+    return []
+
+
+def save_review_rounds(root: Path, entries: list[dict]) -> None:
+    from conductor import atomic_json
+    atomic_json(review_rounds_path(root), entries)
+
+
+def cmd_review_round(args: argparse.Namespace) -> int:
+    root = checkout()
+    if args.summary:
+        return review_summary(root)
+    if args.round is None:
+        print("wb: review-round needs --round K or --summary", file=sys.stderr)
+        return 2
+    if args.round < 1:
+        print("wb: review-round --round must be 1 or more", file=sys.stderr)
+        return 2
+    if args.severe is not None and args.severe < 0:
+        print("wb: review-round --severe must be 0 or more", file=sys.stderr)
+        return 2
+    if args.reason is not None and args.severe is None:
+        print("wb: review-round --reason goes with --severe", file=sys.stderr)
+        return 2
+    try:
+        settings = followup.review_settings(followup.read_config())
+    except followup.SettingsError as err:
+        print(f"wb: review-round: {err}", file=sys.stderr)
+        return 2
+    report = Path(args.report or f".workbench/review/revmux-r{args.round}.md")
+    report = report if report.is_absolute() else root / report
+    try:
+        parsed = parse_revmux_report(report.read_text(encoding="utf-8-sig", errors="replace"))
+    except OSError as err:
+        print(f"wb: review-round: cannot read {report}: {err}", file=sys.stderr)
+        return 2
+    except ReportError as err:
+        print(f"wb: review-round: {report.name}: {err}", file=sys.stderr)
+        return 2
+    counts = parsed["counts"]
+    revmux_severe = sum(counts[name] for name in SEVERE_SECTIONS)
+    severe = revmux_severe if args.severe is None else args.severe
+    if severe < revmux_severe and not (args.reason or "").strip():
+        print(f"wb: review-round: --severe {severe} is below revmux's {revmux_severe}; say why with --reason",
+              file=sys.stderr)
+        return 2
+    # A Major verified lower is still a finding: counted as a minor, so the round stops (FIX, minRounds and
+    # stopWhenNoMajor apply) instead of reading clean. One that did not reproduce at all errs the safe way.
+    minor = sum(counts[name] for name in MINOR_SECTIONS) + max(revmux_severe - severe, 0)
+    decision = review_decision(args.round, severe, minor, parsed["degraded"], settings)
+    entry = {"round": args.round, "counts": counts, "revmuxSevere": revmux_severe, "severe": severe,
+             "reason": (args.reason or "").strip() or None, "degraded": parsed["degraded"], "decision": decision,
+             "stopWhenNoMajor": settings["stopWhenNoMajor"], "minRounds": settings["minRounds"], "at": time.time()}
+    entries = [e for e in load_review_rounds(root) if e["round"] != args.round] + [entry]
+    save_review_rounds(root, sorted(entries, key=lambda e: e["round"]))
+    print(f"review: {decision}{' (degraded)' if parsed['degraded'] else ''}")
+    print(f"round {args.round}: {severe} Major+ (revmux {revmux_severe}), {minor} minor, "
+          f"{counts['pre-existing']} pre-existing, {counts['open questions']} open question(s); "
+          f"stopWhenNoMajor={'true' if settings['stopWhenNoMajor'] else 'false'} minRounds={settings['minRounds']}")
+    return 0
+
+
+def review_summary(root: Path) -> int:
+    """The line for the PR body and the merge note: why review ended, and where every minor deferred
+    by a stop went - the URLs once filed, "not filed yet" before."""
+    entries = load_review_rounds(root)
+    last = max(entries, key=lambda entry: entry["round"], default=None)
+    if not last:
+        print("wb: review-round --summary: no review round recorded", file=sys.stderr)
+        return 2
+    k, decision = last["round"], last["decision"]
+    if decision not in ("stop", "clean") and not (decision == "cap" and last.get("stopWhenNoMajor") is False):
+        print(f"review: round {k} decided {decision}; no summary yet")
+        return 1
+    stops = {f"r{entry['round']}": entry["round"] for entry in entries if entry["decision"] == "stop"}
+    items = [item for item in load_follow_ups(root) if followup.round_of(item.get("origin")) in stops]
+    deferred = ""
+    if items:
+        rounds = sorted({stops[followup.round_of(item.get("origin"))] for item in items})
+        origin = "" if rounds == [k] else f" from round {', '.join(map(str, rounds))}"
+        if all(item.get("url") for item in items):
+            deferred = f"{len(items)} minor finding(s){origin} in {', '.join(dict.fromkeys(item['url'] for item in items))}"
+        else:
+            deferred = f"{len(items)} minor finding(s){origin} deferred as follow-ups (not filed yet)"
+    if decision == "stop":
+        line = f"review stopped: round {k} had no Major; {deferred or 'all findings fixed'}"
+    else:
+        line = f"review clean after round {k}" if decision == "clean" else f"review ended at the five-round cap (round {k})"
+        line += f"; {deferred}" if deferred else ""
+    revmux_severe, severe = int(last.get("revmuxSevere") or 0), int(last.get("severe") or 0)
+    if severe < revmux_severe:
+        line += f" (revmux {revmux_severe} Major+, verified {severe}: {last.get('reason')})"
+    print(line)
+    return 0
 
 
 # --- follow-up issues (#27) ----------------------------------------------------------------------
@@ -541,11 +747,8 @@ def load_follow_ups(root: Path) -> list[dict]:
 
 
 def save_follow_ups(root: Path, items: list[dict]) -> None:
-    path = follow_ups_path(root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(items, indent=2), encoding="utf-8")
-    os.replace(temporary, path)
+    from conductor import atomic_json
+    atomic_json(follow_ups_path(root), items)
 
 
 def cmd_follow_up_add(args: argparse.Namespace) -> int:
@@ -1351,10 +1554,8 @@ def cmd_merge_round(args: argparse.Namespace) -> int:
         print(f"{args.kind}: the limit of {limit} round(s) for PR #{number} is reached - this goes to the human")
         return 1
     record[args.kind] = count + 1
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(record, indent=2), encoding="utf-8")
-    os.replace(temporary, path)
+    from conductor import atomic_json
+    atomic_json(path, record)
     print(f"{args.kind} round {count + 1} of {limit} for PR #{number}")
     return 0
 
@@ -1495,7 +1696,7 @@ def main() -> int:
     p.add_argument("--scope", required=True, help="scope file, relative to the clone or absolute")
     p.add_argument("--profile", help="revmux profile (default: the one the launcher saved for this checkout)")
     p.set_defaults(func=cmd_revmux)
-    p = subs.add_parser("settings", help="print this checkout's settings (implementer, revmux profile, auto-merge, failover)")
+    p = subs.add_parser("settings", help="print this checkout's settings (implementer, revmux profile, auto-merge, review, failover)")
     p.set_defaults(func=cmd_settings)
     p = subs.add_parser("handover", help="facts for a HANDOVER mail to a new implementer (#24)")
     p.set_defaults(func=cmd_handover)
@@ -1519,6 +1720,13 @@ def main() -> int:
     p.add_argument("--pr", required=True, help="PR number or URL")
     p.add_argument("--head", required=True, help="the full SHA the whole suite passed on")
     p.set_defaults(func=cmd_merge_check)
+    p = subs.add_parser("review-round", help="record a verified revmux round's decision: continue, stop, clean or cap (#64)")
+    p.add_argument("--round", type=int)
+    p.add_argument("--report", help="default .workbench/review/revmux-r<K>.md")
+    p.add_argument("--severe", type=int, help="the verified Blocker+Critical+Major count, when it differs from revmux's")
+    p.add_argument("--reason", help="why --severe is below revmux's count (required then)")
+    p.add_argument("--summary", action="store_true", help="print the review line for the PR body or merge note")
+    p.set_defaults(func=cmd_review_round)
     p = subs.add_parser("suite", help="run a long command (the whole suite, a build) in its own visible session (#45)")
     p.add_argument("--label", required=True, help="names the session and the log, e.g. the head's short sha")
     p.add_argument("--to", help="the mailbox the result goes to (default: AI_BOX, else claude)")
