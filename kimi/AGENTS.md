@@ -92,6 +92,11 @@ The planner sends `FIX r<K>` with verified findings. Answer **every** finding wi
 
 Silence on a finding is not an answer. Reply `FIXED <short sha>` with the per-finding list.
 
+A `FIX r<K> (final)` round has no revmux round after it: that round had no Blocker, Critical or
+Major finding, so review stops once it is fixed (#64). Fix the cheap Minor and Immaterial findings;
+mark the rest `deferred` with a reason, and the planner records each one as a follow-up for the leftovers
+issue. A Major never arrives in a final round.
+
 Human feedback arrives the same way, relayed by the planner. If you think the human is wrong, say
 why once, clearly, and let the planner take it to them.
 

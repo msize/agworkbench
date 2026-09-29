@@ -507,9 +507,19 @@ class StallProse(unittest.TestCase):
 
     def test_implementers_never_hide_a_suite_in_a_background_watcher(self):
         self.assertIn('wb.py" suite --label <sha7> -- <command>`', self.text('claude/commands/workbench-implementer.md'))
-        for path in ('claude/commands/workbench-implementer.md', 'codex/skills/workbench-implementer/SKILL.md'):
+        for path in ('claude/commands/workbench-implementer.md', 'codex/skills/workbench-implementer/SKILL.md',
+                     'kimi/AGENTS.md'):
             with self.subTest(path=path):
                 self.assertIn('looks like a stalled loop to the relay', self.text(path))
+
+    def test_every_implementer_role_knows_a_final_round(self):
+        # #64 / #65 FIX r3: the Kimi role (kimi/AGENTS.md) keeps up with the Codex and Claude ones.
+        for path in ('claude/commands/workbench-implementer.md', 'codex/skills/workbench-implementer/SKILL.md',
+                     'kimi/AGENTS.md'):
+            with self.subTest(path=path):
+                text = ' '.join(self.text(path).split())
+                self.assertIn('A `FIX r<K> (final)` round has no revmux round after it', text)
+                self.assertIn('A Major never arrives in a final round.', text)
 
 
 if __name__ == "__main__":
