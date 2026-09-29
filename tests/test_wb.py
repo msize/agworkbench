@@ -1904,6 +1904,48 @@ class AutonomyProse(unittest.TestCase):
         self.assertIn('loop-state done --pr <P> --sha <sha>` as the very last step', text.split('## Phase 7')[1])
 
 
+class ReviewRoundProse(unittest.TestCase):
+    """#64: the planner records each round's decision and stops at a round with no Major; the
+    implementers know a final fix round has no revmux round after it."""
+
+    def text(self, path):
+        return ' '.join((Path(__file__).resolve().parent.parent / path).read_text(encoding='utf-8').split())
+
+    def test_planner_phase_4_to_6(self):
+        text = self.text('claude/commands/start-github-issue.md')
+        phase4 = text.split('## Phase 4')[1].split('## Phase 5')[0]
+        for needle in ['wb.py" review-round --round <K>', '--severe <n> --reason "<why>"',
+                       "Never go below revmux's count without a reason", '| `continue` |', '| `stop` |', '| `clean` |',
+                       '| `cap` |', '`FIX r<K> (final)`', '--origin "review r<K>"',
+                       '**Review stops once a round has no Major**', 'no further revmux round runs',
+                       'A round with a Major gets another round after its fix', 'At most five revmux rounds']:
+            self.assertIn(needle, phase4)
+        self.assertLess(phase4.index('review-round --round <K>'), phase4.index('Send the verified findings'))
+        self.assertIn('wb.py review-round --summary', text.split('## Phase 5')[1].split('## Phase 6')[0])
+        phase6 = text.split('## Phase 6')[1].split('## Phase 7')[0]
+        for needle in ['A review that **stopped**', 'fixed or recorded as a follow-up',
+                       '`follow-up file --source <N> --pr <P>`) before merge-check, with or without autonomy',
+                       'a revmux report with no recorded decision', '<the `wb.py review-round --summary` line>',
+                       'review stopped: round K had no Major; N minor finding(s) in <leftovers URL>',
+                       'recorded with `review-round` like any other']:
+            self.assertIn(needle, phase6)
+
+    def test_follow_ups_are_reachable_without_autonomy(self):
+        text = self.text('claude/commands/start-github-issue.md')
+        section = text.split('## Follow-ups')[1].split('## ')[0]
+        self.assertIn('With or without autonomy', section)
+        for needle in ['wb.py" follow-up add --key', 'follow-up file --source <N> --pr <P>', 'never lower it below revmux']:
+            self.assertIn(needle, section)
+        self.assertIn('as "Follow-ups" below says', text.split('## Full autonomy')[1].split('## Follow-ups')[0])
+
+    def test_both_implementers_know_the_final_round(self):
+        for path in ('claude/commands/workbench-implementer.md', 'codex/skills/workbench-implementer/SKILL.md'):
+            with self.subTest(path=path):
+                text = self.text(path)
+                self.assertIn('A `FIX r<K> (final)` round has no revmux round after it', text)
+                self.assertIn('Fix the cheap Minor and Immaterial findings; mark the rest `deferred` with a reason', text)
+
+
 class LoopEndProse(unittest.TestCase):
     """#27 r18b: an implementer does not answer the end of the loop, so no unread reply blocks the close."""
 
