@@ -552,6 +552,16 @@ class RevmuxProfile(unittest.TestCase):
         self.save('{"tool": "claude", "revmuxProfile": "claude-only"}')
         self.assertIn("-Profile claude-only", self.run_round())
 
+    def test_kimi_implementer_uses_claude_only_unless_the_record_says_otherwise(self):
+        # #65: the launcher records claude-only for kimi; a record without a usable profile falls
+        # back the same way, since Codex is not in the loop to review.
+        self.save('{"tool": "kimi", "revmuxProfile": "claude-only"}')
+        self.assertIn("-Profile claude-only", self.run_round())
+        self.save('{"tool": "kimi"}')
+        self.assertIn("-Profile claude-only", self.run_round())
+        self.save('{"tool": "kimi", "revmuxProfile": "codex-final"}')
+        self.assertIn("-Profile codex-final", self.run_round())
+
     def test_explicit_profile_wins(self):
         self.save('{"tool": "claude", "revmuxProfile": "claude-only"}')
         self.assertIn("-Profile codex-final", self.run_round('--profile', 'codex-final'))
@@ -1210,6 +1220,11 @@ class Settings(unittest.TestCase):
         self.assertEqual('implementer=claude revmuxProfile=claude-only autoMerge=true autonomous=false failover=true',
                          self.printed('{"tool": "claude", "revmuxProfile": "claude-only", "autoMerge": true}'))
         self.assertIn('autoMerge=false', self.printed('{"tool": "codex", "autoMerge": "true"}'))
+        self.assertEqual('implementer=kimi revmuxProfile=claude-only autoMerge=false autonomous=false failover=true',
+                         self.printed('{"tool": "kimi", "revmuxProfile": "claude-only"}'))
+        self.assertIn('implementer=codex', self.printed('{"tool": "aider"}'))
+        import hub
+        self.assertIn('kimi', hub.TOOLS)
 
     def test_failover_is_on_unless_the_config_says_false(self):
         # #24

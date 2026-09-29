@@ -335,10 +335,31 @@ def git_head(root: Path) -> str | None:
     return done.stdout.strip() if done.returncode == 0 else None
 
 
+def _kimi_last_words(text: str) -> str | None:
+    """Kimi Code's last paragraph: the block above its composer box, past any spinner row."""
+    import peerchat
+    box = peerchat.kimi_box(text)
+    if box is None:
+        return None
+    lines, top, _ = box
+    above = lines[:top]
+    while above and (not above[-1].strip() or peerchat.KIMI_SPINNER_RE.match(above[-1])):
+        above.pop()
+    start = len(above)
+    while start and above[start - 1].strip():
+        start -= 1
+    words = " ".join(row.strip() for row in above[start:])
+    if not words:
+        return None
+    return words if len(words) <= LAST_WORDS_MAX else "…" + words[-LAST_WORDS_MAX:]
+
+
 def last_words(text: str | None, tool: str) -> str | None:
     """What an agent last said (#45): the last paragraph above its composer box - not its footer or
     status line, which are the pane's real last rows. None when the composer cannot be found."""
     import peerchat
+    if tool == "kimi":
+        return _kimi_last_words(text or "")
     lines = (text or "").splitlines()
     prompt_re = peerchat.CLAUDE_PROMPT_RE if tool == "claude" else peerchat.CODEX_PROMPT_RE
     prompt = next((i for i in range(len(lines) - 1, -1, -1) if prompt_re.match(lines[i])), None)
@@ -1200,7 +1221,8 @@ class Relay:
                     self.hold(peer, mid, 'usage limit')
                     continue
                 try:
-                    if peer.tool == "claude" and is_busy(agw.pane_text(peer.pane)):
+                    # Claude and Kimi take Return, which would land in a running turn: ring between turns.
+                    if peer.tool in ("claude", "kimi") and is_busy(agw.pane_text(peer.pane)):
                         raise peerchat.Refused('mid-turn; waiting for the agent to finish')
                     text = peerchat.compose_text("Chat from Workbench: ",
                                                  pointer_text(message, self.agmsg, self.hub_dir))
@@ -1611,7 +1633,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hub", required=True, help="the workbench mailbox directory (.workbench)")
     parser.add_argument("--claude-pane", required=True)
     parser.add_argument("--codex-pane", required=True, help="the implementer's pane (mailbox box 'codex')")
-    parser.add_argument("--implementer-tool", choices=("codex", "claude"), default="codex",
+    parser.add_argument("--implementer-tool", choices=("codex", "claude", "kimi"), default="codex",
                         help="which agent runs the implementer pane; picks the peerchat profile it is rung with")
     parser.add_argument("--repo", required=True, help="owner/name")
     parser.add_argument("--branch", required=True)

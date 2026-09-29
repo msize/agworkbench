@@ -1891,6 +1891,25 @@ class ClaudeImplementer(DeliveryFixture):
         with patch('sys.stderr'), self.assertRaises(SystemExit):
             self.peers('--implementer-tool', 'aider')
 
+    def test_kimi_tool_keeps_the_codex_box_with_kimis_profile(self):
+        self.assertEqual(relay.Peer('codex', 'kimi', self.RIGHT_PANE),
+                         self.peers('--implementer-tool', 'kimi')[1])
+
+    def test_kimi_implementer_is_held_mid_turn_then_rung_with_return(self):
+        # #65: captured frames - the spinner row above the box is a running turn.
+        kimi = lambda name: (Path(__file__).resolve().parent / 'fixtures' / 'kimi' / f'{name}.txt').read_text(encoding='utf-8')
+        self.peer = relay.Peer('codex', 'kimi', 'codex-pane')
+        self.r.peers = [self.peer]
+        self.pane.return_value = kimi('running-tool')
+        self.tick(0)
+        self.send.assert_not_called()
+        self.assertIn('mid-turn', self.r.holds[('codex', 'm1')].reason)
+        self.pane.return_value = kimi('idle-after-turn')
+        self.tick(10)
+        self.send.assert_called_once()
+        self.assertIs(peerchat.PROFILES['kimi'], self.send.call_args.args[1])
+        self.assertEqual(['m1'], self.r.state['announced'])
+
     def test_claude_implementer_is_held_mid_turn_then_rung_with_return(self):
         self.peer = relay.Peer('codex', 'claude', 'codex-pane')
         self.r.peers = [self.peer]

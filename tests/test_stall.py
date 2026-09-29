@@ -454,6 +454,22 @@ class LastWords(unittest.TestCase):
         self.assertIsNone(relay.last_words(CLAUDE_IDLE, 'claude'))      # only the turn timer above the box
         self.assertIsNone(relay.last_words(None, 'claude'))
 
+    def test_kimi_last_paragraph_above_its_box_past_the_spinner(self):
+        # #65: captured Kimi Code frames (tests/fixtures/kimi)
+        kimi = lambda name: (Path(__file__).resolve().parent / 'fixtures' / 'kimi' / f'{name}.txt').read_text(encoding='utf-8')
+        self.assertEqual('● done', relay.last_words(kimi('idle-after-turn'), 'kimi'))
+        self.assertEqual('● Running a command · $ sleep 25 && echo slept', relay.last_words(kimi('running-tool'), 'kimi'))
+        self.assertIsNone(relay.last_words(kimi('approval'), 'kimi'))       # no composer box: a dialog
+        self.assertIsNone(relay.last_words(CLAUDE_IDLE, 'kimi'))
+
+    def test_kimi_idle_blockers(self):
+        kimi = lambda name: (Path(__file__).resolve().parent / 'fixtures' / 'kimi' / f'{name}.txt').read_text(encoding='utf-8')
+        peer = relay.Peer('codex', 'kimi', 'pane')
+        self.assertEqual([], closer.idle_blockers(peer, kimi('idle-after-turn')))
+        self.assertEqual(['codex is running a turn'], closer.idle_blockers(peer, kimi('running-thinking')))
+        self.assertEqual(['codex composer is not provably empty'], closer.idle_blockers(peer, kimi('draft-wrapped')))
+        self.assertEqual(['codex composer is not provably empty'], closer.idle_blockers(peer, kimi('approval')))
+
     def test_a_long_line_is_clipped_from_the_front(self):
         words = relay.last_words(codex('', prefix='• ' + 'x' * 500), 'codex')
         self.assertEqual(relay.LAST_WORDS_MAX + 1, len(words))
