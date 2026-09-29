@@ -1431,22 +1431,22 @@ function Get-CallerSession($Tree) {
     return $found
 }
 
-function Get-AdoptionPlan($Tree, [string] $Checkout, [string] $RepoName, [int] $Number) {
+function Get-AdoptionPlan($Tree, [string] $Checkout, [string] $WorkspaceName, [int] $Number) {
     if (-not (Test-ClaudeCaller) -and ($env:CODEX_THREAD_ID -or $env:CODEX_SANDBOX)) {
         throw [AdoptRefused]::new('a Codex process cannot adopt its pane as Claude; use -NewSession')
     }
     $caller = Get-CallerSession $Tree
     $session = $caller.Session
     $panes = @(Get-PaneIds $session)
-    $workspaces = @($Tree.workspaces | Where-Object { $_.name -eq $RepoName })
+    $workspaces = @($Tree.workspaces | Where-Object { $_.name -eq $WorkspaceName })
     if ($workspaces.Count -gt 1) {
-        throw [AdoptRefused]::new("multiple workspaces named '$RepoName': $($workspaces.id -join ', ')")
+        throw [AdoptRefused]::new("multiple workspaces named '$WorkspaceName': $($workspaces.id -join ', ')")
     }
     $workspaceId = $null
     if ($workspaces.Count) {
         $guid = [guid]::Empty
         if (-not [guid]::TryParse([string]$workspaces[0].id, [ref]$guid) -or $guid -eq [guid]::Empty) {
-            throw [AdoptRefused]::new("workspace '$RepoName' has no valid id")
+            throw [AdoptRefused]::new("workspace '$WorkspaceName' has no valid id")
         }
         $workspaceId = $workspaces[0].id
     }
@@ -1473,7 +1473,7 @@ function Get-AdoptionPlan($Tree, [string] $Checkout, [string] $RepoName, [int] $
             }
         }
     }
-    $ownRegistry = ($caller.Workspace.name -eq $RepoName -and
+    $ownRegistry = ($caller.Workspace.name -eq $WorkspaceName -and
         (Test-IssueSessionName $session.name $Number) -and $registry.agents.claude.pane -eq $caller.Pane)
     if ($ownRegistry -and $panes.Count -eq 2) {
         $ownRegistry = $registry.agents.codex.pane -in $panes -and $registry.agents.codex.pane -ne $caller.Pane
@@ -1510,7 +1510,7 @@ function Save-AdoptionState([string] $Checkout, $State) {
     Write-AtomicJson $path $State
 }
 
-function Initialize-AdoptedSession($Plan, [string] $Checkout, [string] $RepoName, [int] $Number, [string] $Slug) {
+function Initialize-AdoptedSession($Plan, [string] $Checkout, [string] $WorkspaceName, [int] $Number, [string] $Slug) {
     $script:Launch.SessionId = $Plan.Session.id
     $script:Launch.Claude = $Plan.CallerPane
     $script:Launch.Codex = $Plan.CodexPane
@@ -1526,7 +1526,7 @@ function Initialize-AdoptedSession($Plan, [string] $Checkout, [string] $RepoName
     Set-LaunchStage adopt-workspace
     $workspaceId = $Plan.TargetWorkspace
     if (-not $workspaceId) {
-        $workspaceId = (Invoke-Ctl workspace new $RepoName).Trim()
+        $workspaceId = (Invoke-Ctl workspace new $WorkspaceName).Trim()
         $guid = [guid]::Empty
         if (-not [guid]::TryParse($workspaceId, [ref]$guid) -or $guid -eq [guid]::Empty) {
             throw "workspace new returned an invalid id: '$workspaceId'"
@@ -1936,14 +1936,19 @@ function Get-GitHubOriginRepo([string] $Url) {
 
 function Get-NamedCheckoutMembership([string] $Dir, [hashtable] $Issue) {
     <# A named queue member's checkout (#66), proven by its own queue membership: it names this repo
-       and issue, and this directory as its checkout. Returns @{ Dir; Workspace; Queue } or $null. #>
+       and issue, and a checkout of this directory's name - the conductor records a resolved path, which
+       a junction or subst checkoutRoot spells differently. Returns @{ Dir; Workspace; Queue }; $null
+       when there is no membership or a valid one that is not this issue's named checkout. A membership
+       that cannot be read is refused, as closer.workspace_of refuses it: guessing would go plain. #>
     $path = Join-Path $Dir '.workbench\state\queue-member.json'
     if (-not (Test-Path -LiteralPath $path)) { return $null }
-    try { $member = Get-Content -Raw -LiteralPath $path -Encoding UTF8 | ConvertFrom-Json } catch { return $null }
+    try { $member = Get-Content -Raw -LiteralPath $path -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop }
+    catch { throw "cannot read the queue membership '$path': $_" }
+    if ($member -isnot [pscustomobject]) { throw "cannot read the queue membership '$path': not an object" }
     if (-not $member.queueName -or -not $member.workspace -or -not $member.checkout -or
         "$($member.repo)" -ne $Issue.Repo -or "$($member.number)" -ne "$($Issue.Number)") { return $null }
     $full = [IO.Path]::GetFullPath($Dir).TrimEnd('\', '/')
-    if ([IO.Path]::GetFullPath([string]$member.checkout).TrimEnd('\', '/') -ne $full) { return $null }
+    if ((Split-Path -Leaf ([string]$member.checkout).TrimEnd('\', '/')) -ne (Split-Path -Leaf $full)) { return $null }
     return @{ Dir = $full; Workspace = [string]$member.workspace; Queue = [string]$member.queueName }
 }
 

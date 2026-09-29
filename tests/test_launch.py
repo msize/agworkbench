@@ -3585,6 +3585,25 @@ class NamedCheckoutLaunch(LauncherFixtures):
                 self.assertIn("in workspace 'repo'", result.stdout)
                 shutil.rmtree(named)
 
+    def test_a_differently_spelled_root_still_matches_and_an_unreadable_membership_is_refused(self):
+        # r2 m4: the conductor records a resolved path, which a junction or subst root spells differently.
+        self.checkout.rmdir()
+        named = self.named(checkout=Path('X:/resolved/elsewhere/repo-kimi-issue-7'))
+        result = self.dry_run(named, '-Failover')
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertIn(f"named queue 'kimi': checkout {named}, workspace 'repo-kimi'", result.stdout)
+        # r2 m5: a membership that cannot be read is refused, naming it; never a silent plain launch.
+        membership = named / '.workbench' / 'state' / 'queue-member.json'
+        for broken in ('{broken', '[1, 2]'):
+            with self.subTest(broken=broken):
+                membership.write_text(broken, encoding='utf-8')
+                for cwd in (named, ROOT):
+                    result = self.dry_run(cwd, '-Failover')
+                    self.assertNotEqual(0, result.returncode, result.stdout)
+                    self.assertIn('cannot read the queue membership', result.stdout + result.stderr)
+                    self.assertIn('queue-member.json', result.stdout + result.stderr)
+                    self.assertNotIn('repo-issue-7 on branch', result.stdout)
+
     def test_a_plain_clone_wins_the_scan_and_two_named_ones_are_refused(self):
         (self.checkout / '.git').mkdir()                             # repo-issue-7 is a clone
         self.named()
