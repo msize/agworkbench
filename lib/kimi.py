@@ -19,7 +19,6 @@ Everything Kimi keeps lives under KIMI_CODE_HOME, else ~/.kimi-code.
 
   kimi.py web-guard [--allow-network]                 exit 1 with the reason when the guard is missing
   kimi.py prepare --checkout DIR --issue REF [--allow-network] [--dry-run]    prints JSON: env and paths
-  kimi.py trust DIR
 """
 
 from __future__ import annotations
@@ -45,7 +44,10 @@ MARKER = "<!-- agworkbench: the Kimi implementer's role"
 AGENTS_MD = Path(".kimi-code") / "AGENTS.md"
 EXCLUDE_LINE = "/.kimi-code/AGENTS.md"
 REFUSED_SCHEME = "agworkbench-push-refused://"
-GITHUB_PUSH_URLS = ("https://github.com/", "git@github.com:", "ssh://git@github.com/")
+# Every spelling of a GitHub remote git itself writes. Userinfo variants (https://user@github.com/...)
+# do not match these prefixes; the git shim refuses those pushes, and the role forbids pushing at all.
+GITHUB_PUSH_URLS = ("https://github.com/", "http://github.com/", "git@github.com:", "ssh://git@github.com/",
+                    "ssh://github.com/")
 REFUSED_TOKEN = "agworkbench-refused"
 WIN_SHAPED = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\|//)")
 
@@ -231,8 +233,6 @@ def main(argv: list[str] | None = None) -> int:
     prep.add_argument("--issue", required=True)
     prep.add_argument("--allow-network", action="store_true")
     prep.add_argument("--dry-run", action="store_true")
-    trust = sub.add_parser("trust")
-    trust.add_argument("directory")
     args = parser.parse_args(argv)
     try:
         if args.command == "web-guard":
@@ -242,10 +242,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             print("ok")
             return 0
-        if args.command == "prepare":
-            print(json.dumps(prepare(args.checkout, args.issue, args.allow_network, args.dry_run)))
-            return 0
-        print(grant_trust(args.directory))
+        print(json.dumps(prepare(args.checkout, args.issue, args.allow_network, args.dry_run)))
         return 0
     except (Refused, OSError, ValueError) as err:
         print(f"{err}")

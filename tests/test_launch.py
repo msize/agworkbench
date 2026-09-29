@@ -3725,7 +3725,7 @@ class KimiImplementer(LauncherFixtures):
         self.assertIn(f"would run: {ps_quote(self.kimi)} '--yolo'\n", fresh.stdout + '\n')
         for expected in ('would set: AI_BOX=codex', f"would set: AI_HUB={self.checkout / '.workbench'}",
                          f'would set: AGWORKBENCH={ROOT}', 'would set: KIMI_CODE_NO_AUTO_UPDATE=1',
-                         'would set: GH_TOKEN=agworkbench-refused', 'would set: GIT_CONFIG_COUNT=3',
+                         'would set: GH_TOKEN=agworkbench-refused', 'would set: GIT_CONFIG_COUNT=5',
                          'would set: console output encoding UTF-8',
                          f"would set: PATH={self.checkout / '.workbench/state/kimi-bin'}"):
             with self.subTest(expected=expected):
@@ -3765,7 +3765,7 @@ class KimiImplementer(LauncherFixtures):
         calls = self.kimi_calls.read_text(encoding='utf-8')
         self.assertIn('ARGS --yolo', calls)
         self.assertIn(f"ENV AI_BOX=codex AI_HUB={self.checkout / '.workbench'} GH_TOKEN=agworkbench-refused", calls)
-        self.assertIn('GIT_CONFIG_COUNT=3 NOUPDATE=1', calls)
+        self.assertIn('GIT_CONFIG_COUNT=5 NOUPDATE=1', calls)
         self.assertIn(f'CWD {self.checkout}', calls)
         self.assertIn('GitHub issue o/repo#7', (self.checkout / '.kimi-code/AGENTS.md').read_text(encoding='utf-8'))
         self.assertTrue((self.checkout / '.workbench/state/kimi-bin/git').exists())

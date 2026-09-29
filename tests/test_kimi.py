@@ -149,10 +149,10 @@ class Prepare(Temp):
         self.assertTrue(env["KIMI_SHELL_PATH"].lower().endswith("\\bin\\bash.exe"))
         self.assertTrue(env["BASH_ENV"].endswith("/.workbench/state/kimi-bin/env.sh"))
         self.assertEqual("agworkbench-refused", env["GH_TOKEN"])
-        self.assertEqual("3", env["GIT_CONFIG_COUNT"])
-        self.assertEqual({"https://github.com/", "git@github.com:", "ssh://git@github.com/"},
-                         {env[f"GIT_CONFIG_VALUE_{i}"] for i in range(3)})
-        self.assertEqual({"url.agworkbench-push-refused://.pushInsteadOf"}, {env[f"GIT_CONFIG_KEY_{i}"] for i in range(3)})
+        self.assertEqual("5", env["GIT_CONFIG_COUNT"])
+        self.assertEqual({"https://github.com/", "http://github.com/", "git@github.com:", "ssh://git@github.com/",
+                          "ssh://github.com/"}, {env[f"GIT_CONFIG_VALUE_{i}"] for i in range(5)})
+        self.assertEqual({"url.agworkbench-push-refused://.pushInsteadOf"}, {env[f"GIT_CONFIG_KEY_{i}"] for i in range(5)})
         self.assertFalse((checkout / ".kimi-code").exists())        # a dry run writes nothing
         self.assertFalse((self.home / "workspace-trust").exists())
 
@@ -189,9 +189,21 @@ class GuardRails(Temp):
 
     def setUp(self):
         super().setUp()
-        self.checkout = self.clone()
+        # Not under %TEMP%: MSYS spells that /tmp/..., a spelling the shim path never has, which once
+        # hid a guard that skipped the prepend whenever the shim was anywhere on PATH (FIX r1 M1). A
+        # real checkout is /c/..., like this one (inside the repository's ignored .workbench/).
+        parent = ROOT / ".workbench" / f"test-kimi-{os.getpid()}-{id(self)}"
+        parent.mkdir(parents=True)
+        self.addCleanup(shutil.rmtree, parent, ignore_errors=True)
+        self.checkout = parent / "repo-issue-7"
+        self.checkout.mkdir()
+        git(self.checkout, "init", "-q")
+        git(self.checkout, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "init")
+        self.assertTrue(kimi.msys_path(str(self.checkout)).startswith("/c/") or not str(self.checkout).lower().startswith("c:"))
         prepared = kimi.prepare(str(self.checkout), "o/repo#7", allow_network=False, home=self.home)
+        # Exactly the pane's environment: its env map, and the shim directory first on the Windows PATH.
         self.env = dict(os.environ, **prepared["env"])
+        self.env["PATH"] = prepared["shimDir"] + os.pathsep + os.environ["PATH"]
         # A github-shaped remote: the backstop rewrites its push URL to a scheme git cannot speak, so
         # nothing ever reaches the network. Fetch URLs are left alone.
         git(self.checkout, "remote", "add", "origin", "https://github.com/o/repo.git")
@@ -224,6 +236,15 @@ class GuardRails(Temp):
                 done = self.bash(command)
                 self.assertNotEqual(0, done.returncode, done.stdout + done.stderr)
                 self.assertIn("agworkbench-push-refused", done.stderr)
+        # Every GitHub spelling git writes is rewritten for push.
+        for url in ("http://github.com/o/repo.git", "ssh://github.com/o/repo.git", "git@github.com:o/repo.git",
+                    "ssh://git@github.com/o/repo.git"):
+            with self.subTest(url=url):
+                git(self.checkout, "remote", "set-url", "origin", url)
+                done = self.bash("git.exe push origin HEAD")
+                self.assertNotEqual(0, done.returncode)
+                self.assertIn("agworkbench-push-refused", done.stderr)
+        git(self.checkout, "remote", "set-url", "origin", "https://github.com/o/repo.git")
         # Fetch URLs are not rewritten.
         self.assertIn("https://github.com/o/repo.git (fetch)", self.bash("git.exe remote -v").stdout)
         self.assertIn("agworkbench-push-refused://o/repo.git (push)", self.bash("git.exe remote -v").stdout)
