@@ -2166,7 +2166,7 @@ class ForkCheckout(unittest.TestCase):
         # was a URL dropped the --repo and left the repo to gh's base - the #71 bug itself.
         for args in (['issue', 'create', '--title', '-Recurse is dropped', '--body-file', 'x'],
                      ['issue', 'create', '--title', '-R', '--body-file', 'x'],
-                     ['issue', 'create', '--title', 'https://github.com/up/r/issues/3', '--body-file', 'x'],
+                     ['issue', 'create', '--title', 'https://github.com/fork/r/issues/3', '--body-file', 'x'],
                      ['issue', 'create', '--title=-Rx'], ['issue', 'create', '-t', '-R'],
                      ['issue', 'create', '--body', '--repo up/r'], ['issue', 'create', '--body', '--repo=up/r'],
                      ['issue', 'list', '--search', '"-R up/r" in:title', '--json', 'title'],
@@ -2175,6 +2175,22 @@ class ForkCheckout(unittest.TestCase):
                 self.assertEqual(args + ['--repo', 'fork/r'], wb.scoped(args, 'fork/r'))
         self.assertEqual(['issue', 'create', '--title', 't', '--repo', 'fork/r', '--', '-R'],
                          wb.scoped(['issue', 'create', '--title', 't', '--', '-R'], 'fork/r'))
+        # r2 i1: a `--` that is a flag's value ends nothing.
+        self.assertEqual(['issue', 'create', '--title', '--', '--body-file', 'x', '--repo', 'fork/r'],
+                         wb.scoped(['issue', 'create', '--title', '--', '--body-file', 'x'], 'fork/r'))
+
+    def test_a_switch_before_a_foreign_url_cannot_hide_it(self):
+        # r2 m1: `-s` is a switch on `pr merge` but a value flag elsewhere; a write refuses on any token.
+        for args in (['pr', 'merge', '-s', 'https://github.com/up/r/pull/1'],
+                     ['pr', 'review', '-a', 'https://github.com/up/r/pull/1'],
+                     ['pr', 'close', '-d', 'https://github.com/up/r/pull/1'],
+                     ['issue', 'close', '-r', 'https://github.com/up/r/issues/1']):
+            with self.subTest(args=args), self.assertRaises(wb.ForeignRepo) as caught:
+                wb.scoped(args, 'fork/r')
+            self.assertIn('targets up/r', str(caught.exception))
+        # The price of failing closed: a write whose text is exactly another repo's URL is refused too.
+        with self.assertRaises(wb.ForeignRepo):
+            wb.scoped(['issue', 'create', '--title', 'https://github.com/up/r/issues/3', '--body-file', 'x'], 'fork/r')
 
     def test_a_write_to_another_repo_is_refused(self):
         for args in (['issue', 'create', '--title', 't', '--repo', 'up/r'],

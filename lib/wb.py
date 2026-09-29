@@ -795,8 +795,10 @@ REPO_WRITES = {
     "run": {"rerun", "cancel", "delete"},
 }
 URL_REPO = re.compile(r"https?://github\.com/([^/\s]+/[^/\s]+)/(?:issues|pull|actions/runs)/\d+\S*", re.I)
-# The value-taking flags of the issue/pr/label/run commands: their value is never a flag or an argument (r1 M1).
-# `-e` (a value for `run list`, a switch for `issue create`) is left out: the workbench passes neither.
+# The value-taking flags of the issue/pr/label/run commands: their value is never read as a flag (r1 M1).
+# One set for every command, so a short letter can be misread (`-s` is a value for `issue list`, a
+# switch for `pr merge`). That only decides where `--repo` goes: a write checks every token for another
+# repo's URL (r2 m1), so a misread can never let one through.
 VALUE_FLAGS = {"-R", "--repo", "-t", "--title", "-b", "--body", "-F", "--body-file", "-S", "--search", "-l", "--label",
                "--add-label", "--remove-label", "-H", "--head", "-B", "--base", "-s", "--state", "--json", "-q", "--jq",
                "-T", "--template", "-L", "--limit", "-c", "--color", "--comment", "-d", "--description", "-j", "--job",
@@ -834,18 +836,16 @@ def repo_value(value: str) -> str:
     return "/".join(parts[-2:]) if len(parts) == 3 else value.strip()
 
 
-def split_args(args: list[str]) -> tuple[str | None, list[str]]:
-    """(the `--repo` value, the positional arguments) of an issue/pr/label/run call, read the way gh
-    reads it: a flag's value - a title like `-Recurse` or a URL - is never a flag or an argument (r1 M1).
-    An unknown flag is taken for a switch, so its value would count as an argument, never as a repo."""
-    repo, positional, i = None, [], 0
+def split_args(args: list[str]) -> tuple[str | None, int | None]:
+    """(the `--repo` value, the index of the `--` that ends the flags) of an issue/pr/label/run call,
+    read the way gh reads it: a flag's value - a title like `-Recurse` or `--` - is never a flag (r1 M1,
+    r2 i1). An unknown flag is taken for a switch."""
+    repo, i = None, 0
     while i < len(args):
         arg = args[i]
         if arg == "--":
-            positional += args[i + 1:]
-            break
+            return repo, i
         if not arg.startswith("-") or arg == "-":
-            positional.append(arg)
             i += 1
             continue
         long = arg.startswith("--")
@@ -856,7 +856,7 @@ def split_args(args: list[str]) -> tuple[str | None, list[str]]:
             value = (arg[len(name) + 1:] if long else arg[2:]) if joined else (args[i + 1] if i + 1 < len(args) else "")
             repo = repo_value(value)
         i += 2 if takes and not joined else 1
-    return repo, positional
+    return repo, None
 
 
 def refuse(what: str, target: str, repo: str) -> ForeignRepo:
@@ -906,15 +906,17 @@ def scoped(args: list[str] | tuple[str, ...], repo: str) -> list[str]:
     if args[:1] == ["api"]:
         return scoped_api(args, repo)
     if args[:1] and args[0] in REPO_WRITES:
-        named, positional = split_args(args[2:])
-        url = next((match[1] for match in map(URL_REPO.fullmatch, positional) if match), None)
-        target = named or url
-        if target and not same_repo(target, repo) and args[1:2] and args[1] in REPO_WRITES[args[0]]:
-            raise refuse(' '.join(args[:2]), target, repo)
+        named, end = split_args(args[2:])
+        if args[1:2] and args[1] in REPO_WRITES[args[0]]:
+            # Fail closed (r2 m1): any token naming another repo refuses a write, whatever reads it.
+            urls = [match[1] for match in map(URL_REPO.fullmatch, args[2:]) if match]
+            target = next((t for t in [named, *urls] if t and not same_repo(t, repo)), None)
+            if target:
+                raise refuse(' '.join(args[:2]), target, repo)
         # --repo whenever no flag names one: a URL argument wins over it in gh, and a value we misread
-        # can then never leave the repo to gh's base (r1 M1).
+        # can then never leave the repo to gh's base (r1 M1). Before a `--` that ends the flags.
         if named is None:
-            at = args.index("--", 2) if "--" in args[2:] else len(args)     # before `--`, still a flag
+            at = len(args) if end is None else end + 2
             return args[:at] + ["--repo", repo] + args[at:]
     return args
 
