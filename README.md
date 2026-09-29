@@ -368,8 +368,67 @@ both Claude panes. For the implementer, flags that would widen its tool policy a
 `--dangerously-skip-permissions`, it asks before commands, and the loop waits for you.
 
 **Review rounds follow the implementer.** `wb.py revmux` uses the revmux profile saved for the
-checkout: `comprehensive` with Codex, `claude-only` with Claude, so a round never depends on Codex's
-quota. `revmuxProfile` in the config overrides both, and `--profile` overrides it for one round.
+checkout: `comprehensive` with Codex, `claude-only` with Claude or Kimi, so a round never depends on
+Codex's quota. `revmuxProfile` in the config overrides both, and `--profile` overrides it for one round.
+
+### Kimi Code as the implementer
+
+With `"implementer": "kimi"`, or `github-workbench <issue> -Implementer kimi`, the right pane runs
+[Kimi Code](https://moonshotai.github.io/kimi-code/) (`kimi`, tested with 2.1.1). The loop is the
+same: the mailbox box stays `codex`, the relay rings it with Kimi's profile (Return submits, typed in
+its own call, well after Kimi's 120 ms paste-burst window; mail is held while a turn's spinner is
+above its composer), and failover and the queue know it. `lib/pane-implementer-kimi.ps1` starts it,
+and `lib/kimi.py` prepares what the pane needs.
+
+- **Where kimi comes from.** `kimiPath` in the config, else `kimi` on `PATH`, else
+  `%USERPROFILE%\.kimi-code\bin\kimi.exe`. A launch (and a failover to Kimi) is refused, before
+  anything is recorded, when kimi is missing, when `kimi doctor` fails, or when the web-tool check
+  below fails. `-DryRun` prints what it would check instead.
+- **`--yolo` ("Ask When Needed"), never `--auto`.** Routine edits and commands run on their own.
+  Kimi still stops for commands it rates dangerous (a recursive delete, say), for sensitive files and
+  for `.git` control paths. Our guards cover only push, gh and the web, so `--auto` would remove the
+  only stop left. A pane on Kimi's approval prompt is a dialog: the relay holds its mail and the
+  stall watch reports it. Answer the prompt yourself.
+- **The role is `<checkout>\.kimi-code\AGENTS.md`**, not an agent file. Kimi Code 2.1.1 ignores
+  `--agent-file` and `--agent` in its interactive mode: only `kimi -p` binds the profile. With either
+  flag, the session's wire log still shows `profileName: "agent"`, no disallowed tools, and none of
+  the file's prompt (verified on 2026-09-29; see #65). Kimi loads `.kimi-code/AGENTS.md` next to the
+  repository's own `AGENTS.md`. The pane writes it at every launch from `kimi/AGENTS.md` and adds it
+  to `.git/info/exclude`. It refuses to start if the repository tracks that file or someone else
+  wrote it.
+- **No `git push`, no `gh`.** Kimi's shell tool is Git Bash. Its launcher (`Git\bin\bash.exe`) puts
+  `/mingw64/bin` first on `PATH`, so a shim directory on the inherited `PATH` would be shadowed. The
+  pane pins `KIMI_SHELL_PATH` to that bash and sets `BASH_ENV` to a script that puts
+  `.workbench\state\kimi-bin` (a `git` that refuses `push` and `send-pack`, and a `gh` that refuses
+  everything) back in front. For the spellings a shim cannot catch (`git.exe push`, an absolute
+  path, `cmd /c git push`), `GIT_CONFIG_*` rewrites every GitHub push URL to a scheme git cannot
+  speak, and `GH_TOKEN` is set to a token GitHub refuses. All of this lives only in Kimi's process
+  tree. It is a guardrail, not a boundary: Kimi could unset it, and its role says not to.
+- **The web tools are your `[tools] disabled`.** No per-session switch exists in Kimi 2.1.1, and the
+  launcher never edits your global config. Unless `allowNetwork` is set, it refuses to start Kimi
+  until `config.toml` (under `KIMI_CODE_HOME`, else `~/.kimi-code`) has:
+
+  ```toml
+  [tools]
+  disabled = ["FetchURL", "WebSearch"]
+  ```
+
+  That turns them off for every Kimi session on the machine, and that is why the launcher asks you
+  rather than doing it. Kimi's question, plan-mode and subagent tools (`AskUserQuestion`,
+  `EnterPlanMode`, `Agent`) cannot be turned off per session either. The role forbids them, and a
+  pane parked on a question shows up as a dialog.
+- **Trust, console and restarts.** Kimi's "Trust this folder?" dialog exits on Esc, so the pane
+  writes Kimi's own trust record for the clone (`workspace-trust/wd_<name>_<hash>`) when it is
+  missing. It runs Kimi with a UTF-8 console, without which every glyph the relay reads arrives as
+  mojibake. `KIMI_CODE_NO_AUTO_UPDATE=1` keeps it one process. The restart pin runs the pane with
+  `-Resume`: `kimi -c` continues its last session for the clone, and a note from `relay` in box
+  `codex` makes the relay ring it, since the relay rings each mail only once.
+- **Limits.** Kimi retries a 429 itself (`Retrying (n/10)`). The relay counts a Kimi limit only as
+  its session error (`Error: [provider.<code>] ...` followed by its `/export-debug-zip` hint), as the
+  last thing above an idle composer, and only when the message names a quota or usage limit. A bare
+  rate limit after the retries is not a reason to fail over. No real Kimi limit frame has been seen
+  yet, so those fixtures are synthesised (`tests/fixtures/limits/README.md`). If a limit is missed,
+  the stall watch still reports the idle pane.
 
 **The relay** types only into the two panes of its own session, only into an agent's composer it
 can prove is empty, never into a dialog, and never answers a prompt. A refusal before typing waits
@@ -583,8 +642,10 @@ implementer, the planner runs `github-workbench <issue> -Failover`, which:
 - takes an exited agent as it is. When the agent is still running, it stops it only when the pane
   has not changed for 90 s, there is no `.git/index.lock`, and exactly one agent process belongs to
   this checkout. It stops that process tree and never types into the agent;
-- records the limit in the checkout's settings, clears the pane, and starts the other tool there
-  through the `-Implementer` switch;
+- records the limit in the checkout's settings, clears the pane, and starts another tool there
+  through the `-Implementer` switch: the first tool in `failoverOrder` (default claude, codex,
+  kimi) that is not the limited one, has no recorded limit and, for Kimi, passes its launch checks.
+  The default keeps Codex and Claude switching to each other, as before;
 - lets the planner hand the work over by mail (`wb.py handover` computes the open request).
 
 A tool with a recorded limit is never switched back to automatically. Once its limit has reset,
@@ -593,7 +654,7 @@ chooser (under 10% of its limit left) fails over the same way. Nobody answers it
 only at the bottom of the pane, where the chooser replaces the composer. The planner's own limit
 cannot be failed over: you get the notification, and the loop waits. Set `"failover": false` to
 have limits only reported. In a queue, a limit that any live member recorded sends later members
-to Claude (with `failover` on). If Claude is limited, or failover is off, the queue pauses with
+to the first free tool in `failoverOrder`, usually Claude (with `failover` on). If Claude is limited, or failover is off, the queue pauses with
 `toolsPaused: "tool limits: ..."`. Once the limit has reset, clear it for the queue with
 `-Queue <spec> -ClearLimit <tool>`. That changes nothing else: the queue's `-Implementer` stays as
 it is, and setting `-Implementer` never clears a limit. Records made before the clear are ignored
@@ -700,10 +761,13 @@ the autonomous close can close it. revmux and revdiff rounds that fail also mail
 | `claudeArgs` | `[]` | extra arguments for `claude` — `-Bypass` puts `--dangerously-skip-permissions` here |
 | `codexArgs` | `[]` | extra arguments for `codex`; anything touching the sandbox policy is refused |
 | `checkoutRoot` | `~/source/workbench` | where per-issue clones go |
-| `allowNetwork` | `false` | let Codex's sandbox reach the network (package installs, tests that fetch); with a Claude implementer, allows its web tools |
-| `implementer` | `"codex"` | who runs the right pane (`"codex"` or `"claude"`) in a new checkout; an existing checkout keeps its saved tool. `-Implementer` changes it for that checkout (refused while a live agent holds the pane) or sets it for a queue's members |
-| `revmuxProfile` | by implementer | revmux profile for review rounds: `comprehensive` with Codex, `claude-only` with Claude |
-| `failover` | `true` | when the implementer hits its usage limit, the planner stops it (only when idle at the limit) and switches to the other tool; `false` only reports |
+| `allowNetwork` | `false` | let Codex's sandbox reach the network (package installs, tests that fetch); with a Claude implementer, allows its web tools; with Kimi, drops the launcher's check that Kimi's own `[tools] disabled` turns its web tools off |
+| `implementer` | `"codex"` | who runs the right pane (`"codex"`, `"claude"` or `"kimi"`) in a new checkout; an existing checkout keeps its saved tool. `-Implementer` changes it for that checkout (refused while a live agent holds the pane) or sets it for a queue's members |
+| `revmuxProfile` | by implementer | revmux profile for review rounds: `comprehensive` with Codex, `claude-only` with Claude or Kimi |
+| `failover` | `true` | when the implementer hits its usage limit, the planner stops it (only when idle at the limit) and switches to the next tool in `failoverOrder`; `false` only reports |
+| `failoverOrder` | `["claude", "codex", "kimi"]` | the tools a failover (and a queue with a limited tool) tries, in order: the first that is not the limited one, has no recorded limit and is usable. At least two distinct tools |
+| `kimiPath` | none | `kimi.exe` for the Kimi implementer; without it, `PATH`, then `%USERPROFILE%\.kimi-code\bin\kimi.exe` |
+| `kimiArgs` | `[]` | extra arguments for `kimi` (e.g. `["-m", "<model alias>"]`); approval-mode, session, agent and directory flags are refused in every spelling |
 | `bugLabel` | `"bug"` | the label `-Queue bugs` stands for (non-empty, no comma) |
 | `triage` | none | per product repo: `{"owner/repo": {"specRepos": [...], "model": "..."}}`, the private spec repos `-Triage` judges against (see Issue triage) |
 | `followUp` | `{"dedupe": true, "bumpAt": {"P2": 2, "P1": 3, "P0": 5}}` | `dedupe: false` skips duplicate matching: separate items keep #27's filing, leftovers still share one issue per PR (per item without `--pr`); `bumpAt` is the total number of reports that raises a matched issue to each priority |
@@ -723,6 +787,9 @@ lib/github-workbench.ps1    terminal detection, clone, session, split, relay
 lib/pane-claude.ps1         left pane: claude "/start-github-issue <issue>"
 lib/pane-codex.ps1          right pane: codex, sandboxed, with the implementer prompt
 lib/pane-implementer-claude.ps1  right pane with implementer=claude: claude "/workbench-implementer <issue>"
+lib/pane-implementer-kimi.ps1    right pane with implementer=kimi: kimi --yolo, with its role and guard rails (#65)
+lib/kimi.py                 the Kimi pane's role file, git/gh shims, web-tool check and trust record
+kimi/AGENTS.md, kimi/bin/   the Kimi implementer's role and its shell shims (templates)
 lib/relay.py                mail doorbell and PR watcher; spots usage limits and stalls in the agent panes
 lib/limits.py               recognises an agent's own usage-limit message in a pane frame (#24)
 lib/closer.py               the autonomous close after a merge, shared by the relay and the conductor (#27, #33)

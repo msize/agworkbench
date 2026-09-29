@@ -110,9 +110,16 @@ function Get-WorkbenchConfig {
          codexArgs      extra arguments for codex (policy flags are refused - see pane-codex.ps1)
          checkoutRoot   where per-issue clones go (default ~/source/workbench)
          allowNetwork   let Codex's sandbox reach the network (default false)
-         implementer    who runs in the right pane: codex (default) or claude
+         implementer    who runs in the right pane: codex (default), claude or kimi (#65)
          revmuxProfile  revmux profile for review rounds (default: comprehensive with codex,
-                        claude-only with claude)
+                        claude-only with claude or kimi)
+         kimiPath       kimi.exe to run when implementer is kimi (default: PATH, then
+                        ~\.kimi-code\bin\kimi.exe)
+         kimiArgs       extra arguments for kimi (policy and session flags are refused - see
+                        pane-implementer-kimi.ps1)
+         failoverOrder  the tools -Failover and the queue try, in order, when the implementer is
+                        limited (default ["claude", "codex", "kimi"]): the first that is not the
+                        limited one, has no recorded limit and is usable
          autoMerge      let the planner merge its own PR when every condition holds (default false)
          failover       switch the implementer to the other tool when it hits its usage limit (default true)
          autonomous     full autonomy (#27): auto-merge, follow-up issues, sessions closed after the merge
@@ -129,16 +136,31 @@ function Get-WorkbenchConfig {
     if ($env:AGWORKBENCH_CONFIG) { $path = $env:AGWORKBENCH_CONFIG }   # tests point this elsewhere
     $config = @{ claudeArgs = @(); codexArgs = @(); checkoutRoot = (Join-Path $HOME 'source\workbench'); allowNetwork = $false;
                  implementer = 'codex'; revmuxProfile = $null; autoMerge = $false; failover = $true; autonomous = $false;
-                 cleanup = 'merged'; minFreeGB = 20; minFreeRamGB = 3; stallMinutes = 15 }
+                 cleanup = 'merged'; minFreeGB = 20; minFreeRamGB = 3; stallMinutes = 15; kimiPath = $null; kimiArgs = @();
+                 failoverOrder = @('claude', 'codex', 'kimi') }
     if (Test-Path -LiteralPath $path) {
         $loaded = Get-Content -Raw -LiteralPath $path | ConvertFrom-Json
-        foreach ($key in @('claudeArgs', 'codexArgs', 'checkoutRoot', 'allowNetwork', 'implementer', 'revmuxProfile', 'autoMerge', 'failover', 'autonomous', 'cleanup', 'minFreeGB', 'minFreeRamGB', 'stallMinutes')) {
+        foreach ($key in @('claudeArgs', 'codexArgs', 'checkoutRoot', 'allowNetwork', 'implementer', 'revmuxProfile', 'autoMerge', 'failover', 'autonomous', 'cleanup', 'minFreeGB', 'minFreeRamGB', 'stallMinutes', 'kimiPath', 'kimiArgs', 'failoverOrder')) {
             if ($null -ne $loaded.$key) { $config[$key] = $loaded.$key }
         }
     }
     if (-not (Test-ImplementerTool $config.implementer)) {
-        throw "implementer in '$path' must be codex or claude (got '$($config.implementer)')"
+        throw "implementer in '$path' must be codex, claude or kimi (got '$($config.implementer)')"
     }
+    if ($null -ne $config.kimiPath -and ($config.kimiPath -isnot [string] -or -not $config.kimiPath.Trim())) {
+        throw "kimiPath in '$path' must be the path of kimi.exe (got '$($config.kimiPath)')"
+    }
+    $config.kimiArgs = @(@($config.kimiArgs) | Where-Object { $null -ne $_ })
+    foreach ($argument in $config.kimiArgs) {
+        if ($argument -isnot [string]) { throw "kimiArgs in '$path' must be a list of strings (got '$argument')" }
+    }
+    # @( ... ) keeps a one-item list a list: ConvertFrom-Json unrolls nothing, but a bare string must fail.
+    $order = $config.failoverOrder
+    if ($order -is [string] -or @($order).Count -lt 2 -or @($order | Where-Object { -not (Test-ImplementerTool $_) }).Count -or
+        @($order | Select-Object -Unique).Count -ne @($order).Count) {
+        throw "failoverOrder in '$path' must list at least two distinct tools of codex, claude and kimi (got '$(@($order) -join ', ')')"
+    }
+    $config.failoverOrder = @($order | ForEach-Object { [string]$_ })
     if ($null -ne $config.revmuxProfile -and ($config.revmuxProfile -isnot [string] -or $config.revmuxProfile -notmatch '^[A-Za-z0-9._-]+$')) {
         throw "revmuxProfile in '$path' must be a revmux profile name (got '$($config.revmuxProfile)')"
     }
@@ -163,12 +185,61 @@ function Get-WorkbenchConfig {
     return $config
 }
 
-function Test-ImplementerTool($Value) { return $Value -is [string] -and $Value -cin @('codex', 'claude') }
+function Test-ImplementerTool($Value) { return $Value -is [string] -and $Value -cin @('codex', 'claude', 'kimi') }
 
 function Get-RevmuxProfile([string] $Tool, $Configured) {
+    # Codex reviews only when Codex implements: a Claude or Kimi implementer may mean Codex is out of quota.
     if ($Configured) { return [string]$Configured }
-    if ($Tool -eq 'claude') { return 'claude-only' }
+    if ($Tool -ne 'codex') { return 'claude-only' }
     return 'comprehensive'
+}
+
+# --- Kimi Code (#65) -----------------------------------------------------------------------------
+
+function Find-KimiExe($Config) {
+    <# kimiPath from the config, else kimi on PATH, else where the installer puts it. $null when
+       none exists. A configured kimiPath that does not exist is not replaced by a guess. #>
+    if ($Config -and $Config.kimiPath) {
+        if (Test-Path -LiteralPath $Config.kimiPath -PathType Leaf) { return (Resolve-Path -LiteralPath $Config.kimiPath).Path }
+        return $null
+    }
+    $onPath = Find-Tool kimi
+    if ($onPath) { return $onPath }
+    $installed = Join-Path $HOME '.kimi-code\bin\kimi.exe'
+    if (Test-Path -LiteralPath $installed -PathType Leaf) { return $installed }
+    return $null
+}
+
+function Invoke-KimiDoctor([string] $Exe) {
+    # The doctor boundary; tests replace it. Output and exit code, without aborting on stderr.
+    $ErrorActionPreference = 'Continue'
+    $PSNativeCommandUseErrorActionPreference = $false
+    $global:LASTEXITCODE = 0
+    $output = & $Exe doctor 2>&1
+    return @{ Code = $LASTEXITCODE; Output = (($output | ForEach-Object { "$_" }) -join "`n").Trim() }
+}
+
+function Get-KimiProblem($Config) {
+    <# Why Kimi cannot be the implementer here, or $null: the executable, `kimi doctor`, and - unless
+       allowNetwork - its web tools disabled in its own config (lib/kimi.py web-guard; Kimi 2.1.1
+       ignores --agent-file, so nothing else can turn them off). #>
+    $exe = Find-KimiExe $Config
+    if (-not $exe) {
+        if ($Config.kimiPath) { return "kimi not found at kimiPath '$($Config.kimiPath)' (~/.agworkbench.json)" }
+        return "kimi not found: set kimiPath in ~/.agworkbench.json, put kimi on PATH, or install it to ~\.kimi-code\bin\kimi.exe"
+    }
+    $doctor = Invoke-KimiDoctor $exe
+    if ($doctor.Code -ne 0) { return "'$exe doctor' failed (exit $($doctor.Code)): $($doctor.Output)" }
+    $guard = @('web-guard')
+    if ($Config.allowNetwork) { $guard += '--allow-network' }
+    $said = & python (Join-Path $script:Lib 'kimi.py') @guard 2>&1
+    if ($LASTEXITCODE -ne 0) { return (($said | ForEach-Object { "$_" }) -join "`n").Trim() }
+    return $null
+}
+
+function Assert-KimiReady($Config) {
+    $problem = Get-KimiProblem $Config
+    if ($problem) { throw [ImplementerConflict]::new("the Kimi implementer cannot start: $problem") }
 }
 
 # --- the terminal ----------------------------------------------------------------------------
@@ -259,12 +330,14 @@ function Get-ToolchainVersions {
         }
     } catch { $version = 'unversioned' }
     [pscustomobject] @{ Name = 'agworkbench'; Version = "$version ($script:Root)" }
-    foreach ($name in @('agwinterm', 'claude', 'codex', 'revmux', 'revdiff', 'gh')) {
+    foreach ($name in @('agwinterm', 'claude', 'codex', 'kimi', 'revmux', 'revdiff', 'gh')) {
         try {
             $arguments = @('--version')
             if ($name -eq 'agwinterm') {
                 $exe = Get-AgwintermCtl
                 $arguments = @('version')
+            } elseif ($name -eq 'kimi') {
+                $exe = Find-KimiExe $null        # PATH, then where its installer puts it (#65)
             } else { $exe = Find-Tool $name }
             $version = 'missing'
             if ($exe) { $version = Get-ToolVersion $exe $arguments }
@@ -513,6 +586,8 @@ function Test-ShellReady([string] $Text) {
     if (-not $rows.Count) { return $false }
     $frame = ($rows | Select-Object -Last 15) -join "`n"
     if ($frame -match 'esc to interrupt|bypass permissions|for shortcuts|Ask Codex|Chat from Workbench|Working|\[y/N\]|Do you trust|\(y/n\)') { return $false }
+    # Kimi Code (#65): its footer's mode label and context meter, its trust dialog, its composer box.
+    if ($frame -match ('Ask When Needed|Never Ask|context: \d+%|Trust this folder|(?m)^\s*[' + [char]0x256D + [char]0x2570 + ']' + [char]0x2500)) { return $false }
     # Rules around a composer are evidence of an agent even during a footer redraw.
     if ($frame -match ('(?m)^\s*[-' + [char]0x2500 + [char]0x2501 + [char]0x2014 + ']{10,}\s*$')) { return $false }
     $last = $rows[-1]
@@ -528,6 +603,7 @@ function Test-ImplementerRunningFrame([string] $Text, [string] $Tool) {
     if (-not $rows.Count) { return $false }
     $frame = ($rows | Select-Object -Last 15) -join "`n"
     if ($Tool -eq 'codex') { return $frame -match 'Ask Codex to do anything|for shortcuts|esc to interrupt' }
+    if ($Tool -eq 'kimi') { return $frame -match 'Ask When Needed|Never Ask|context: \d+%' }
     return $frame -match 'bypass permissions|for shortcuts|esc to interrupt'
 }
 
@@ -974,7 +1050,7 @@ function Resolve-Implementer {
        message or $null. #>
     param([string] $Checkout, [string] $Requested, $Config, $Tree, [switch] $NoProbe, $RequestedAutoMerge = $null,
           $RequestedAutonomous = $null)
-    if ($Requested -and -not (Test-ImplementerTool $Requested)) { throw [ImplementerConflict]::new("-Implementer must be codex or claude (got '$Requested')") }
+    if ($Requested -and -not (Test-ImplementerTool $Requested)) { throw [ImplementerConflict]::new("-Implementer must be codex, claude or kimi (got '$Requested')") }
     $saved = Get-SavedImplementerTool $Checkout
     $tool = $Config.implementer
     if ($saved) { $tool = $saved }
@@ -1115,6 +1191,13 @@ function Find-AgentRoot([string] $Checkout, [string] $Tool) {
         $needle = "shell_environment_policy.set.AI_HUB='" + (Join-Path $Checkout '.workbench') + "'"
         $matched = @($processes | Where-Object { $_.Name -eq 'codex.exe' -and $_.CommandLine -and
             $_.CommandLine.IndexOf($needle, [StringComparison]::OrdinalIgnoreCase) -ge 0 })
+    } elseif ($Tool -eq 'kimi') {
+        # `kimi -c` carries nothing of the checkout, so the mark is its parent: the pane's shell running
+        # pane-implementer-kimi.ps1 for exactly this checkout (#65).
+        $pane = '(?i)pane-implementer-kimi\.ps1.*-Checkout\s+["'']?' + [regex]::Escape($Checkout) + '["'']?(\s|$)'
+        $shells = @($processes | Where-Object { $_.Name -in @('pwsh.exe', 'powershell.exe') -and $_.CommandLine -match $pane } |
+            ForEach-Object { $_.ProcessId })
+        $matched = @($processes | Where-Object { $_.Name -eq 'kimi.exe' -and $shells -contains $_.ParentProcessId })
     } else {
         $id = Get-RecordedClaudeSessionId $Checkout 'implementer'
         if (-not $id) { return @() }
@@ -1155,6 +1238,29 @@ function Confirm-PaneStable([string] $Checkout, [string] $Pane, [string] $Tool, 
     }
 }
 
+function Get-FailoverTarget {
+    <# The tool a -Failover switches to (#65): the first in failoverOrder that is not the limited one,
+       has no recorded limit, and - for kimi - is usable (Get-KimiProblem). -NoProbe (the dry run)
+       skips that last check. Returns @{ Target; Reasons }, Target $null when no tool qualifies. #>
+    param([string] $Checkout, $Config, [string] $Saved, [switch] $NoProbe)
+    $recorded = Get-ImplementerLimits $Checkout
+    $reasons = @()
+    foreach ($tool in @($Config.failoverOrder)) {
+        if ($tool -eq $Saved) { continue }
+        if ($recorded.ContainsKey($tool)) {
+            $reasons += "$tool was recorded limited at $($recorded[$tool].at) ('$($recorded[$tool].line)'). Once it has reset, the human clears that with: github-workbench <issue> -Implementer $tool"
+            continue
+        }
+        if ($tool -eq 'kimi' -and -not $NoProbe) {
+            $problem = Get-KimiProblem $Config
+            if ($problem) { $reasons += "kimi is not usable: $problem"; continue }
+        }
+        return @{ Target = $tool; Reasons = $reasons }
+    }
+    if (-not $reasons.Count) { $reasons = @("failoverOrder ($(@($Config.failoverOrder) -join ', ')) names no tool but $Saved") }
+    return @{ Target = $null; Reasons = $reasons }
+}
+
 function Invoke-Failover {
     <# Stops a limited implementer (only when it is provably idle at its limit) or accepts an exited
        one, records the limit, clears the pane, and returns the tool to switch to. A refusal is an
@@ -1164,12 +1270,9 @@ function Invoke-Failover {
     if (-not $Config.failover) { throw [ImplementerConflict]::new('failover refused: "failover" is false in ~/.agworkbench.json') }
     $saved = Get-SavedImplementerTool $Checkout
     if (-not $saved) { throw [ImplementerConflict]::new('failover refused: this checkout has no recorded implementer') }
-    $target = 'claude'
-    if ($saved -eq 'claude') { $target = 'codex' }
-    $recorded = Get-ImplementerLimits $Checkout
-    if ($recorded.ContainsKey($target)) {
-        throw [ImplementerConflict]::new("failover refused: $target was recorded limited at $($recorded[$target].at) ('$($recorded[$target].line)'). Once it has reset, the human clears that with: github-workbench <issue> -Implementer $target")
-    }
+    $choice = Get-FailoverTarget -Checkout $Checkout -Config $Config -Saved $saved
+    if (-not $choice.Target) { throw [ImplementerConflict]::new("failover refused: $($choice.Reasons -join '; ')") }
+    $target = $choice.Target
     $pane = $null
     $registryPath = Join-Path $Checkout '.workbench\state\agents.json'
     if (Test-Path -LiteralPath $registryPath) {
@@ -1230,6 +1333,7 @@ function Invoke-Failover {
 
 function Get-ImplementerName([string] $Tool) {
     if ($Tool -eq 'claude') { return 'Claude implementer' }
+    if ($Tool -eq 'kimi') { return 'Kimi implementer' }
     return 'Codex'
 }
 
@@ -1994,6 +2098,11 @@ function Invoke-LauncherBody {
             $line = Get-PaneLaunch 'pane-implementer-claude.ps1' @{ Checkout = $co.Dir; Issue = $issueRef }
             return @{ Launch = $line; Restore = $line }
         }
+        if ($Tool -eq 'kimi') {
+            # Codex's pattern: the pin resumes Kimi's last session for this checkout (-c), if it has one.
+            return @{ Launch = (Get-PaneLaunch 'pane-implementer-kimi.ps1' @{ Checkout = $co.Dir; Issue = $issueRef });
+                      Restore = (Get-PaneLaunch 'pane-implementer-kimi.ps1' @{ Checkout = $co.Dir; Issue = $issueRef } -Switches @('Resume')) }
+        }
         return @{ Launch = (Get-PaneLaunch 'pane-codex.ps1' @{ Checkout = $co.Dir; Issue = $issueRef });
                   Restore = (Get-PaneLaunch 'pane-codex.ps1' @{ Checkout = $co.Dir; Issue = $issueRef } -Switches @('Resume')) }
     }
@@ -2011,11 +2120,26 @@ function Invoke-LauncherBody {
         Write-Step "implementer: $($resolved.Tool) (revmux profile $($resolved.RevmuxProfile)); auto-merge $(Format-AutoMerge $resolved.AutoMerge); autonomous $(Format-AutoMerge $resolved.Autonomous)"
         if ($resolved.Conflict) { Write-Step "would refuse unless the right pane is a shell: $($resolved.Conflict)" }
         if ($Failover) {
-            $target = 'claude'
-            if ($resolved.Tool -eq 'claude') { $target = 'codex' }
-            Write-Step "failover: would check the right pane, stop the limited $($resolved.Tool) only if it is idle at its limit (or accept a shell), record the limit, clear the pane, then switch to $target"
+            $choice = Get-FailoverTarget -Checkout $co.Dir -Config $config -Saved $resolved.Tool -NoProbe
+            if ($choice.Target) {
+                $probe = ''
+                if ($choice.Target -eq 'kimi') { $probe = ' (after checking that kimi is usable: the executable, kimi doctor, its web tools)' }
+                Write-Step "failover: would check the right pane, stop the limited $($resolved.Tool) only if it is idle at its limit (or accept a shell), record the limit, clear the pane, then switch to $($choice.Target)$probe"
+                foreach ($reason in $choice.Reasons) { Write-Step "failover: skipping $reason" }
+            } else {
+                Write-Step "failover: would refuse: $($choice.Reasons -join '; ')"
+            }
             if (-not $config.failover) { Write-Step 'failover: would refuse: "failover" is false' }
-            if ((Get-ImplementerLimits $co.Dir).ContainsKey($target)) { Write-Step "failover: would refuse: $target has a recorded limit" }
+        }
+        if ($resolved.Tool -eq 'kimi') {
+            # A dry run reports what the real launch would refuse on; it runs nothing (#65).
+            $exe = Find-KimiExe $config
+            if ($exe) { Write-Step "kimi: $exe; a real launch runs 'kimi doctor' first" }
+            else { Write-Step 'kimi: would refuse: kimi not found (kimiPath, PATH, ~\.kimi-code\bin\kimi.exe)' }
+            $guard = @('web-guard')
+            if ($config.allowNetwork) { $guard += '--allow-network' }
+            $said = (& python (Join-Path $script:Lib 'kimi.py') @guard 2>&1 | ForEach-Object { "$_" }) -join ' '
+            if ($LASTEXITCODE -ne 0) { Write-Step "kimi: would refuse: $said" } else { Write-Step 'kimi: web tools checked off (or allowNetwork)' }
         }
         Write-Step "right pane: $codexLaunch"
         $relayTool = ''
@@ -2041,6 +2165,9 @@ function Invoke-LauncherBody {
         }
         $resolved = Resolve-Implementer -Checkout $co.Dir -Requested $Implementer -Config $config -Tree (Get-Tree) -RequestedAutoMerge $AutoMerge -RequestedAutonomous $Autonomous
         if ($resolved.Conflict) { throw [ImplementerConflict]::new($resolved.Conflict) }
+        # Kimi is checked before anything is recorded, so a refusal changes nothing (#65). A failover
+        # to kimi checked it before it stopped the limited agent.
+        if ($resolved.Tool -eq 'kimi' -and -not $Failover) { Assert-KimiReady $config }
         Save-Implementer $co.Dir $resolved
         # The human choosing a tool explicitly says its limit has reset (#24).
         if ($Implementer -and -not $Failover) { Set-ImplementerLimit $co.Dir $Implementer $null }

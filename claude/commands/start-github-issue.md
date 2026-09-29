@@ -86,13 +86,13 @@ all stop you exactly as they do without autonomy.
   It logs every step to `.workbench/state/relay-close.log`, and never closes on a timeout alone:
   only unread implementer mail is overridden after the wait.
 
-## When the implementer is Claude
+## When the implementer is Claude or Kimi
 
-The right pane may run **Claude Code** instead of Codex (`implementer: "claude"` in
-`~/.agworkbench.json`, or `github-workbench -Implementer claude`, e.g. when Codex is out of quota).
-`.workbench/state/implementer.json` says which. Everything below still says "Codex" for the
-implementer: its mailbox box stays `codex`, the relay rings it the same way, and the loop is the same.
-The differences:
+The right pane may run **Claude Code** or **Kimi Code** instead of Codex (`implementer: "claude"` or
+`"kimi"` in `~/.agworkbench.json`, or `github-workbench -Implementer claude|kimi`, e.g. when Codex is
+out of quota). `.workbench/state/implementer.json` says which. Everything below still says "Codex"
+for the implementer: its mailbox box stays `codex`, the relay rings it the same way, and the loop is
+the same. The differences:
 
 - **Never commit the implementer's uncommitted work yourself** (this holds for either tool): both
   panes share one index. If something is left uncommitted, ask the implementer to commit it. Only
@@ -102,6 +102,14 @@ The differences:
   PowerShell tools) and, unless `allowNetwork` is set, the web tools. It still reads the issue from `.workbench/issue.md`.
 - `wb.py revmux` defaults to the `claude-only` revmux profile, so a review round does not depend on
   Codex's quota (a `revmuxProfile` key in `~/.agworkbench.json` overrides it).
+- **Kimi** (#65) has no waiter: like Codex, it ends its turn after it sends, and the relay's
+  `Chat from Workbench:` line wakes it. Its role is `.kimi-code/AGENTS.md` in the clone (the
+  launcher writes it and keeps it out of git; never commit it). In its shell, `git push` and `gh` are
+  refused. Its web tools are off unless `allowNetwork`: the launcher checks Kimi's own config for
+  that. It runs `--yolo`, so it may stop on an approval prompt for a command it rates dangerous. The
+  relay then holds its mail as for any dialog. Never answer it; tell the human (`wb.py status
+  blocked --sound`). A Kimi pane idle with a draft in its composer, or on a question, is the human's
+  to clear too.
 
 ## Usage limits (the relay's `usage limit:` mail)
 
@@ -126,8 +134,9 @@ desktop notification. It stops ringing a limited implementer: mail to it waits.
 
      If the agent already exited, it switches straight away. If it is still running, the launcher
      stops it only when it is provably idle at its limit (an unchanged pane, no `.git/index.lock`,
-     exactly one agent process). It records the limit, clears the pane, starts the other tool
-     there, and restarts the relay for it. It never types into the limited agent.
+     exactly one agent process). It records the limit, clears the pane, starts the next tool in
+     `failoverOrder` there (by default Codex and Claude replace each other, and a limited Kimi goes
+     to Claude), and restarts the relay for it. It never types into the limited agent.
   3. Hand over. Run `python "$AGWORKBENCH/lib/wb.py" handover`, then mail the new implementer
      (kind `task`, subject `HANDOVER`):
      - the current phase and plan version;
