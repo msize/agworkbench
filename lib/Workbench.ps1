@@ -1901,8 +1901,13 @@ function Resolve-IssueRef {
     if ($Ref -match '^#?(\d+)$') {
         $repo = $RepoHint
         if (-not $repo) {
-            $repo = (& gh repo view --json nameWithOwner --jq .nameWithOwner 2>$null)
-            if ($LASTEXITCODE -ne 0 -or -not $repo) {
+            # The origin, not `gh repo view`: in a fork's checkout gh names the fork's parent (#71).
+            $origin = & {
+                $ErrorActionPreference = 'Continue'
+                & git remote get-url origin 2>$null
+            }
+            $repo = Get-GitHubOriginRepo "$origin" -KeepCase
+            if (-not $repo) {
                 throw "'$Ref' is a bare issue number, and this directory is not a GitHub checkout. Use owner/repo#$($Matches[1]) or the issue URL."
             }
         }
@@ -1926,12 +1931,33 @@ function Get-IssueInfo([hashtable] $Issue) {
 
 # --- the checkout ----------------------------------------------------------------------------
 
-function Get-GitHubOriginRepo([string] $Url) {
-    # `owner/name` (lowercase) of a GitHub remote in https, ssh or scp form, else $null (cleanup.py's origin_repo).
+function Get-GitHubOriginRepo([string] $Url, [switch] $KeepCase) {
+    # `owner/name` (lowercase, or as spelled with -KeepCase) of a GitHub remote in https, ssh or scp
+    # form, else $null (cleanup.py's origin_repo, triage.github_repo).
     if ("$Url".Trim() -match '^(?:https?://(?:[^@/]+@)?github\.com/|ssh://git@github\.com/|git@github\.com:)([A-Za-z0-9][A-Za-z0-9_.-]*)/([A-Za-z0-9][A-Za-z0-9_.-]*?)(?:\.git)?/?$') {
-        return "$($Matches[1])/$($Matches[2])".ToLowerInvariant()
+        $repo = "$($Matches[1])/$($Matches[2])"
+        if ($KeepCase) { return $repo }
+        return $repo.ToLowerInvariant()
     }
     return $null
+}
+
+function Set-GitHubDefaultRepo([hashtable] $Issue) {
+    <# Pin gh's base repository in the current checkout to the issue's repo (#71). `gh repo clone` of a
+       fork marks its parent (the `upstream` remote) as the base, and every gh call without --repo then
+       reads and writes upstream - the agents' own `gh pr ...` included. Checked, not trusted. #>
+    $out = & {
+        $ErrorActionPreference = 'Continue'
+        & gh repo set-default $Issue.Repo 2>&1
+    }
+    if ($LASTEXITCODE -ne 0) { throw "gh repo set-default $($Issue.Repo) failed: $out" }
+    $default = & {
+        $ErrorActionPreference = 'Continue'
+        & gh repo set-default --view 2>&1
+    }
+    if ($LASTEXITCODE -ne 0 -or "$default".Trim() -ne $Issue.Repo) {
+        throw "gh's default repository here is '$("$default".Trim())', not $($Issue.Repo), after gh repo set-default"
+    }
 }
 
 function Get-NamedCheckoutMembership([string] $Dir, [hashtable] $Issue) {
@@ -2031,6 +2057,7 @@ function New-IssueCheckout {
     Connect-LaunchLog (Join-Path $dir '.workbench\state\launch.log')
     Push-Location $dir
     try {
+        Set-GitHubDefaultRepo $Issue           # in the checkout: queue mode's gh proxy runs in the cwd
         $existing = & git rev-parse --abbrev-ref HEAD
         if ($LASTEXITCODE -ne 0) { throw "git rev-parse failed in $dir (exit $LASTEXITCODE)" }
         if ($existing -notlike "issue-$($Issue.Number)-*") {
