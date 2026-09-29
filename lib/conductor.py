@@ -1510,45 +1510,55 @@ class Worker:
                 self.tick_sessions = None
         return self.tick_sessions
 
-    def has_session(self, data, m):
+    def session_live(self, data, m):
+        """The one answer to "is this member's issue session there" (#61): None when the terminal
+        cannot be read (nothing is stamped or cleared then), True when it is seen or has been missing
+        for less than SESSION_GRACE seconds - one blank read of a restarting terminal changes
+        nothing - and False after that. `sessionGoneSince` records when it was first missed."""
         live = self.live_numbers(data['repo'])
-        return live is None or m['number'] in live
+        if live is None:
+            return None
+        if m['number'] in live:
+            m.pop('sessionGoneSince', None)
+            return True
+        since = m.get('sessionGoneSince')
+        if type(since) not in (int, float):
+            since = m['sessionGoneSince'] = self.clock()
+        return self.clock() - since < SESSION_GRACE
 
     def hold_environment(self, data, m):
         """A blocked member keeps its slot while the cause is environmental - its report says so, or
-        its relay announced a usage limit - and its issue session is still in the terminal (#61),
-        under the same grace as watch_session. A question for the human frees it at once."""
+        its relay announced a usage limit, or its relay record cannot be read - and its session is
+        live (slot_by_session). A question for the human frees it at once."""
         key = f'environment #{m["number"]}'
         try:
             environmental = m.get('cause') == 'environment' or relay_limited(m)
             self.errors.pop(key, None)
         except (OSError, ValueError, AttributeError) as err:
             self.error(key, err)
-            environmental = m.get('cause') == 'environment'
+            environmental = True               # unknown: kept, and the session grace still ends it
         if environmental:
             self.slot_by_session(data, m)
         else:
-            m.pop('sessionGoneSince', None)
-            m['slotReleased'] = True
-
-    def watch_session(self, data, m):
-        """An active member with a PR or a resumed loop holds a slot (#61) that refresh_stale never
-        reclaims: it skips members with a PR, and an open issue without one stays active."""
-        self.slot_by_session(data, m)
+            m['slotReleased'] = True           # its session's stamp stays: the ceiling reads it
 
     def slot_by_session(self, data, m):
-        """The slot follows the member's issue session, re-decided every tick (#61): once the session
-        has been missing for SESSION_GRACE seconds the slot is released - one missed read of a
-        restarting terminal is not enough - and it is taken back when the session is seen again."""
-        if self.has_session(data, m):
-            m.pop('sessionGoneSince', None)
-            m['slotReleased'] = False
-            return
-        since = m.get('sessionGoneSince')
-        if type(since) not in (int, float):
-            since = m['sessionGoneSince'] = self.clock()
-        if self.clock() - since >= SESSION_GRACE:
-            m['slotReleased'] = True
+        """The slot follows the member's session, re-decided every tick (#61): held while
+        session_live, released once it is not, taken back when the session is seen again. An
+        unreadable terminal changes nothing. Used for environmental blocks, and for active members
+        with a PR or a resumed loop, whose slots refresh_stale never reclaims (it skips members with
+        a PR, and an open issue without one stays active)."""
+        live = self.session_live(data, m)
+        if live is not None:
+            m['slotReleased'] = not live
+
+    def forget_stale_stamps(self, data):
+        """After a readable tree, a member whose session is there has no gone-since stamp, whether or
+        not anything asked about it this tick: a stamp from an old blank read must not count later."""
+        if isinstance(self.tick_sessions, set):
+            for m in data['members']:
+                if m['number'] in self.tick_sessions:
+                    m.pop('sessionGoneSince', None)
 
     def collect_tool_limits(self, data):
         """Merge live members' recorded usage limits into the queue's toolLimits (#61). A record not
@@ -1575,15 +1585,14 @@ class Worker:
 
     def live_count(self, data):
         """Members with running agent sessions (#61): launching ones always, active ones that hold a
-        slot, and active, blocked, pr-open and close-pending ones while their issue session is in the
-        terminal."""
+        slot, and active, blocked, pr-open and close-pending ones while session_live is not False -
+        an unreadable terminal counts them all, and a blank read counts them until the grace ends."""
         count = 0
         for m in data['members']:
             if m['state'] == 'launching' or (m['state'] == 'active' and not m['slotReleased']):
                 count += 1
-            elif m['state'] == 'active' and self.has_session(data, m):
-                count += 1
-            elif (m['state'] in {'blocked', 'pr-open'} or m.get('closePending')) and self.has_session(data, m):
+            elif ((m['state'] in {'active', 'blocked', 'pr-open'} or m.get('closePending')) and
+                  self.session_live(data, m) is not False):
                 count += 1
         return count
 
@@ -1623,7 +1632,7 @@ class Worker:
                 if m['state'] == 'blocked':
                     self.hold_environment(data, m)
                 elif m['state'] == 'active' and (m.get('pr') or m.get('resumed')):
-                    self.watch_session(data, m)
+                    self.slot_by_session(data, m)      # a PR or resumed loop's slot (#61)
                 if m['state'] in {'active', 'blocked'} and not m.get('pr'):
                     try:
                         if adopt_done(data, m):
@@ -1698,6 +1707,7 @@ class Worker:
                             orphan_timeouts.append((m['number'], m['attempt'], m.get('token'), m['checkout'], unlocked))
                     elif not file_locked(self.store.directory / f'member-{m["number"]}.lock') and not checkout_locked(Path(m['checkout'])):
                         launches.append(dict(m))
+            self.forget_stale_stamps(data)
             settings = dict(data)
             if route:
                 settings['implementer'] = route     # this launch only; the queue's setting is the human's

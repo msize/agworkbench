@@ -2043,7 +2043,7 @@ class EnvironmentalBlocks(unittest.TestCase):
             for m in data['members'][:3]:
                 m.update(attempt=1, token=str(uuid.uuid4()), pr=f'https://github.com/o/r/pull/{m["number"]}',
                          state='pr-open', phase='pr-open', slotReleased=True)
-            data['members'][0].update(state='active', phase='active')
+            data['members'][0].update(state='active', phase='active', sessionGoneSince=self.now - q.SESSION_GRACE)
         self.sessions = {2, 3}
         w = self.worker()
         w.tick()
@@ -2067,6 +2067,9 @@ class EnvironmentalBlocks(unittest.TestCase):
         self.assertEqual(3, peak)
         self.sessions.discard(1)                    # one member's sessions close: one more may start
         w.tick()
+        self.assertEqual([1, 2, 3], self.launched())            # r4 M1: not on one blank read
+        self.now += q.SESSION_GRACE
+        w.tick()
         self.assertEqual([1, 2, 3, 4], self.launched())
 
     def test_an_unreadable_terminal_counts_every_member_as_live(self):
@@ -2081,8 +2084,72 @@ class EnvironmentalBlocks(unittest.TestCase):
         with patch.object(q.agw, 'tree', side_effect=q.agw.CtlError('no pipe')):
             w.tick()
         self.assertEqual([1], self.launched())
+        self.assertFalse(any('sessionGoneSince' in m for m in self.store.load()['members']))   # nothing stamped
         w.tick()                                    # readable, and none of them has a session
+        self.assertEqual([1], self.launched())      # r4 M1: one blank read admits nobody
+        self.now += q.SESSION_GRACE
+        w.tick()
         self.assertEqual([1, 4], self.launched())
+
+    def test_one_blank_read_at_the_ceiling_admits_nobody(self):
+        # r4 M1: the ceiling has the same grace as the slots.
+        self.start('o/r#1,2,3,4', parallel=1)
+        w = self.worker()
+        with self.store.transaction() as data:
+            for m in data['members'][:3]:
+                m.update(attempt=1, token=str(uuid.uuid4()), pr=f'https://github.com/o/r/pull/{m["number"]}',
+                         state='pr-open', phase='pr-open', slotReleased=True)
+        self.sessions = {1, 2, 3}
+        w.tick()
+        self.assertEqual([], self.launched())
+        self.sessions = set()                       # agwinterm restarting
+        w.tick()
+        self.assertEqual([], self.launched())
+        self.sessions = {1, 2, 3}                   # back: the stamps go
+        w.tick()
+        self.assertFalse(any('sessionGoneSince' in m for m in self.store.load()['members']))
+        self.sessions = {2, 3}                      # #1's sessions really close
+        w.tick()
+        self.assertEqual([], self.launched())
+        self.now += q.SESSION_GRACE
+        w.tick()
+        self.assertEqual([4], self.launched())
+
+    def test_an_unreadable_tree_changes_no_slot_and_no_stamp(self):
+        # r4 m2: a failed read neither re-takes a released slot nor resets its stamp.
+        self.start('o/r#1,2', parallel=1)
+        w = self.worker()
+        w.tick(); w.tick()
+        self.sessions = {1}
+        self.report(1, 'blocked', reason='x')
+        w.tick()
+        self.report(1, 'resumed')
+        w.tick()
+        self.sessions = set()
+        w.tick()
+        stamp = self.member(1)['sessionGoneSince']
+        self.now += q.SESSION_GRACE
+        w.tick()
+        self.assertTrue(self.member(1)['slotReleased'])
+        with patch.object(q.agw, 'tree', side_effect=q.agw.CtlError('no pipe')):
+            w.tick()
+        self.assertTrue(self.member(1)['slotReleased'])
+        self.assertEqual(stamp, self.member(1)['sessionGoneSince'])
+
+    def test_an_unreadable_relay_record_keeps_a_relay_held_slot(self):
+        # r4 m1: a plain block held by the relay's episode stays held when relay.json cannot be read.
+        self.start('o/r#1,2', parallel=1)
+        w = self.worker()
+        w.tick(); w.tick()
+        self.sessions = {1}
+        self.relay_episode(1)
+        self.report(1, 'blocked', reason='chooser')
+        w.tick()
+        self.assertFalse(self.member(1)['slotReleased'])
+        (Path(self.member(1)['checkout']) / '.workbench/state/relay.json').write_text('{broken', encoding='utf-8')
+        w.tick()
+        self.assertFalse(self.member(1)['slotReleased'])
+        self.assertEqual([1], self.launched())
 
 
 class ToolLimits(unittest.TestCase):
@@ -2582,7 +2649,7 @@ class PriorityOrder(unittest.TestCase):
     def admit_all(self, worker, count):
         for _ in range(count):
             worker.tick()
-            self.now += 20
+            self.now += 20 + q.SESSION_GRACE            # these members' sessions are gone (#61 ceiling)
             launched = self.launches[-1][0]
             self.report(launched)
             worker.tick()

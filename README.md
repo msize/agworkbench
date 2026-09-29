@@ -553,7 +553,9 @@ that with `wb.py loop-state blocked --environmental`, and a limit its relay anno
 A member that resumes takes a slot again. It gives the slot back once its issue session has been
 gone for two minutes, and takes it again if the session comes back. Whatever the slots say, the queue admits nothing while
 `parallel + 2` members have live sessions: launching, active, blocked, and open-PR or
-close-pending members whose issue session is still in the terminal. So with `-Parallel 1`,
+close-pending members whose issue session is still in the terminal. A
+session counts as gone only after two minutes missing, and an unreadable terminal counts every
+member as live. So with `-Parallel 1`,
 three PRs waiting for your merge stop new launches until you merge one or close its sessions.
 
 **Queue launch failures.** A transient launcher-start failure, launcher exit without a result,
