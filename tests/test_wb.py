@@ -2077,8 +2077,8 @@ class ForkGh:
     """gh in a checkout of fork/r, a fork of up/r (#71): gh's own base resolution picks the parent, so
     a call that does not name fork/r is recorded as unscoped (and answered as the parent would)."""
 
-    def __init__(self, repo='fork/r'):
-        self.repo = repo
+    def __init__(self, repo='fork/r', pr_repo=None):
+        self.repo, self.pr_repo = repo, pr_repo or repo
         self.calls, self.unscoped = [], []
 
     def names_repo(self, args):
@@ -2100,7 +2100,7 @@ class ForkGh:
             self.unscoped.append(argv)
         link = f'https://github.com/{self.repo}/actions/runs/11/job/22'
         if args[:2] == ['pr', 'view']:
-            return done(json.dumps(clean_pr(url=f'https://github.com/{self.repo}/pull/7', mergeStateStatus='BLOCKED')))
+            return done(json.dumps(clean_pr(url=f'https://github.com/{self.pr_repo}/pull/7', mergeStateStatus='BLOCKED')))
         if args[:1] == ['api']:
             return done(json.dumps([[]]))
         if args[:2] == ['pr', 'checks']:
@@ -2148,14 +2148,33 @@ class ForkCheckout(unittest.TestCase):
             with self.subTest(verb=verb):
                 self.assertEqual(verb + ['--repo', 'fork/r'], wb.scoped(verb, 'fork/r'))
 
-    def test_a_named_repo_or_url_is_left_alone(self):
+    def test_a_named_repo_is_left_alone(self):
         for args in (['issue', 'view', '5', '--repo', 'up/r'], ['issue', 'view', '5', '-R', 'up/r'],
                      ['issue', 'view', '5', '--repo=up/r'], ['issue', 'view', '5', '-Rup/r'],
-                     ['pr', 'view', 'https://github.com/up/r/pull/7'],
-                     ['issue', 'comment', '5', '--repo', 'github.com/Fork/R', '--body', 'x'],
-                     ['pr', 'merge', 'https://github.com/FORK/r/pull/7']):
+                     ['issue', 'comment', '5', '--repo', 'github.com/Fork/R', '--body', 'x']):
             with self.subTest(args=args):
                 self.assertEqual(args, wb.scoped(args, 'fork/r'))          # reads anywhere; writes here, any case
+
+    def test_a_url_argument_still_gets_the_repo(self):
+        # r1 M1: gh takes the URL's repo over --repo; the append means a misread can never drop it.
+        for args in (['pr', 'view', 'https://github.com/up/r/pull/7'], ['pr', 'merge', 'https://github.com/FORK/r/pull/7']):
+            with self.subTest(args=args):
+                self.assertEqual(args + ['--repo', 'fork/r'], wb.scoped(args, 'fork/r'))
+
+    def test_flag_values_are_never_read_as_flags_or_arguments(self):
+        # r1 M1: a title like `-Recurse ...` read as `-R ecurse ...` made filing fail forever; a title that
+        # was a URL dropped the --repo and left the repo to gh's base - the #71 bug itself.
+        for args in (['issue', 'create', '--title', '-Recurse is dropped', '--body-file', 'x'],
+                     ['issue', 'create', '--title', '-R', '--body-file', 'x'],
+                     ['issue', 'create', '--title', 'https://github.com/up/r/issues/3', '--body-file', 'x'],
+                     ['issue', 'create', '--title=-Rx'], ['issue', 'create', '-t', '-R'],
+                     ['issue', 'create', '--body', '--repo up/r'], ['issue', 'create', '--body', '--repo=up/r'],
+                     ['issue', 'list', '--search', '"-R up/r" in:title', '--json', 'title'],
+                     ['issue', 'edit', '5', '--add-label', '-Rup/r']):
+            with self.subTest(args=args):
+                self.assertEqual(args + ['--repo', 'fork/r'], wb.scoped(args, 'fork/r'))
+        self.assertEqual(['issue', 'create', '--title', 't', '--repo', 'fork/r', '--', '-R'],
+                         wb.scoped(['issue', 'create', '--title', 't', '--', '-R'], 'fork/r'))
 
     def test_a_write_to_another_repo_is_refused(self):
         for args in (['issue', 'create', '--title', 't', '--repo', 'up/r'],
@@ -2257,11 +2276,11 @@ class ForkCheckout(unittest.TestCase):
         self.assertIn("In a fork's clone gh's own default is the fork's **parent**", text)
 
     def test_merge_check_refuses_a_pr_of_another_repo(self):
-        gh = ForkGh()
-        with patch.object(wb, 'fetch_pr', return_value=(clean_pr(url='https://github.com/up/r/pull/1'), [])):
-            self.assertEqual(1, self.run_wb('merge-check', '--pr', 'https://github.com/up/r/pull/1', '--head', HEAD, gh=gh))
-        self.assertEqual("repo: PR https://github.com/up/r/pull/1 is in up/r, not this workbench's repo fork/r",
+        gh = ForkGh(pr_repo='up/r')
+        self.assertEqual(1, self.run_wb('merge-check', '--pr', 'https://github.com/up/r/pull/7', '--head', HEAD, gh=gh))
+        self.assertEqual("repo: PR https://github.com/up/r/pull/7 is in up/r, not this workbench's repo fork/r",
                          self.out.getvalue().strip())
+        self.assertEqual([['pr', 'view']], [c[1:3] for c in gh.calls])       # nothing more is read of it
 
 if __name__ == '__main__':
     unittest.main()

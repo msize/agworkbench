@@ -795,6 +795,16 @@ REPO_WRITES = {
     "run": {"rerun", "cancel", "delete"},
 }
 URL_REPO = re.compile(r"https?://github\.com/([^/\s]+/[^/\s]+)/(?:issues|pull|actions/runs)/\d+\S*", re.I)
+# The value-taking flags of the issue/pr/label/run commands: their value is never a flag or an argument (r1 M1).
+# `-e` (a value for `run list`, a switch for `issue create`) is left out: the workbench passes neither.
+VALUE_FLAGS = {"-R", "--repo", "-t", "--title", "-b", "--body", "-F", "--body-file", "-S", "--search", "-l", "--label",
+               "--add-label", "--remove-label", "-H", "--head", "-B", "--base", "-s", "--state", "--json", "-q", "--jq",
+               "-T", "--template", "-L", "--limit", "-c", "--color", "--comment", "-d", "--description", "-j", "--job",
+               "--match-head-commit", "-r", "--reason", "-a", "--assignee", "--add-assignee", "--remove-assignee",
+               "-m", "--milestone", "-A", "--author", "-p", "--project", "--add-project", "--remove-project",
+               "--subject", "--app", "--mention", "--duplicate-of", "-w", "--workflow", "--branch", "--event",
+               "-u", "--user", "--commit", "--status", "--attempt", "-n", "--name", "-i", "--interval",
+               "--reviewer", "--add-reviewer", "--remove-reviewer", "--required-checks"}
 API_VALUE_FLAGS = {"-X", "--method", "-f", "--raw-field", "-F", "--field", "-H", "--header", "--input",
                    "-q", "--jq", "-t", "--template", "--hostname", "--cache", "-p", "--preview"}
 API_FIELD_FLAGS = ("-f", "--raw-field", "-F", "--field", "--input")
@@ -824,19 +834,29 @@ def repo_value(value: str) -> str:
     return "/".join(parts[-2:]) if len(parts) == 3 else value.strip()
 
 
-def named_repo(args: list[str]) -> str | None:
-    for i, arg in enumerate(args):
-        if arg in ("--repo", "-R") and i + 1 < len(args):
-            return repo_value(args[i + 1])
-        if arg.startswith("--repo="):
-            return repo_value(arg[len("--repo="):])
-        if arg.startswith("-R") and len(arg) > 2:
-            return repo_value(arg[2:])
-    for arg in args:
-        match = URL_REPO.fullmatch(arg)
-        if match:
-            return match[1]
-    return None
+def split_args(args: list[str]) -> tuple[str | None, list[str]]:
+    """(the `--repo` value, the positional arguments) of an issue/pr/label/run call, read the way gh
+    reads it: a flag's value - a title like `-Recurse` or a URL - is never a flag or an argument (r1 M1).
+    An unknown flag is taken for a switch, so its value would count as an argument, never as a repo."""
+    repo, positional, i = None, [], 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            positional += args[i + 1:]
+            break
+        if not arg.startswith("-") or arg == "-":
+            positional.append(arg)
+            i += 1
+            continue
+        long = arg.startswith("--")
+        name = arg.split("=", 1)[0] if long else arg[:2]
+        joined = "=" in arg if long else len(arg) > 2        # --title=x, -tx: the value is in this token
+        takes = name in VALUE_FLAGS
+        if name in ("--repo", "-R"):
+            value = (arg[len(name) + 1:] if long else arg[2:]) if joined else (args[i + 1] if i + 1 < len(args) else "")
+            repo = repo_value(value)
+        i += 2 if takes and not joined else 1
+    return repo, positional
 
 
 def refuse(what: str, target: str, repo: str) -> ForeignRepo:
@@ -886,11 +906,16 @@ def scoped(args: list[str] | tuple[str, ...], repo: str) -> list[str]:
     if args[:1] == ["api"]:
         return scoped_api(args, repo)
     if args[:1] and args[0] in REPO_WRITES:
-        target = named_repo(args[1:])
-        if target is None:
-            return args + ["--repo", repo]
-        if not same_repo(target, repo) and args[1:2] and args[1] in REPO_WRITES[args[0]]:
+        named, positional = split_args(args[2:])
+        url = next((match[1] for match in map(URL_REPO.fullmatch, positional) if match), None)
+        target = named or url
+        if target and not same_repo(target, repo) and args[1:2] and args[1] in REPO_WRITES[args[0]]:
             raise refuse(' '.join(args[:2]), target, repo)
+        # --repo whenever no flag names one: a URL argument wins over it in gh, and a value we misread
+        # can then never leave the repo to gh's base (r1 M1).
+        if named is None:
+            at = args.index("--", 2) if "--" in args[2:] else len(args)     # before `--`, still a flag
+            return args[:at] + ["--repo", repo] + args[at:]
     return args
 
 
@@ -1472,11 +1497,14 @@ def gh_json(*args: str, cwd: Path | None = None):
     return json.loads(done.stdout)
 
 
-def fetch_pr(pr_ref: str) -> tuple[dict, list[dict]]:
+def fetch_pr(pr_ref: str, repo: str | None = None) -> tuple[dict, list[dict]]:
+    """ForeignRepo when the PR is not in repo: the merge that follows the gate must land there (#71)."""
     pr = gh_json("pr", "view", pr_ref, "--json", PR_FIELDS)
     match = re.match(r"https://github\.com/([^/]+/[^/]+)/pull/(\d+)", pr.get("url") or "")
     if not match:
         raise RuntimeError(f"cannot tell the repository from PR url {pr.get('url')!r}")
+    if repo and not same_repo(match[1], repo):
+        raise ForeignRepo(f"PR {pr['url']} is in {match[1]}, not this workbench's repo {repo}")
     pages = gh_json("api", f"repos/{match[1]}/pulls/{match[2]}/comments", "--paginate", "--slurp")
     inline = [comment for page in pages for comment in page] if pages and isinstance(pages[0], list) else list(pages or [])
     return pr, inline
@@ -1487,14 +1515,8 @@ def cmd_merge_check(args: argparse.Namespace) -> int:
         print("wb: merge-check --head needs the full 40-character SHA the suite ran on", file=sys.stderr)
         return 2
     root = checkout()
-    repo = workbench_repo(root)
     try:
-        pr, inline = fetch_pr(args.pr)
-        # The merge that follows this gate must land on the workbench's own repo (#71).
-        where = (re.match(r"https://github\.com/([^/]+/[^/]+)/pull/", pr.get("url") or "") or [None, None])[1]
-        if where and not same_repo(where, repo):
-            print(f"repo: PR {pr.get('url')} is in {where}, not this workbench's repo {repo}")
-            return 1
+        pr, inline = fetch_pr(args.pr, workbench_repo(root))
         checks = None
         # CI is classified only for the tested head: checks of another commit mean nothing (#32).
         if (pr.get("headRefOid") or "").lower() == args.head.lower() and pr.get("state") == "OPEN" \
