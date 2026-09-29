@@ -82,8 +82,9 @@ Minor, Immaterial and plan items from one PR go into one checklist issue named
 `Leftovers from #N: <issue title>`. Major and blocker items get their own issue. The planner must
 explicitly add `--own-issue` for a planned out-of-scope feature the spec needs, regardless of
 severity. A deferred review point is still recorded with `follow-up add` before filing.
-Before merge-check, file them all with `python "$AGWORKBENCH/lib/wb.py" follow-up file --source <N> --pr <P>`
-(`--pr is required` while `followUp.dedupe` is on, the default). It labels a new issue `follow-up`
+**File them as soon as the PR exists** - right after `gh pr create` (Phase 5), and again right after
+recording any later one - and in any case before merge-check, with
+`python "$AGWORKBENCH/lib/wb.py" follow-up file --source <N> --pr <P>` (`--pr is required` while `followUp.dedupe` is on, the default). It labels a new issue `follow-up`
 (`follow-up-nested` when this issue is itself a follow-up) and adds the planner marker. With dedupe on
 (#42) it first looks for an existing issue describing the same problem: the same normalised title
 among the follow-up issues, or an unchecked checklist line in an open, trusted leftovers issue,
@@ -358,7 +359,8 @@ yourself before reviewing it: `git log --oneline origin/<default>..HEAD` and
    It reads `.workbench/review/revmux-r<K>.md` and counts the Blocker, Critical and Major findings.
    When one of them did not verify (you could not reproduce it, or it is really a Minor), pass the
    verified count with the reason: `--severe <n> --reason "<why>"`. Never go below revmux's count
-   without a reason. Exit 2 means the report is incomplete or the config is invalid: look, do not guess.
+   without a reason. The difference counts as Minor findings, so the round stops rather than reads
+   clean. Exit 2 means the report is incomplete or the config is invalid: look, do not guess.
    It prints one decision:
 
    | decision | when | next |
@@ -366,7 +368,7 @@ yourself before reviewing it: `git log --oneline origin/<default>..HEAD` and
    | `continue` | a verified Major+, a degraded run, or `review.stopWhenNoMajor` is false or `review.minRounds` is not reached | `FIX r<K>`, then round K+1 |
    | `stop` | no verified Major+ (and at or past `minRounds`) | `FIX r<K> (final)`: no revmux round after it |
    | `clean` | no findings at all | review is done |
-   | `cap` | round 5 still has a Major+ or is degraded | `FIX r5`, then the human (with `stopWhenNoMajor: false`, today's rule: the fixes verified, as condition 1 says) |
+   | `cap` | round 5 or later still has a Major+ or is degraded | `FIX r5`, then the human (with `stopWhenNoMajor: false`, today's rule: the fixes verified, as condition 1 says) |
 
 5. Send the verified findings to Codex (kind `review`, subject `FIX r<K>`, or `FIX r<K> (final)`
    after a `stop`): one block per finding with file:line, the failure it causes, and your evidence.
@@ -394,8 +396,14 @@ gh pr create --repo <owner/repo> --base <default> --title "<title>" --body-file 
 
 The body: what changed and why, `Closes #<N>`, how it was tested, and the review record - rounds
 run, findings fixed, findings disputed and why, and the line `wb.py review-round --summary` prints
-(why review ended; deferred minors read "filed at merge" here). It ends with the planner marker line. The relay notices the PR on its next check and
-watches it from then on.
+(why review ended; leave it out when it exits 2, meaning no revmux round was recorded).
+It ends with the planner marker line. The relay notices the PR on its next check and watches it from then on.
+
+**A stop's deferred minors are filed now**, with or without auto-merge - nothing later files them
+when the human merges: right after `gh pr create`, run
+`python "$AGWORKBENCH/lib/wb.py" follow-up file --source <N> --pr <P>`, run `review-round --summary`
+again, put its line (now with the leftovers URL) in `.workbench/pr-body.md`, and
+`gh pr edit <P> --body-file .workbench/pr-body.md`.
 
 ## Phase 6 - the human's review
 
@@ -412,8 +420,9 @@ on, you merge only when **all** of these hold:
    before merge-check, with or without autonomy. With full autonomy, a
    remaining Minor or Immaterial finding may also be deferred **with a filed follow-up issue**; a
    Major or blocker never may, disputed or not. A round that ended with open findings goes to the
-   human instead. merge-check refuses a last round that decided `continue`, a `cap` with a Major, and
-   a revmux report with no recorded decision.
+   human instead. merge-check refuses a last round that decided `continue`; a `cap` (a Major or a
+   degraded run at round 5 or later) unless it was recorded with `stopWhenNoMajor: false`; and a
+   revmux report with no recorded decision.
 2. **The whole suite passed on the PR head.** Note that commit's full SHA (`git rev-parse HEAD`
    after the push) and the test count. Run it with `wb.py suite --label <sha7> -- <command>` (see
    Rules). The result arrives as mail from `helper`.
@@ -512,7 +521,7 @@ reviews, comments, line comments, the review decision). For each round of it:
    `gh pr comment` rather than turning it into code.
 2. Send the change requests to Codex as a fix round. Review the fix - a direct diff read for small
    changes, another revmux round for substantial ones (recorded with `review-round` like any
-   other, or merge-check refuses its report).
+   other, round 6 and later included, or merge-check refuses its report; a Major there is a `cap`).
 3. Push, and reply on the PR saying what changed for each point.
 
 ## Phase 7 - done

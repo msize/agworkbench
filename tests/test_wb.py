@@ -1309,11 +1309,14 @@ class ReviewRound(unittest.TestCase):
                 self.assertEqual('review: cap', self.decision(5, text))
         self.assertEqual('review: stop', self.decision(5, revmux_report([('Minor', 1)])))
 
-    def test_past_the_cap_is_refused_and_nothing_is_recorded(self):
-        self.assertEqual(2, self.record(6, revmux_report([('Minor', 1)])))
-        self.assertIn("the five-round cap is past; this is the human's", self.err.getvalue())
+    def test_a_round_past_the_cap_is_recorded(self):
+        # r1 m2: a round the human asks for after the PR can be round 6; a Major there is still the cap.
         self.assertEqual(2, self.record(0, revmux_report([('Minor', 1)])))
         self.assertEqual([], self.entries())
+        self.assertEqual('review: cap', self.decision(6, revmux_report([('Major', 1)])))
+        self.assertEqual((1, ["review: round 6 had a Major at the cap - this is the human's"]), self.merge_check())
+        self.assertEqual('review: stop', self.decision(6, revmux_report([('Minor', 1)])))
+        self.assertEqual((0, ['ok']), self.merge_check())
 
     def test_stop_when_no_major_off_keeps_todays_rule(self):
         # AC3
@@ -1381,6 +1384,14 @@ class ReviewRound(unittest.TestCase):
         self.assertEqual('review: stop', self.decision(2, major, '--severe', '0', '--reason', 'not reproducible'))
         self.assertEqual((1, 0, 'not reproducible'),
                          (self.entries()[-1]['revmuxSevere'], self.entries()[-1]['severe'], self.entries()[-1]['reason']))
+        # r1 M1: a Major verified lower is still a finding - never `clean`, and the stop rules apply.
+        only_major = revmux_report([('Major', 1)])
+        self.assertEqual('review: stop', self.decision(2, only_major, '--severe', '0', '--reason', 'really a Minor'))
+        self.configure({'minRounds': 3})
+        self.assertEqual('review: continue', self.decision(2, only_major, '--severe', '0', '--reason', 'really a Minor'))
+        self.configure({'stopWhenNoMajor': False})
+        self.assertEqual('review: continue', self.decision(2, only_major, '--severe', '0', '--reason', 'really a Minor'))
+        self.configure({})
         # Raising it needs no reason.
         self.assertEqual('review: continue', self.decision(2, revmux_report([('Minor', 1)]), '--severe', '1'))
 
@@ -1430,7 +1441,7 @@ class ReviewRound(unittest.TestCase):
                         {'key': 'r1-m1', 'severity': 'minor', 'origin': 'review r1'},
                         {'key': 'plan-x', 'severity': 'plan', 'origin': 'plan'})
         self.wb('review-round', '--summary')
-        self.assertEqual('review stopped: round 2 had no Major; 2 minor finding(s) deferred as follow-ups (filed at merge)',
+        self.assertEqual('review stopped: round 2 had no Major; 2 minor finding(s) deferred as follow-ups (not filed yet)',
                          self.out.getvalue().strip())
         self.follow_ups({'key': 'r2-m1', 'severity': 'minor', 'origin': 'review r2', 'url': leftovers},
                         {'key': 'r2-m2', 'severity': 'minor', 'origin': 'review r2', 'url': leftovers})
@@ -1438,7 +1449,25 @@ class ReviewRound(unittest.TestCase):
         self.assertEqual(f'review stopped: round 2 had no Major; 2 minor finding(s) in {leftovers}', self.out.getvalue().strip())
         self.decision(3, revmux_report([('Major', 1)]), '--severe', '0', '--reason', 'verified as Minor')
         self.wb('review-round', '--summary')
-        self.assertEqual('review clean after round 3 (revmux 1 Major+, verified 0: verified as Minor)',
+        self.assertEqual(f'review stopped: round 3 had no Major; 2 minor finding(s) from round 2 in {leftovers} '
+                         '(revmux 1 Major+, verified 0: verified as Minor)', self.out.getvalue().strip())
+
+    def test_summary_keeps_an_earlier_stops_minors_and_covers_the_cap(self):
+        # r1 m1 and m3
+        leftovers = 'https://github.com/o/r/issues/90'
+        self.decision(2, revmux_report([('Minor', 2)]))
+        self.decision(3, revmux_report(no_findings=True))
+        self.follow_ups({'key': 'r2-m1', 'severity': 'minor', 'origin': 'review r2', 'url': leftovers})
+        self.assertEqual(0, self.wb('review-round', '--summary'))
+        self.assertEqual(f'review clean after round 3; 1 minor finding(s) from round 2 in {leftovers}',
+                         self.out.getvalue().strip())
+        self.decision(5, revmux_report([('Major', 1)]))
+        self.assertEqual(1, self.wb('review-round', '--summary'))
+        self.assertEqual('review: round 5 decided cap; no summary yet', self.out.getvalue().strip())
+        self.configure({'stopWhenNoMajor': False})
+        self.decision(5, revmux_report([('Major', 1)]))
+        self.assertEqual(0, self.wb('review-round', '--summary'))
+        self.assertEqual(f'review ended at the five-round cap (round 5); 1 minor finding(s) from round 2 in {leftovers}',
                          self.out.getvalue().strip())
 
     # --- merge-check -------------------------------------------------------------------------------
@@ -1457,6 +1486,14 @@ class ReviewRound(unittest.TestCase):
         code, lines = self.merge_check()
         self.assertEqual(1, code)
         self.assertIn("the major finding 'r2-M1' is deferred", lines[0])
+
+    def test_a_later_clean_round_does_not_ungate_a_stops_minors(self):
+        # r1 m1
+        self.decision(2, revmux_report([('Minor', 2)]))
+        self.decision(3, revmux_report(no_findings=True))
+        self.follow_ups({'key': 'r2-m1', 'severity': 'minor', 'origin': 'review r2'})
+        self.assertEqual((1, ["follow-up: 'r2-m1' is not filed yet - run wb.py follow-up file, then check again"]),
+                         self.merge_check())
 
     def test_merge_check_on_continue_and_cap(self):
         # AC8
@@ -1480,7 +1517,7 @@ class ReviewRound(unittest.TestCase):
         self.assertEqual((0, ['ok']), self.merge_check())
 
     def test_a_report_without_a_recorded_decision_fails_the_gate(self):
-        self.assertEqual((0, ['ok']), self.merge_check())                     # neither: a loop older than #64
+        self.assertEqual((0, ['ok']), self.merge_check())                     # neither: no revmux round ran
         (self.reviews / 'revmux-r1.md').write_text(revmux_report([('Minor', 1)]), encoding='utf-8')
         self.assertEqual((1, ['review: revmux round 1 has no recorded decision - run wb.py review-round --round 1']),
                          self.merge_check())
@@ -1921,20 +1958,31 @@ class ReviewRoundProse(unittest.TestCase):
                        'A round with a Major gets another round after its fix', 'At most five revmux rounds']:
             self.assertIn(needle, phase4)
         self.assertLess(phase4.index('review-round --round <K>'), phase4.index('Send the verified findings'))
-        self.assertIn('wb.py review-round --summary', text.split('## Phase 5')[1].split('## Phase 6')[0])
+        self.assertIn('The difference counts as Minor findings, so the round stops rather than reads clean', phase4)
+        phase5 = text.split('## Phase 5')[1].split('## Phase 6')[0]
+        # r1 M2: without auto-merge nothing later files a stop's minors, so they are filed with the PR.
+        for needle in ['wb.py review-round --summary', 'leave it out when it exits 2',
+                       "**A stop's deferred minors are filed now**, with or without auto-merge",
+                       'wb.py" follow-up file --source <N> --pr <P>`, run `review-round --summary` again',
+                       'gh pr edit <P> --body-file .workbench/pr-body.md']:
+            self.assertIn(needle, phase5)
+        self.assertLess(phase5.index('gh pr create'), phase5.index('gh pr edit <P>'))
+        self.assertNotIn('filed at merge', text)
         phase6 = text.split('## Phase 6')[1].split('## Phase 7')[0]
         for needle in ['A review that **stopped**', 'fixed or recorded as a follow-up',
                        '`follow-up file --source <N> --pr <P>`) before merge-check, with or without autonomy',
                        'a revmux report with no recorded decision', '<the `wb.py review-round --summary` line>',
                        'review stopped: round K had no Major; N minor finding(s) in <leftovers URL>',
-                       'recorded with `review-round` like any other']:
+                       'recorded with `review-round` like any other', 'round 6 and later included',
+                       'unless it was recorded with `stopWhenNoMajor: false`']:
             self.assertIn(needle, phase6)
 
     def test_follow_ups_are_reachable_without_autonomy(self):
         text = self.text('claude/commands/start-github-issue.md')
         section = text.split('## Follow-ups')[1].split('## ')[0]
         self.assertIn('With or without autonomy', section)
-        for needle in ['wb.py" follow-up add --key', 'follow-up file --source <N> --pr <P>', 'never lower it below revmux']:
+        for needle in ['wb.py" follow-up add --key', 'follow-up file --source <N> --pr <P>', 'never lower it below revmux',
+                       '**File them as soon as the PR exists**']:
             self.assertIn(needle, section)
         self.assertIn('as "Follow-ups" below says', text.split('## Full autonomy')[1].split('## Follow-ups')[0])
 

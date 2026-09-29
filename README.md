@@ -613,8 +613,9 @@ from then on, and `-DryRun` shows the record it would clear. The limit strings c
 Review stops once a verified revmux round has no Blocker, Critical or Major finding (#64): that
 round's fix is the last, its Minor findings are fixed if cheap and otherwise go to the PR's
 "Leftovers from #N" issue, and no further revmux round runs. The planner records each round with
-`wb.py review-round --round K`, which prints `continue`, `stop`, `clean` or `cap` (round 5). A
-degraded round never stops review. `wb.py review-round --summary` prints the line the PR body and
+`wb.py review-round --round K`, which prints `continue`, `stop`, `clean` or `cap` (round 5 or later).
+A degraded round never stops review. The planner files a stop's deferred minors right after it
+opens the PR, whether or not auto-merge is on. `wb.py review-round --summary` prints the line the PR body and
 the merge note carry, e.g. `review stopped: round 2 had no Major; 3 minor finding(s) in <URL>`.
 
 That check is read-only. It requires:
@@ -623,8 +624,9 @@ That check is read-only. It requires:
 - there is no unread mail from you (`human`) or from GitHub;
 - the relay has seen the PR open;
 - the PR head is the tested commit;
-- every revmux report has a recorded decision, and the last one is not `continue` (nor a `cap`
-  with a Major); after a `stop`, every recorded follow-up is filed;
+- every revmux report has a recorded decision, and the last one is not `continue`, nor a `cap` (a
+  Major or a degraded run at round 5 or later) unless `stopWhenNoMajor` was off; after any `stop`,
+  every recorded follow-up is filed;
 - **no hold**: a label (`do-not-merge`, `hold`, `wip`), the title, or any unmarked description,
   comment, review or line comment containing `hold`, `wait`, `waiting`, `wip`, or `do not merge` in
   any spelling (`don't`, `dont`, `do-not-merge`, typographic apostrophes, markdown emphasis, any
