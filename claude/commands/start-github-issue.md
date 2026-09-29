@@ -421,8 +421,8 @@ on, you merge only when **all** of these hold:
    remaining Minor or Immaterial finding may also be deferred **with a filed follow-up issue**; a
    Major or blocker never may, disputed or not. A round that ended with open findings goes to the
    human instead. merge-check refuses a last round that decided `continue`; a `cap` (a Major or a
-   degraded run at round 5 or later) unless it was recorded with `stopWhenNoMajor: false`; and a
-   revmux report with no recorded decision.
+   degraded run at round 5 or later) unless it was recorded with `stopWhenNoMajor: false`; and the
+   newest revmux report when it has no recorded decision.
 2. **The whole suite passed on the PR head.** Note that commit's full SHA (`git rev-parse HEAD`
    after the push) and the test count. Run it with `wb.py suite --label <sha7> -- <command>` (see
    Rules). The result arrives as mail from `helper`.

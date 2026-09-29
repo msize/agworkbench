@@ -624,7 +624,7 @@ That check is read-only. It requires:
 - there is no unread mail from you (`human`) or from GitHub;
 - the relay has seen the PR open;
 - the PR head is the tested commit;
-- every revmux report has a recorded decision, and the last one is not `continue`, nor a `cap` (a
+- the newest revmux report has a recorded decision, and the last one is not `continue`, nor a `cap` (a
   Major or a degraded run at round 5 or later) unless `stopWhenNoMajor` was off; after any `stop`,
   every recorded follow-up is filed;
 - **no hold**: a label (`do-not-merge`, `hold`, `wip`), the title, or any unmarked description,

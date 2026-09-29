@@ -1349,6 +1349,20 @@ class ReviewRound(unittest.TestCase):
                          self.decision(2, revmux_report(statuses=('DEGRADED, reported nothing',), no_findings=True)))
         self.assertEqual('review: cap (degraded)', self.decision(5, revmux_report(minor, ('rate limited: x',))))
 
+    def test_a_finding_that_quotes_the_degraded_line_is_not_a_degraded_run(self):
+        # r2 m1: round 2's own report quoted the phrase in a finding title and body, every row ok.
+        quoting = revmux_report([('Minor', 1)]).replace(
+            '### finding 0\n\nevidence\n',
+            '### The degraded check matches `This run is DEGRADED` anywhere in the report text\n\n'
+            '`degraded = "This run is DEGRADED" in text` searches the whole report.\n'
+            'This run is DEGRADED: quoted at the start of a body line, still inside the finding.\n')
+        self.assertIn('This run is DEGRADED: quoted', quoting)
+        self.assertEqual('review: stop', self.decision(2, quoting))
+        # revmux's own line, before the findings or dressed as a quote/emphasis, still counts.
+        for extra in ('This run is DEGRADED: 3 of 4 sources ran', '> This run is DEGRADED: x', '**This run is DEGRADED: x**'):
+            with self.subTest(extra=extra):
+                self.assertEqual('review: continue (degraded)', self.decision(2, revmux_report([('Minor', 1)], extra=extra)))
+
     def test_an_incomplete_report_is_refused_and_nothing_is_recorded(self):
         # AC6: revmux writes the Sources table last, so a crashed run has none.
         header_only = '# Review: workbench / r1\n\nscope: `x`\n'
@@ -1971,7 +1985,7 @@ class ReviewRoundProse(unittest.TestCase):
         phase6 = text.split('## Phase 6')[1].split('## Phase 7')[0]
         for needle in ['A review that **stopped**', 'fixed or recorded as a follow-up',
                        '`follow-up file --source <N> --pr <P>`) before merge-check, with or without autonomy',
-                       'a revmux report with no recorded decision', '<the `wb.py review-round --summary` line>',
+                       'the newest revmux report when it has no recorded decision', '<the `wb.py review-round --summary` line>',
                        'review stopped: round K had no Major; N minor finding(s) in <leftovers URL>',
                        'recorded with `review-round` like any other', 'round 6 and later included',
                        'unless it was recorded with `stopWhenNoMajor: false`']:

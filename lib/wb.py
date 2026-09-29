@@ -546,8 +546,11 @@ def parse_revmux_report(text: str) -> dict:
     a `## Sources` status that is not `ok` (`ok, nothing raised` is), or revmux's own DEGRADED line.
     A report without a Sources row is incomplete - revmux writes it last, so a crashed run has none."""
     counts = {name: 0 for name in SEVERE_SECTIONS + MINOR_SECTIONS + APART_SECTIONS}
-    known, section, statuses = False, None, []
+    known, section, statuses, flagged = False, None, [], False
     for line in text.splitlines():
+        # revmux's own line, outside any finding: a finding that quotes the phrase is not a degraded run.
+        if section not in counts and re.match(r"[\s>*_]*This run is DEGRADED", line):
+            flagged = True
         if line.startswith("## "):
             section = line[3:].strip().casefold()
             known = known or section in counts
@@ -563,7 +566,7 @@ def parse_revmux_report(text: str) -> dict:
         raise ReportError("report incomplete: no ## Sources table")
     if not known and "No findings." not in text:
         raise ReportError("report incomplete: no findings section and no 'No findings.'")
-    degraded = "This run is DEGRADED" in text or any(not re.match(r"ok(?:,|$)", status, re.I) for status in statuses)
+    degraded = flagged or any(not re.match(r"ok(?:,|$)", status, re.I) for status in statuses)
     return {"counts": counts, "degraded": degraded}
 
 
@@ -626,7 +629,8 @@ def check_review(root: Path) -> list[str]:
 
 
 def save_review_rounds(root: Path, entries: list[dict]) -> None:
-    write_json(review_rounds_path(root), entries)
+    from conductor import atomic_json
+    atomic_json(review_rounds_path(root), entries)
 
 
 def cmd_review_round(args: argparse.Namespace) -> int:
@@ -740,16 +744,9 @@ def load_follow_ups(root: Path) -> list[dict]:
     return [item for item in items if isinstance(item, dict) and item.get("key")] if isinstance(items, list) else []
 
 
-def write_json(path: Path, data) -> None:
-    """Replace a state file atomically: a reader sees the old record or the new one, never half."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    os.replace(temporary, path)
-
-
 def save_follow_ups(root: Path, items: list[dict]) -> None:
-    write_json(follow_ups_path(root), items)
+    from conductor import atomic_json
+    atomic_json(follow_ups_path(root), items)
 
 
 def cmd_follow_up_add(args: argparse.Namespace) -> int:
@@ -1555,7 +1552,8 @@ def cmd_merge_round(args: argparse.Namespace) -> int:
         print(f"{args.kind}: the limit of {limit} round(s) for PR #{number} is reached - this goes to the human")
         return 1
     record[args.kind] = count + 1
-    write_json(path, record)
+    from conductor import atomic_json
+    atomic_json(path, record)
     print(f"{args.kind} round {count + 1} of {limit} for PR #{number}")
     return 0
 
