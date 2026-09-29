@@ -2057,7 +2057,6 @@ function New-IssueCheckout {
     Connect-LaunchLog (Join-Path $dir '.workbench\state\launch.log')
     Push-Location $dir
     try {
-        Set-GitHubDefaultRepo $Issue           # in the checkout: queue mode's gh proxy runs in the cwd
         $existing = & git rev-parse --abbrev-ref HEAD
         if ($LASTEXITCODE -ne 0) { throw "git rev-parse failed in $dir (exit $LASTEXITCODE)" }
         if ($existing -notlike "issue-$($Issue.Number)-*") {
@@ -2071,6 +2070,7 @@ function New-IssueCheckout {
             else { & git checkout --quiet -b $branch "origin/$default" }
             if ($LASTEXITCODE -ne 0) { throw 'git checkout failed' }
         } else { $branch = $existing }
+        Set-GitHubDefaultRepo $Issue           # in the checkout: queue mode's gh proxy runs in the cwd
         # keep the workbench's own files out of the project without touching its .gitignore
         $exclude = Join-Path $dir '.git\info\exclude'
         $lines = @('.workbench/', '.revmux/')

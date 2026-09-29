@@ -2017,6 +2017,10 @@ class QueueEntry(LauncherFixtures):
             '  sys.exit(1)\n'
             ' assert args[4:] == ["--", "--quiet"], args\n'
             ' shutil.copytree(' + repr(str(seed)) + ',target,dirs_exist_ok=True)\n'
+            'elif args == ["repo", "set-default", "--view"]:\n'        # #71: the launcher pins gh's default
+            ' print("o/repo")\n'
+            'elif args[:2] == ["repo", "set-default"]:\n'
+            ' assert args[2:] == ["o/repo"], args\n'
             'else: raise AssertionError(args)\n', encoding='utf-8')
         self.cmd('gh', '"' + sys.executable + '" "' + str(stub) + '" %*')
         self.overrides = '\nfunction Grant-CodexTrust {}\nfunction Grant-ClaudeTrust {}\n'
