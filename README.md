@@ -384,6 +384,14 @@ the policy — not by flag, config key, profile, or alias; the test suite pins e
 Because its sandbox denies the terminal's control pipe, Codex cannot type into any pane — and
 doesn't need to: it writes mail files inside its clone, and the relay rings Claude.
 
+**Forks (#71).** In a clone of a fork, `gh` without `--repo` resolves to the fork's *parent*: a
+leftovers issue once landed on the upstream repo that way. Every `gh` call the workbench makes names
+the checkout's own repo, read from its `origin` remote (never `gh repo view`), and `wb.py` refuses,
+before `gh` runs, any write aimed at another repo (`refused: gh issue create targets up/r, not this
+workbench's repo fork/r`). merge-check fails a PR of another repo with a `repo:` line. The launcher
+also runs `gh repo set-default <owner/repo>` in every checkout, and checks it took, so the agents'
+own `gh` commands default to the right repo too.
+
 ### Claude as the implementer
 
 With `"implementer": "claude"` in `~/.agworkbench.json`, or `github-workbench <issue> -Implementer

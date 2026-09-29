@@ -346,7 +346,7 @@ RUN_LINK = re.compile(r"/actions/runs/(\d+)(?:/job/(\d+))?")
 def gh_checks(pr_ref: str, required: bool = False) -> list[dict]:
     """`gh pr checks --json`: exit 1 (a check failed) and 8 (checks pending) still carry the JSON;
     "no checks reported" is no checks, not an error."""
-    argv = ["gh", "pr", "checks", str(pr_ref), "--json", CHECK_FIELDS] + (["--required"] if required else [])
+    argv = gh_argv(checkout(), ["pr", "checks", str(pr_ref), "--json", CHECK_FIELDS] + (["--required"] if required else []))
     done = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace")
     out = (done.stdout or "").strip()
     if done.returncode in (0, 1, 8) and out.startswith("["):
@@ -778,8 +778,161 @@ def cmd_follow_up_add(args: argparse.Namespace) -> int:
     return 0
 
 
+# --- the workbench's own repo (#71) ----------------------------------------------------------------
+# In a fork's checkout gh resolves its base repository to the fork's parent, so a gh call without
+# --repo reads and writes upstream. Every repo-scoped call names this checkout's origin instead, and
+# a write aimed at another repo is refused before gh runs.
+
+class ForeignRepo(RuntimeError):
+    """A gh write aimed at a repo other than the workbench's own."""
+
+
+REPO_WRITES = {
+    "issue": {"create", "edit", "comment", "close", "reopen", "delete", "transfer", "lock", "unlock",
+              "pin", "unpin", "develop"},
+    "pr": {"create", "edit", "comment", "merge", "close", "reopen", "review", "ready", "lock", "unlock"},
+    "label": {"create", "edit", "delete", "clone"},
+    "run": {"rerun", "cancel", "delete"},
+}
+URL_REPO = re.compile(r"https?://github\.com/([^/\s]+/[^/\s]+)/(?:issues|pull|actions/runs)/\d+\S*", re.I)
+# The value-taking flags of the issue/pr/label/run commands: their value is never read as a flag (r1 M1).
+# One set for every command, so a short letter can be misread (`-s` is a value for `issue list`, a
+# switch for `pr merge`). That only decides where `--repo` goes: a write checks every token for another
+# repo's URL (r2 m1), so a misread can never let one through.
+VALUE_FLAGS = {"-R", "--repo", "-t", "--title", "-b", "--body", "-F", "--body-file", "-S", "--search", "-l", "--label",
+               "--add-label", "--remove-label", "-H", "--head", "-B", "--base", "-s", "--state", "--json", "-q", "--jq",
+               "-T", "--template", "-L", "--limit", "-c", "--color", "--comment", "-d", "--description", "-j", "--job",
+               "--match-head-commit", "-r", "--reason", "-a", "--assignee", "--add-assignee", "--remove-assignee",
+               "-m", "--milestone", "-A", "--author", "-p", "--project", "--add-project", "--remove-project",
+               "--subject", "--app", "--mention", "--duplicate-of", "-w", "--workflow", "--branch", "--event",
+               "-u", "--user", "--commit", "--status", "--attempt", "-n", "--name", "-i", "--interval",
+               "--reviewer", "--add-reviewer", "--remove-reviewer", "--required-checks"}
+API_VALUE_FLAGS = {"-X", "--method", "-f", "--raw-field", "-F", "--field", "-H", "--header", "--input",
+                   "-q", "--jq", "-t", "--template", "--hostname", "--cache", "-p", "--preview"}
+API_FIELD_FLAGS = ("-f", "--raw-field", "-F", "--field", "--input")
+
+
+def workbench_repo(root: Path) -> str:
+    """`owner/name` of the checkout's origin, case kept. Only root's own .git counts: a folder inside
+    another clone is not a checkout (r1 critique 1). No origin on GitHub is exit 2, never gh's guess."""
+    done = subprocess.run(["git", "-C", str(root), "--git-dir", ".git", "remote", "get-url", "origin"],
+                          capture_output=True, text=True, encoding="utf-8", errors="replace")
+    repo = triage.github_repo(done.stdout) if done.returncode == 0 else None
+    if not repo:
+        print(f"wb: cannot tell this workbench's repository: {root} has no GitHub origin "
+              f"({(done.stderr or done.stdout or '').strip() or 'not a clone'}); gh is not left to guess (#71)",
+              file=sys.stderr)
+        raise SystemExit(2)
+    return repo
+
+
+def same_repo(a: str, b: str) -> bool:
+    return a.casefold() == b.casefold()
+
+
+def repo_value(value: str) -> str:
+    """The OWNER/REPO of a `--repo` value, which gh also accepts as HOST/OWNER/REPO."""
+    parts = value.strip().strip("/").split("/")
+    return "/".join(parts[-2:]) if len(parts) == 3 else value.strip()
+
+
+def split_args(args: list[str]) -> tuple[str | None, int | None]:
+    """(the `--repo` value, the index of the `--` that ends the flags) of an issue/pr/label/run call,
+    read the way gh reads it: a flag's value - a title like `-Recurse` or `--` - is never a flag (r1 M1,
+    r2 i1). An unknown flag is taken for a switch."""
+    repo, i = None, 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            return repo, i
+        if not arg.startswith("-") or arg == "-":
+            i += 1
+            continue
+        long = arg.startswith("--")
+        name = arg.split("=", 1)[0] if long else arg[:2]
+        joined = "=" in arg if long else len(arg) > 2        # --title=x, -tx: the value is in this token
+        takes = name in VALUE_FLAGS
+        if name in ("--repo", "-R"):
+            value = (arg[len(name) + 1:] if long else arg[2:]) if joined else (args[i + 1] if i + 1 < len(args) else "")
+            repo = repo_value(value)
+        i += 2 if takes and not joined else 1
+    return repo, None
+
+
+def refuse(what: str, target: str, repo: str) -> ForeignRepo:
+    return ForeignRepo(f"refused: gh {what} targets {target}, not this workbench's repo {repo} (#71)")
+
+
+def api_flag(arg: str) -> str | None:
+    """The value-taking `gh api` flag arg starts, spelled `-X`, `-XPOST`, `--method` or `--method=POST`."""
+    for flag in API_VALUE_FLAGS:
+        if arg == flag or arg.startswith(flag + "=") or (not flag.startswith("--") and arg.startswith(flag)):
+            return flag
+    return None
+
+
+def scoped_api(args: list[str], repo: str) -> list[str]:
+    owner, name = repo.split("/")
+    # gh fills {owner}/{repo} from its own base resolution - the #71 bug - so they are filled here.
+    fill = lambda text: text.replace("{owner}", owner).replace("{repo}", name)
+    out, method, fields, endpoint, i = list(args), None, False, None, 1
+    while i < len(out):
+        flag = api_flag(out[i])
+        if flag is None:
+            if endpoint is None and not out[i].startswith("-"):
+                out[i] = endpoint = fill(out[i])
+            i += 1
+            continue
+        at = i if out[i] != flag else i + 1           # the token that holds the value
+        value = (out[at][len(flag):].lstrip("=") if at == i else out[at]) if at < len(out) else ""
+        if flag in ("-X", "--method"):
+            method = value.upper()
+        elif flag in API_FIELD_FLAGS:
+            fields = True
+            if flag in ("-F", "--field"):
+                out[at] = fill(out[at])
+        i = at + 1
+    writes = method != "GET" if method else fields
+    target = re.match(r"/?repos/([^/?#]+/[^/?#]+)", endpoint or "")
+    if writes and target and not same_repo(target[1], repo):
+        raise refuse(f"api {endpoint}", target[1], repo)
+    return out
+
+
+def scoped(args: list[str] | tuple[str, ...], repo: str) -> list[str]:
+    """args with the workbench repo named; ForeignRepo for a write to another repo. `api graphql` is
+    not inspected: the workbench sends no mutations."""
+    args = list(args)
+    if args[:1] == ["api"]:
+        return scoped_api(args, repo)
+    if args[:1] and args[0] in REPO_WRITES:
+        named, end = split_args(args[2:])
+        if args[1:2] and args[1] in REPO_WRITES[args[0]]:
+            # Fail closed (r2 m1): any token naming another repo refuses a write, whatever reads it.
+            urls = [match[1] for match in map(URL_REPO.fullmatch, args[2:]) if match]
+            target = next((t for t in [named, *urls] if t and not same_repo(t, repo)), None)
+            if target:
+                raise refuse(' '.join(args[:2]), target, repo)
+        # --repo whenever no flag names one: a URL argument wins over it in gh, and a value we misread
+        # can then never leave the repo to gh's base (r1 M1). Before a `--` that ends the flags.
+        if named is None:
+            at = len(args) if end is None else end + 2
+            return args[:at] + ["--repo", repo] + args[at:]
+    return args
+
+
+def gh_argv(root: Path, args) -> list[str]:
+    return ["gh", *scoped(args, workbench_repo(root))]
+
+
 def gh_run(root: Path, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["gh", *args], cwd=str(root), capture_output=True, text=True,
+    """A refusal is a failed call (exit 1), so every caller's failure path reports it."""
+    try:
+        argv = gh_argv(root, args)
+    except ForeignRepo as err:
+        print(f"wb: {err}", file=sys.stderr)
+        return subprocess.CompletedProcess(["gh", *args], 1, "", str(err))
+    return subprocess.run(argv, cwd=str(root), capture_output=True, text=True,
                           encoding="utf-8", errors="replace")
 
 
@@ -875,8 +1028,7 @@ def file_without_dedupe(root: Path, args: argparse.Namespace, items: list[dict],
     failed = file_legacy(root, args, items, own, label)
     if any(not followup.own_issue(i) for i in pending) or any(i.get("refresh") for i in items):
         try:
-            repo = json.loads(gh_ok(root, "reading the repository", "repo", "view", "--json", "nameWithOwner")
-                              .stdout)["nameWithOwner"]
+            repo = workbench_repo(root)
             file_leftovers(root, repo, args, items, [], label, source_title,
                            triaged=followup.triage_on(config, repo))
         except (DedupeFailed, ValueError, KeyError, TypeError) as err:
@@ -1101,8 +1253,7 @@ def file_deduped(root: Path, args: argparse.Namespace, items: list[dict], pendin
     if label is None:
         note("an issue filed without the follow-up label cannot be found as a duplicate later")
     try:
-        repo = json.loads(gh_ok(root, "reading the repository", "repo", "view", "--json", "nameWithOwner")
-                          .stdout)["nameWithOwner"]
+        repo = workbench_repo(root)
         candidates = {}
         for name in (FOLLOW_UP_LABEL, NESTED_LABEL):
             for issue in fetch_issues(root, repo, name, "all"):
@@ -1341,17 +1492,21 @@ def loop_done_no_pr(root: Path, reason: str | None, pr: str | None = None) -> in
 
 
 def gh_json(*args: str, cwd: Path | None = None):
-    done = subprocess.run(["gh", *args], capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=cwd)
+    """ForeignRepo (a RuntimeError) for a write to another repo, before gh runs (#71)."""
+    done = subprocess.run(gh_argv(cwd or checkout(), args), capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=cwd)
     if done.returncode != 0:
         raise RuntimeError(f"gh {' '.join(args[:3])} failed: {(done.stderr or done.stdout).strip()}")
     return json.loads(done.stdout)
 
 
-def fetch_pr(pr_ref: str) -> tuple[dict, list[dict]]:
+def fetch_pr(pr_ref: str, repo: str | None = None) -> tuple[dict, list[dict]]:
+    """ForeignRepo when the PR is not in repo: the merge that follows the gate must land there (#71)."""
     pr = gh_json("pr", "view", pr_ref, "--json", PR_FIELDS)
     match = re.match(r"https://github\.com/([^/]+/[^/]+)/pull/(\d+)", pr.get("url") or "")
     if not match:
         raise RuntimeError(f"cannot tell the repository from PR url {pr.get('url')!r}")
+    if repo and not same_repo(match[1], repo):
+        raise ForeignRepo(f"PR {pr['url']} is in {match[1]}, not this workbench's repo {repo}")
     pages = gh_json("api", f"repos/{match[1]}/pulls/{match[2]}/comments", "--paginate", "--slurp")
     inline = [comment for page in pages for comment in page] if pages and isinstance(pages[0], list) else list(pages or [])
     return pr, inline
@@ -1363,12 +1518,15 @@ def cmd_merge_check(args: argparse.Namespace) -> int:
         return 2
     root = checkout()
     try:
-        pr, inline = fetch_pr(args.pr)
+        pr, inline = fetch_pr(args.pr, workbench_repo(root))
         checks = None
         # CI is classified only for the tested head: checks of another commit mean nothing (#32).
         if (pr.get("headRefOid") or "").lower() == args.head.lower() and pr.get("state") == "OPEN" \
                 and pr.get("mergeStateStatus") in ("UNSTABLE", "BLOCKED"):
             checks = fetch_checks(args.pr)
+    except ForeignRepo as err:
+        print(f"repo: {err}")
+        return 1
     except (RuntimeError, ValueError, OSError) as err:
         print(f"gh: {err}")
         return 1
@@ -1589,7 +1747,7 @@ def cmd_ci_log(args: argparse.Namespace) -> int:
         return 1
     parts, fetched = [], 0
     for run, job, check in runs:
-        argv = ["gh", "run", "view", run, "--log-failed"] + (["--job", job] if job else [])
+        argv = gh_argv(root, ["run", "view", run, "--log-failed"] + (["--job", job] if job else []))
         done = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace")
         header = f"=== {check.get('name')} ({check.get('workflow') or 'Actions'}) - {check.get('link')}\n"
         if done.returncode != 0:
@@ -1646,7 +1804,7 @@ def cmd_ci_rerun(args: argparse.Namespace) -> int:
         return 1
     started = []
     for run in dict.fromkeys(run for run, _, _ in runs):
-        done = subprocess.run(["gh", "run", "rerun", run, "--failed"], capture_output=True, text=True,
+        done = subprocess.run(gh_argv(root, ["run", "rerun", run, "--failed"]), capture_output=True, text=True,
                               encoding="utf-8", errors="replace")
         print(f"rerun {run}: " + ("started" if done.returncode == 0 else f"failed: {(done.stderr or '').strip()[:200]}"))
         if done.returncode == 0:

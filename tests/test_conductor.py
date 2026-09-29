@@ -3074,10 +3074,31 @@ class Specs(unittest.TestCase):
     def test_lists_and_repositories(self):
         self.assertEqual(('o/r', [3, 4], None), q.resolve_spec('o/r#3,#4,3'))
         self.assertEqual(('o/r', [3, 4], None), q.resolve_spec('3,4', 'o/r'))
-        self.assertEqual(('o/r', [3], None), q.resolve_spec('3', gh=lambda *a: {'nameWithOwner': 'o/r'}))
+        self.assertEqual(('o/r', [3], None), q.resolve_spec('3', gh=None, origin=lambda: 'O/r'))
         for spec in ('', '0', '-1', 'o/r#1,x/y#2', '1,', 'label:'):
             with self.subTest(spec=spec), self.assertRaises(q.QueueError):
                 q.resolve_spec(spec, 'o/r')
+
+    def test_without_a_repo_the_spec_takes_the_cwds_origin_not_gh(self):
+        # #71: `gh repo view` answers a fork's checkout with the parent.
+        def gh(*args):
+            self.assertNotEqual(('repo', 'view'), args[:2])
+            return [[{'number': 4, 'created_at': 'a'}]]
+        folder = Path(__file__).resolve().parent.parent / ('test conductor fork ' + uuid.uuid4().hex)
+        folder.mkdir()
+        self.addCleanup(shutil.rmtree, folder)
+        subprocess.run(['git', 'init', '-q', str(folder)], check=True)
+        subprocess.run(['git', '-C', str(folder), 'remote', 'add', 'origin', 'git@github.com:Fork/R.git'], check=True)
+        here = os.getcwd()
+        os.chdir(folder)
+        self.addCleanup(os.chdir, here)
+        self.assertEqual('Fork/R', q.cwd_repo())
+        for spec, expected in (('4', ('fork/r', [4], None)), ('label:bug', ('fork/r', [4], 'bug'))):
+            with self.subTest(spec=spec):
+                self.assertEqual(expected, q.resolve_spec(spec, None, gh))
+        subprocess.run(['git', 'remote', 'remove', 'origin'], check=True)
+        with self.assertRaises(q.UsageError):
+            q.resolve_spec('4', None, gh)
 
     def test_paginated_label_order_excludes_prs_and_encodes_label(self):
         calls = []

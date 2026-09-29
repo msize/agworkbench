@@ -300,9 +300,20 @@ def gh_json(*args):
     return json.loads(done.stdout.decode('utf-8-sig'))
 
 
-def resolve_spec(spec, hint=None, gh=gh_json):
+def cwd_repo():
+    """The repository of the current directory's origin (#71): `gh repo view` answers a fork's
+    checkout with the fork's parent."""
+    done = subprocess.run(['git', 'remote', 'get-url', 'origin'], capture_output=True, text=True,
+                          encoding='utf-8', errors='replace')
+    repo = triage.github_repo(done.stdout) if done.returncode == 0 else None
+    if not repo:
+        raise UsageError('this directory is not a checkout with a GitHub origin; name the repository')
+    return repo
+
+
+def resolve_spec(spec, hint=None, gh=gh_json, origin=cwd_repo):
     """(repo, numbers, watched): `watched` is the label of a `label:` spec, a labelquery.Query for a
-    `where:` spec (#38), else None."""
+    `where:` spec (#38), else None. Without a hint the repo is the cwd's origin, never gh's guess."""
     label = None
     if spec[:6].casefold() == 'where:':
         # Parsed before any network: a malformed query changes nothing and costs no call.
@@ -310,7 +321,7 @@ def resolve_spec(spec, hint=None, gh=gh_json):
             node, query = labelquery.compile_query(spec[6:])
         except labelquery.QueryError as err:
             raise UsageError(f'invalid query: {err}') from None
-        repo = repo_name(hint or gh('repo', 'view', '--json', 'nameWithOwner')['nameWithOwner'])
+        repo = repo_name(hint or origin())
         pages = gh('api', f'repos/{repo}/issues?state=open&per_page=100', '--paginate', '--slurp')
         issues = [issue for page in pages for issue in page if 'pull_request' not in issue and
                   labelquery.evaluate(node, labelquery.labels_of(label.get('name') for label in issue.get('labels') or []))]
@@ -319,7 +330,7 @@ def resolve_spec(spec, hint=None, gh=gh_json):
         label = spec[6:].strip()
         if not label:
             raise UsageError('label must not be empty')
-        repo = repo_name(hint or gh('repo', 'view', '--json', 'nameWithOwner')['nameWithOwner'])
+        repo = repo_name(hint or origin())
         pages = gh('api', f'repos/{repo}/issues?labels={quote(label, safe="")}&state=open&per_page=100', '--paginate', '--slurp')
         issues = [issue for page in pages for issue in page if 'pull_request' not in issue]
         return repo, list(dict.fromkeys(i['number'] for i in sorted(issues, key=lambda i: (i['created_at'], i['number'])))), label
@@ -335,7 +346,7 @@ def resolve_spec(spec, hint=None, gh=gh_json):
                 raise UsageError('a queue must contain exactly one repository')
             repo = qualified
         items.append(int(match['number']))
-    repo = repo or repo_name(gh('repo', 'view', '--json', 'nameWithOwner')['nameWithOwner'])
+    repo = repo or repo_name(origin())
     return repo, list(dict.fromkeys(items)), label
 
 

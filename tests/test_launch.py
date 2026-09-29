@@ -76,6 +76,99 @@ class IssueRefs(unittest.TestCase):
         self.assertLessEqual(len(slug), 20)
 
 
+def git(*args, cwd=None):
+    return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args], cwd=cwd, check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
+def remove_clone(path: Path) -> None:
+    def writable(func, target, _):
+        os.chmod(target, 0o700)
+        func(target)
+    shutil.rmtree(path, onexc=writable) if sys.version_info >= (3, 12) else shutil.rmtree(path, onerror=writable)
+
+
+# gh in a fork's clone (#71): `repo clone` adds the parent as `upstream` and marks it gh's base, as
+# gh does; `repo set-default` moves the mark, and `--view` answers from it.
+FORK_GH = r"""
+function gh {
+    $global:LASTEXITCODE = 0
+    if ($args[0] -eq 'repo' -and $args[1] -eq 'clone') {
+        & git clone -q $env:WB_TEST_SOURCE $args[3]
+        & git -C $args[3] remote add upstream https://github.com/up/r.git
+        & git -C $args[3] config remote.upstream.gh-resolved base
+        return
+    }
+    if ($args[0] -eq 'repo' -and $args[1] -eq 'set-default' -and $args[2] -eq '--view') {
+        if ($env:WB_TEST_VIEW) { return $env:WB_TEST_VIEW }
+        if ((& git config remote.origin.gh-resolved) -eq 'base') { return 'fork/r' }
+        return 'up/r'
+    }
+    if ($args[0] -eq 'repo' -and $args[1] -eq 'set-default') {
+        Add-Content -LiteralPath $env:WB_TEST_LOG -Value "set-default $($args[2]) in $((Get-Location).Path)"
+        & git config --unset remote.upstream.gh-resolved
+        & git config remote.origin.gh-resolved base
+        $global:LASTEXITCODE = 0
+        return
+    }
+    if ($args[0] -eq 'repo' -and $args[1] -eq 'view') { return 'main' }
+    throw "unexpected gh $args"
+}
+"""
+
+
+class ForkCheckouts(unittest.TestCase):
+    """#71: in a fork's clone gh's base repository is the parent. The launcher pins it to the issue's
+    repo, and a bare issue number takes the repo from the origin, not from gh."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="wb-fork-"))
+        self.addCleanup(remove_clone, self.root)
+        self.source = self.root / "source"
+        git("init", "-q", "-b", "main", str(self.source))
+        git("commit", "-q", "--allow-empty", "-m", "init", cwd=self.source)
+        self.log = self.root / "gh.log"
+        self.env = dict(os.environ, WB_TEST_SOURCE=str(self.source), WB_TEST_LOG=str(self.log))
+
+    def checkout(self, env=None):
+        return ps(". ./lib/Workbench.ps1; " + FORK_GH +
+                  "$co = New-IssueCheckout -Issue @{ Repo = 'Fork/R'; Number = 5 } -Title 'Fix it' -Root "
+                  + ps_quote(self.root / "co") + "; $co.Dir", env=env or self.env)
+
+    def test_a_new_and_a_reused_checkout_pin_gh_to_the_issues_repo(self):
+        for attempt in ("clone", "reuse"):
+            with self.subTest(attempt=attempt):
+                result = self.checkout()
+                self.assertEqual(0, result.returncode, result.stderr + result.stdout)
+                directory = Path(result.stdout.strip().splitlines()[-1])
+                self.assertEqual("base", git("-C", str(directory), "config", "remote.origin.gh-resolved"))
+        lines = self.log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(2, len(lines))
+        for line in lines:
+            self.assertTrue(line.startswith("set-default Fork/R in "), line)
+            self.assertEqual(os.path.normcase(str(self.root / "co" / "R-issue-5")),
+                             os.path.normcase(line.split(" in ", 1)[1]))
+
+    def test_a_default_that_does_not_stick_fails_the_launch(self):
+        result = self.checkout(dict(self.env, WB_TEST_VIEW="up/r"))
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("gh's default repository here is 'up/r', not Fork/R", result.stderr + result.stdout)
+
+    def test_a_bare_number_takes_the_origins_repo_not_gh(self):
+        folder = self.root / "here"
+        git("init", "-q", str(folder))
+        git("-C", str(folder), "remote", "add", "origin", "git@github.com:Fork/R.git")
+        git("-C", str(folder), "remote", "add", "upstream", "https://github.com/up/r.git")
+        script = (". ./lib/Workbench.ps1; function gh { throw 'gh called' }; Set-Location " + ps_quote(folder) +
+                  "; $r = Resolve-IssueRef -Ref '7'; \"$($r.Repo)#$($r.Number)\"")
+        result = ps(script)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("Fork/R#7", result.stdout.strip())
+        git("-C", str(folder), "remote", "remove", "origin")
+        result = ps(script)
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("is a bare issue number, and this directory is not a GitHub checkout", result.stderr + result.stdout)
+
 class PaneIdsOfASession(unittest.TestCase):
     def test_an_unsplit_session_yields_its_whole_id_not_its_first_character(self):
         # Consumers capture the flat pipeline with @(), even for a single pane.
@@ -1924,6 +2017,10 @@ class QueueEntry(LauncherFixtures):
             '  sys.exit(1)\n'
             ' assert args[4:] == ["--", "--quiet"], args\n'
             ' shutil.copytree(' + repr(str(seed)) + ',target,dirs_exist_ok=True)\n'
+            'elif args == ["repo", "set-default", "--view"]:\n'        # #71: the launcher pins gh's default
+            ' print("o/repo")\n'
+            'elif args[:2] == ["repo", "set-default"]:\n'
+            ' assert args[2:] == ["o/repo"], args\n'
             'else: raise AssertionError(args)\n', encoding='utf-8')
         self.cmd('gh', '"' + sys.executable + '" "' + str(stub) + '" %*')
         self.overrides = '\nfunction Grant-CodexTrust {}\nfunction Grant-ClaudeTrust {}\n'

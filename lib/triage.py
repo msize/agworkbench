@@ -146,6 +146,15 @@ def label_names(issue) -> list[str]:
     return [(label.get('name') if isinstance(label, dict) else str(label)) or '' for label in issue.get('labels') or []]
 
 
+def github_repo(url: str | None) -> str | None:
+    """`owner/name` of a GitHub remote URL in https, ssh or scp form, with its case kept, else None.
+    One parser for the workbench's own repo (#71) and cleanup's origin check."""
+    match = re.fullmatch(r'(?:https?://(?:[^@/]+@)?github\.com/|ssh://git@github\.com/|git@github\.com:)'
+                         r'([A-Za-z0-9][A-Za-z0-9_.-]*)/([A-Za-z0-9][A-Za-z0-9_.-]*?)(?:\.git)?/?',
+                         (url or '').strip(), re.I)
+    return f"{match[1]}/{match[2]}" if match else None
+
+
 # --- processes -------------------------------------------------------------------------------------
 
 def kill_tree(process) -> None:
