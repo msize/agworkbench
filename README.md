@@ -156,7 +156,7 @@ setting changes, and whether it would start the queue or append to it (running o
 
 The repo's queue is appended to when one exists, running or not, and `-Watch` onto a queue started
 from a list turns watching on. A switch on an append (`-Autonomous`, `-Implementer`, `-AutoMerge`,
-`-Parallel`) changes the queue for every member launched from then on, including ones already
+`-BigReview`, `-Parallel`) changes the queue for every member launched from then on, including ones already
 waiting. The append prints each such change (`settings: autonomous null -> true`).
 
 A visible, restart-pinned `#queue owner/repo` conductor starts one issue at a time by default
@@ -731,7 +731,13 @@ from then on, and `-DryRun` shows the record it would clear. The limit strings c
 Review stops once a verified revmux round has no Blocker, Critical or Major finding (#64): that
 round's fix is the last, its Minor findings are fixed if cheap and otherwise go to the PR's
 "Leftovers from #N" issue, and no further revmux round runs. The planner records each round with
-`wb.py review-round --round K`, which prints `continue`, `stop`, `clean` or `cap` (round 5 or later).
+`wb.py review-round --round K`, which prints `continue`, `stop`, `clean` or `cap` (at or past the review cap).
+The review cap is `review.maxRounds` (5), or `review.maxRoundsBig` (10) for a big issue (#75): its title
+starts with `Batch:`, it has a `batch` or `big` label, its diff against the base passes
+`review.bigDiffLines` (1500 lines added + deleted) when a round is recorded, or its checkout was launched
+with `-BigReview` (`-Queue <spec> -BigReview` for every member; `-NoBigReview` turns it off). An issue
+judged big stays big; `wb.py settings` prints `reviewCap=<n>` and why, e.g.
+`reviewCap=10 (big: diff 1623 lines > 1500 vs origin/main)`.
 A degraded round never stops review. The planner files a stop's deferred minors right after it
 opens the PR, whether or not auto-merge is on. `wb.py review-round --summary` prints the line the PR body and
 the merge note carry, e.g. `review stopped: round 2 had no Major; 3 minor finding(s) in <URL>`.
@@ -743,7 +749,7 @@ That check is read-only. It requires:
 - the relay has seen the PR open;
 - the PR head is the tested commit;
 - the newest revmux report has a recorded decision, and the last one is not `continue`, nor a `cap` (a
-  Major or a degraded run at round 5 or later) unless `stopWhenNoMajor` was off; after any `stop`,
+  Major or a degraded run at or past the review cap) unless `stopWhenNoMajor` was off; after any `stop`,
   every recorded follow-up is filed;
 - **no hold**: a label (`do-not-merge`, `hold`, `wip`), the title, or any unmarked description,
   comment, review or line comment containing `hold`, `wait`, `waiting`, `wip`, or `do not merge` in
@@ -840,7 +846,7 @@ the autonomous close can close it. revmux and revdiff rounds that fail also mail
 | `bugLabel` | `"bug"` | the label `-Queue bugs` stands for (non-empty, no comma) |
 | `triage` | none | per product repo: `{"owner/repo": {"specRepos": [...], "model": "..."}}`, the private spec repos `-Triage` judges against (see Issue triage) |
 | `followUp` | `{"dedupe": true, "bumpAt": {"P2": 2, "P1": 3, "P0": 5}}` | `dedupe: false` skips duplicate matching: separate items keep #27's filing, leftovers still share one issue per PR (per item without `--pr`); `bumpAt` is the total number of reports that raises a matched issue to each priority |
-| `review` | `{"stopWhenNoMajor": true, "minRounds": 1}` | `stopWhenNoMajor: false` keeps reviewing until a round has no findings at all (up to five); `minRounds` (1-5) is the first round that may stop review |
+| `review` | `{"stopWhenNoMajor": true, "minRounds": 1, "maxRounds": 5, "maxRoundsBig": 10, "bigDiffLines": 1500}` | `stopWhenNoMajor: false` keeps reviewing until a round has no findings at all (up to the review cap); `minRounds` (1-5, at most `maxRounds`) is the first round that may stop review; `maxRounds` (1-20) is the review cap, `maxRoundsBig` (`maxRounds`-20, default the larger of 10 and `maxRounds`) the cap of a big issue, and `bigDiffLines` (1 or more) the diff size that makes an issue big |
 | `autonomous` | `false` | full autonomy: merge, file follow-up issues, close the sessions after the merge; implies `autoMerge` |
 | `cleanup` | `"merged"` | after an autonomous close: `merged` deletes the checkout when it is safe, `build` deletes only its build outputs, `off` keeps it (see Cleaning up checkouts) |
 | `minFreeGB` | `20` | the queue admits no member while the checkout drive has less free space (GiB); `0` turns the guard off |

@@ -1872,7 +1872,7 @@ class AutoMergeProse(unittest.TestCase):
         text = (Path(__file__).resolve().parent.parent / 'claude/commands/start-github-issue.md').read_text(encoding='utf-8')
         phase6 = text.split('## Phase 6')[1].split('## Phase 7')[0]
         for needle in ['wb.py" settings', 'autoMerge=true', 'wb.py" merge-check --pr <N> --head <full sha>',
-                       '--match-head-commit <full sha>', 'None is deferred', 'five-round cap',
+                       '--match-head-commit <full sha>', 'None is deferred', 'within the review cap',
                        'whole suite passed on the PR head', 'If any condition fails, do not merge',
                        'UNKNOWN', 'go ahead']:
             self.assertIn(needle, ' '.join(phase6.split()) if ' ' in needle else phase6)
@@ -2252,7 +2252,9 @@ class ReviewRoundProse(unittest.TestCase):
                        "Never go below revmux's count without a reason", '| `continue` |', '| `stop` |', '| `clean` |',
                        '| `cap` |', '`FIX r<K> (final)`', '--origin "review r<K>"',
                        '**Review stops once a round has no Major**', 'no further revmux round runs',
-                       'A round with a Major gets another round after its fix', 'At most five revmux rounds']:
+                       'A round with a Major gets another round after its fix', "At most the review cap's revmux rounds",
+                       '**The review cap** is `review.maxRounds` (5), or `review.maxRoundsBig` (10) for a **big** issue',
+                       '`Batch:`', '`-BigReview`', 'Judged big once, an issue stays big', '`reviewCap=<n>`']:
             self.assertIn(needle, phase4)
         self.assertLess(phase4.index('review-round --round <K>'), phase4.index('Send the verified findings'))
         self.assertIn('The difference counts as Minor findings, so the round stops rather than reads clean', phase4)
@@ -2265,12 +2267,15 @@ class ReviewRoundProse(unittest.TestCase):
             self.assertIn(needle, phase5)
         self.assertLess(phase5.index('gh pr create'), phase5.index('gh pr edit <P>'))
         self.assertNotIn('filed at merge', text)
+        for stale in ('five-round', 'At most five', 'round 5 or later', 'FIX r5', 'round 6 and later'):
+            self.assertNotIn(stale, text)        # #75: the cap is the review cap, five or ten
         phase6 = text.split('## Phase 6')[1].split('## Phase 7')[0]
         for needle in ['A review that **stopped**', 'fixed or recorded as a follow-up',
                        '`follow-up file --source <N> --pr <P>`) before merge-check, with or without autonomy',
                        'the newest revmux report when it has no recorded decision', '<the `wb.py review-round --summary` line>',
                        'review stopped: round K had no Major; N minor finding(s) in <leftovers URL>',
-                       'recorded with `review-round` like any other', 'round 6 and later included',
+                       'recorded with `review-round` like any other', 'rounds past the review cap included',
+                       'within the review cap', 'a degraded run at or past the review cap',
                        'unless it was recorded with `stopWhenNoMajor: false`']:
             self.assertIn(needle, phase6)
 
