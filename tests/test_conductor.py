@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -2280,6 +2281,121 @@ class EnvironmentalBlocks(unittest.TestCase):
         self.assertEqual([1], self.launched())
 
 
+class LimitWait(unittest.TestCase):
+    """#77: in a queue started with -WaitOnLimit a member whose agent (or reviewer) hits its usage limit
+    keeps its slot and waits; nobody new starts, nothing is failed over, and nobody is notified."""
+    terminal, start, gh, worker, member, report, spawn = (QueueCase.terminal, QueueCase.start, QueueCase.gh,
+                                                          QueueCase.worker, QueueCase.member, QueueCase.report,
+                                                          QueueCase.spawn)
+
+    def setUp(self):
+        QueueCase.setUp(self)
+        self.start('o/r#1,2,3', parallel=2, on_limit='wait', implementer='kimi')
+        self.w = self.worker()
+        self.w.notify, self.w.status = Mock(), Mock()
+        self.w.tick(); self.w.tick()               # #1 and #2 active
+        self.sessions = {1, 2}
+        self.at = datetime(2026, 9, 30, 10, 0, tzinfo=timezone.utc)
+
+    def launched(self):
+        return [n for n, *_ in self.launches]
+
+    def state_dir(self, n):
+        return Path(self.member(n)['checkout']) / '.workbench/state'
+
+    def relay_wait(self, n, wait=True, retry=None):
+        episode = {'kind': 'limited', 'tool': 'kimi', 'line': 'Error: 403 5-hour usage limit',
+                   'firstSeen': self.at.isoformat(timespec='seconds'), 'announced': True}
+        if wait:
+            episode.update(wait=True, retryAt=retry or self.at.timestamp() + 1800, probes=0, probeAt=None)
+        q.atomic_json(self.state_dir(n) / 'relay.json', {'limits': {'codex': episode}})
+
+    def out(self):
+        return sys.stdout.getvalue()
+
+    def test_a_waiting_member_keeps_its_slot_and_nobody_new_starts(self):
+        self.relay_wait(1)
+        self.report(2, 'pr-open')                  # a free slot: #3 would start
+        self.w.tick(); self.w.tick()
+        self.assertEqual([1, 2], self.launched())
+        self.assertEqual('pending', self.member(3)['state'])
+        m = self.member(1)
+        self.assertEqual(('active', False), (m['state'], m['slotReleased']))
+        self.assertEqual({'tool': 'kimi', 'since': self.at.timestamp(), 'retryAt': self.at.timestamp() + 1800,
+                          'source': 'relay codex'}, m['limitWait'])
+        (self.state_dir(1) / 'relay.json').unlink()   # the limit reset: the relay ended the episode
+        self.w.tick()
+        self.assertNotIn('limitWait', self.member(1))
+        self.assertEqual([1, 2, 3], self.launched())
+
+    def test_the_wait_is_printed_once_and_its_end_too_and_never_notified(self):
+        self.relay_wait(1)
+        for _ in range(3):
+            self.w.tick()
+        since = time.strftime('%H:%M', time.localtime(self.at.timestamp()))
+        retry = time.strftime('%H:%M', time.localtime(self.at.timestamp() + 1800))
+        self.assertEqual(1, self.out().count(f'waiting: #1 kimi usage limit since {since}, next try {retry}'))
+        self.assertIn('#1: active waiting-limit', self.out())
+        (self.state_dir(1) / 'relay.json').unlink()
+        self.w.tick(); self.w.tick()
+        self.assertEqual(1, self.out().count('queue resumed: usage limit cleared'))
+        self.w.notify.assert_not_called()
+        self.assertNotIn(('blocked',), [c.args for c in self.w.status.call_args_list])
+        self.assertNotIn('toolsPaused', self.store.load())
+
+    def test_a_blocked_member_that_starts_waiting_is_not_notified_again(self):
+        self.report(1, 'blocked', reason='kimi limited', cause='environment')
+        self.w.tick()
+        self.assertEqual(1, self.w.notify.call_count)
+        self.relay_wait(1)
+        self.w.tick(); self.w.tick()
+        self.assertEqual(1, self.w.notify.call_count)
+
+    def test_a_wait_episode_is_not_a_tool_limit(self):
+        self.relay_wait(1)
+        self.w.tick()
+        self.assertNotIn('toolLimits', self.store.load())
+        self.assertEqual([], q.member_limits(self.member(1)))
+        self.relay_wait(1, wait=False)                # a failover episode is still one
+        self.assertEqual(['kimi'], [tool for tool, *_ in q.member_limits(self.member(1))])
+
+    def test_a_wait_queue_never_routes_to_another_tool(self):
+        limits = {'codex': {'kind': 'limited', 'member': 1, 'line': 'x', 'at': 1}}
+        self.assertEqual((None, None), q.tool_route({'config': str(self.config), 'onLimit': 'wait',
+                                                    'implementer': 'codex', 'toolLimits': limits}))
+        self.assertEqual(('claude', None), q.tool_route({'config': str(self.config), 'onLimit': 'failover',
+                                                        'implementer': 'codex', 'toolLimits': limits}))
+
+    def test_a_review_limit_waits_too(self):
+        q.atomic_json(self.state_dir(1) / 'review-limit.json',
+                      {'tool': 'kimi', 'since': self.at.timestamp(), 'retryAt': self.at.timestamp() + 1800, 'round': 2})
+        self.report(2, 'pr-open')
+        self.w.tick(); self.w.tick()
+        self.assertEqual([1, 2], self.launched())
+        self.assertEqual('review', self.member(1)['limitWait']['source'])
+        self.assertIn('#1 kimi reviewer usage limit since', self.out())
+
+    def test_a_dead_member_cannot_pin_the_queue(self):
+        self.relay_wait(1)
+        self.report(2, 'pr-open')
+        self.w.tick()
+        self.assertEqual([1, 2], self.launched())
+        self.sessions = {2}
+        self.w.tick()                                  # first missed: the grace starts, it still waits
+        self.assertIn('limitWait', self.member(1))
+        self.now += q.SESSION_GRACE + 1
+        self.w.tick(); self.w.tick()
+        self.assertNotIn('limitWait', self.member(1))
+        self.assertEqual([1, 2, 3], self.launched())
+
+    def test_the_summary_shows_waiting_limit(self):
+        self.relay_wait(1)
+        self.w.tick()
+        summary = q.summary(self.store.load())
+        self.assertIn('| 1 | waiting-limit (active) |', summary)
+        self.assertIn('| 2 | active |', summary)
+
+
 class ToolLimits(unittest.TestCase):
     """#61: a usage limit recorded by any live member steers new members to the other tool, or pauses
     the queue when no tool is usable; only the human's -ClearLimit clears it."""
@@ -3013,6 +3129,23 @@ class LabelQuery(unittest.TestCase):
         self.assertEqual([('api', 'repos/o/r/issues?state=open&per_page=100', '--paginate', '--slurp')], self.calls)
         _, numbers, _ = q.resolve_spec('WHERE:bug AND priority NOT IN [P2, P3]', 'o/r', self.fake_gh)
         self.assertEqual([2, 3, 5, 1], numbers)                                # untriaged #1 included
+
+    def test_the_kimi_queue_spec_admits_only_kimi_labelled_p2_p3(self):
+        # #77: a regression pin (labelquery already parses it), not a fails-without test.
+        self.pages = [[listed(1, '2026-01-01', 'kimi', 'priority:P2'), listed(2, '2026-01-02', 'priority:P2'),
+                       listed(3, '2026-01-03', 'kimi', 'priority:P1'), listed(4, '2026-01-04', 'Kimi', 'priority:P3'),
+                       listed(5, '2026-01-05', 'kimi')]]
+        _, numbers, _ = q.resolve_spec('where: kimi AND priority IN [P2, P3]', 'o/r', self.fake_gh)
+        self.assertEqual([1, 4], numbers)
+
+    def test_prune_drops_a_pending_member_triage_took_kimi_from(self):
+        # #77: -Watch adds members that gain the label; -Watch -Prune drops pending ones that lost it.
+        self.pages = [[listed(1, '2026-01-01', 'kimi', 'priority:P2'), listed(2, '2026-01-02', 'kimi', 'priority:P3')]]
+        self.query('where: kimi AND priority IN [P2, P3]', repo='o/r', watch=True)
+        self.assertEqual([1, 2], [m['number'] for m in self.store.load()['members']])
+        self.pages = [[listed(1, '2026-01-01', 'priority:P2'), listed(2, '2026-01-02', 'kimi', 'priority:P3')]]
+        self.query('where: kimi AND priority IN [P2, P3]', repo='o/r', watch=True, prune=True)
+        self.assertEqual([2], [m['number'] for m in self.store.load()['members']])
 
     def test_a_malformed_query_is_refused_before_any_call(self):
         with self.assertRaises(q.UsageError) as caught:

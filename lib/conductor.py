@@ -609,7 +609,8 @@ def member_limits(m):
     path = directory / 'relay.json'
     if path.exists():
         for episode in (read_json(path).get('limits') or {}).values():
-            if (isinstance(episode, dict) and episode.get('announced') and
+            # A limit waited out (#77) is not a tool to route around: the member keeps it and waits.
+            if (isinstance(episode, dict) and episode.get('announced') and not episode.get('wait') and
                     episode.get('tool') in IMPLEMENTER_TOOLS and episode.get('kind') in ('limited', 'warning')):
                 found.append((episode['tool'], epoch(episode.get('firstSeen')), str(episode.get('line') or ''),
                               episode['kind']))
@@ -625,9 +626,44 @@ def relay_limited(m):
     return any(isinstance(e, dict) and e.get('announced') for e in episodes.values())
 
 
+def limit_wait(m):
+    """The usage limit a member waits out (#77): {tool, since, retryAt, source} from its relay's wait
+    episode (relay.json) or a review round's reviewer limit (review-limit.json); None when it waits for
+    nothing. Times are epoch seconds, None when unreadable."""
+    directory = Path(m['checkout']) / '.workbench/state'
+    path = directory / 'relay.json'
+    if path.exists():
+        for box, episode in sorted((read_json(path).get('limits') or {}).items()):
+            if isinstance(episode, dict) and episode.get('wait') and episode.get('announced'):
+                retry = episode.get('retryAt')
+                return dict(tool=str(episode.get('tool') or '?'), since=epoch(episode.get('firstSeen')),
+                            retryAt=retry if type(retry) in (int, float) else None, source=f'relay {box}')
+    path = directory / 'review-limit.json'
+    if path.exists():
+        record = read_json(path)
+        if isinstance(record, dict):
+            since, retry = record.get('since'), record.get('retryAt')
+            return dict(tool=str(record.get('tool') or '?'), since=since if type(since) in (int, float) else None,
+                        retryAt=retry if type(retry) in (int, float) else None, source='review')
+    return None
+
+
+def local_clock(epoch_value):
+    return time.strftime('%H:%M', time.localtime(epoch_value)) if epoch_value is not None else '?'
+
+
+def wait_text(m):
+    wait = m['limitWait']
+    what = 'reviewer usage limit' if wait['source'] == 'review' else 'usage limit'
+    return (f'#{m["number"]} {wait["tool"]} {what} since {local_clock(wait["since"])}, '
+            f'next try {local_clock(wait["retryAt"])}')
+
+
 def tool_route(data):
     """(implementer for the next launch, pause reason) from the queue's recorded tool limits (#61).
-    (None, None) launches with the queue's own settings."""
+    (None, None) launches with the queue's own settings, and always in a queue that waits limits out (#77)."""
+    if data.get('onLimit') == 'wait':
+        return None, None
     limits = data.get('toolLimits') or {}
     if not limits:
         return None, None
@@ -1193,6 +1229,8 @@ def summary(data):
              'Rerun github-workbench -Queue <spec> to refresh.', '', '| Issue | State | PR | Reason |', '|---|---|---|---|']
     for m in data['members']:
         state = m['state'] + (' (PR closed)' if m.get('prState') == 'CLOSED' else '')
+        if m.get('limitWait'):
+            state = f'waiting-limit ({state})'      # #77: an overlay, the state is unchanged
         values = [str(m['number']), state, m.get('pr') or '', m.get('reason') or '']
         lines.append('| ' + ' | '.join(str(v).replace('|', '\\|').replace('\n', ' ') for v in values) + ' |')
     counts = {state: sum(m['state'] == state for m in data['members']) for state in STATES}
@@ -1210,6 +1248,7 @@ class Worker:
         self.disk_announced = False   # whether this worker has announced a disk pause (#41)
         self.ram_announced = False    # ... a memory pause (#61)
         self.tools_announced = False  # ... a tool-limits pause (#61)
+        self.waits_announced = ()     # the members whose usage-limit wait this worker printed (#77)
         self.tick_sessions = _UNREAD  # issue numbers with a live session, read at most once per tick
         self.launch_announced = False
         self.spawn = spawn or self.spawn_launcher
@@ -1878,6 +1917,28 @@ class Worker:
         if limits:
             data['toolLimits'] = limits
 
+    def collect_limit_waits(self, data):
+        """Stamp `limitWait` on each live member that waits out a usage limit (#77), clear it on the rest;
+        the members that wait. A member whose session is gone waits for nothing: it cannot pin the queue."""
+        waiting = []
+        for m in data['members']:
+            found = None
+            if m['state'] in LIVE_STATES and m['checkoutEstablished']:
+                key = f'limit wait #{m["number"]}'
+                try:
+                    found = limit_wait(m)
+                    self.errors.pop(key, None)
+                except (OSError, ValueError, AttributeError) as err:
+                    self.error(key, err)
+                if found and self.session_live(data, m) is False:
+                    found = None
+            if found:
+                m['limitWait'] = found
+                waiting.append(m)
+            else:
+                m.pop('limitWait', None)
+        return waiting
+
     def live_count(self, data):
         """Members with running agent sessions (#61): launching ones always, active ones that hold a
         slot, and active, blocked, pr-open and close-pending ones while session_live is not False -
@@ -1946,6 +2007,9 @@ class Worker:
         with self.store.transaction() as data:
             self.collect_tool_limits(data)
             route, tools = tool_route(data)
+            # A member waiting out a usage limit keeps its slot, and nobody new starts meanwhile (#77).
+            # Not a pause: nothing is wrong, so no notification and no blocked status.
+            waiting = self.collect_limit_waits(data)
             # Announced on pause and on resume, by this worker (a restarted conductor announces a pause it
             # finds); the figures in the text are refreshed silently.
             for key, reason in (('diskPaused', disk), ('ramPaused', ram), ('toolsPaused', tools)):
@@ -1971,8 +2035,8 @@ class Worker:
                     pending.insert(0, preferred)
             for m in pending:
                 launch_in_flight = any(other['state'] == 'launching' for other in data['members'])
-                if pause or (backoff and (self.clock() < backoff['until'] or launch_in_flight)):
-                    break                  # disk/memory/tools/back-off/probe gate: keep other members pending
+                if pause or waiting or (backoff and (self.clock() < backoff['until'] or launch_in_flight)):
+                    break                  # disk/memory/tools/limit wait/back-off/probe gate: keep other members pending
                 if count >= data['parallel'] or (awaits_triage(data, m) and not paused):
                     break                  # strictly in order: nothing behind a member still being triaged
                 # The ceiling (#61): the terminal is read only when the members could reach it.
@@ -2043,13 +2107,25 @@ class Worker:
                 changed = True
         if changed:
             self.status('blocked' if pause or launch_paused else 'active')
+        # A limit wait (#77) is printed when it starts and when it ends, never notified.
+        waits = tuple(sorted(m['number'] for m in current['members'] if m.get('limitWait')))
+        if waits != self.waits_announced:
+            if waits:
+                texts = '; '.join(wait_text(m) for m in current['members'] if m['number'] in waits)
+                print(f'{self.tag}waiting: {texts}; no new member starts meanwhile', flush=True)
+            else:
+                print(f'{self.tag}queue resumed: usage limit cleared', flush=True)
+            self.waits_announced = waits
         for m in current['members']:
             display = (m['state'], m.get('prState'), m.get('reason'))
-            if self.last_display.get(m['number']) != display:
-                print(f'{self.tag}#{m["number"]}: {display[0]} {display[1] or ""} {display[2] or ""}', flush=True)
-                if m['state'] in {'blocked', 'failed'}:
+            shown = display + (bool(m.get('limitWait')),)
+            if self.last_display.get(m['number']) != shown:
+                waiting = ' waiting-limit' if m.get('limitWait') else ''
+                print(f'{self.tag}#{m["number"]}: {display[0]}{waiting} {display[1] or ""} {display[2] or ""}', flush=True)
+                # Only a change of state or reason notifies: a limit wait coming or going does not.
+                if m['state'] in {'blocked', 'failed'} and (self.last_display.get(m['number']) or ())[:3] != display:
                     self.notify(f'#{m["number"]}: {m["state"]}: {m.get("reason") or ""}')
-                self.last_display[m['number']] = display
+                self.last_display[m['number']] = shown
         for message in self.alerts:
             self.notify(message)
         self.alerts.clear()
