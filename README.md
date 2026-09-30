@@ -166,6 +166,10 @@ alongside later issues. Agents never merge or approve PRs. Queue launches preser
 does not open revdiff automatically; run `wb.py human-review --base origin/main` in the issue's
 context to open it on demand, or review on GitHub.
 
+Every line the `#queue` conductor, the `#triage` watch and each relay print in their panes starts with
+the local time: `HH:MM:SS `, or `YYYY-MM-DD HH:MM:SS ` on the first line and on the first line after the
+date changes (#78). JSON output (`-DryRun`, member context) and log files are not stamped.
+
 Rerunning appends new issues without duplicates. Saved parallelism is preserved unless explicitly
 changed. A watched spec (a label or a query) is checked every five minutes; empty or temporarily failing scans keep
 waiting. Without `-Watch`, the conductor exits after admission work finishes and writes a summary

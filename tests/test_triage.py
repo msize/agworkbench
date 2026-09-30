@@ -1,4 +1,6 @@
 """Triage (#34) with a fake gh, git and model at the process boundary. Nothing calls GitHub or a model."""
+import contextlib
+import io
 import json
 import os
 import re
@@ -13,6 +15,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'lib'))
 import triage as t
+import tslog
 
 PRODUCT = 'yeroo/docxy'
 PROJECT, WORD, EXCEL = 'yeroo/docxy-project-spec', 'yeroo/docxy-word-spec', 'yeroo/docxy-excel-spec'
@@ -894,6 +897,48 @@ class Command(unittest.TestCase):
         with patch.dict(os.environ, AGWORKBENCH_CONFIG=str(config)), patch('sys.stderr') as err:
             self.assertEqual(2, t.main(['run', '--repo', PRODUCT]))
         self.assertIn('no "triage" section', ''.join(c.args[0] for c in err.write.call_args_list))
+
+
+
+class Timestamps(unittest.TestCase):
+    """#78: the `#triage` watch pane stamps every line; `run` (the conductor's triage-N.log) does not."""
+
+    class Triage:
+        def __init__(self, repo, config, out, **kwargs):
+            self.out = out
+
+        def watch(self, interval, limit):
+            self.out('#469: priority:P1 (model)')
+            self.out('triage scan failed: boom')
+
+        def run_once(self, *args, **kwargs):
+            self.out('#469: priority:P1 (model)')
+            return 0
+
+    def main(self, argv):
+        out = io.StringIO()
+        with patch.object(t, 'Triage', self.Triage), patch.object(t, 'load_config', return_value={}), \
+                patch.object(t.tslog, 'install', wraps=tslog.install) as install, contextlib.redirect_stdout(out):
+            self.assertEqual(0, t.main(argv))
+        return out.getvalue(), install
+
+    def test_watch_stamps_every_line(self):
+        text, install = self.main(['watch', '--repo', PRODUCT])
+        install.assert_called_once()
+        self.assertRegex(text, r'^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d #469: priority:P1 \(model\)\n'
+                               r'\d\d:\d\d:\d\d triage scan failed: boom\n$')
+
+    def test_run_is_not_stamped(self):
+        text, install = self.main(['run', '--repo', PRODUCT])
+        install.assert_not_called()
+        self.assertEqual('#469: priority:P1 (model)\n', text)
+
+    def test_a_watch_config_error_is_stamped_too(self):
+        err = io.StringIO()
+        with patch.object(t, 'load_config', side_effect=t.ConfigError('no "triage" section')), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            self.assertEqual(t.ConfigError.code, t.main(['watch', '--repo', PRODUCT]))
+        self.assertRegex(err.getvalue(), r'^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d triage: no "triage" section\n$')
 
 
 if __name__ == '__main__':

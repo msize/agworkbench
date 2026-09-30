@@ -7,6 +7,8 @@ Claude is never rung while it is mid-turn.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import sys
 import os
 import copy
@@ -3174,6 +3176,40 @@ class HelperMarkers(unittest.TestCase):
         marker = json.loads((folder / 'state' / 'helpers' / 'p-2.done').read_text(encoding='utf-8'))
         self.assertEqual([], marker['rows'])
         self.assertFalse(closer.helper_untouched(marker['rows'], ['#']))
+
+
+class Timestamps(unittest.TestCase):
+    """#78: every line in the relay's pane starts with one timestamp, installed by main()."""
+    STAMPED = r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d "
+
+    def test_main_installs_the_stamp_and_a_log_line_has_exactly_one(self):
+        class Relay:
+            log = relay.Relay.log
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run(self):
+                self.log("rang codex for m1 (review) [submitted]")
+                self.log("watching PR #8")
+                return 0
+
+        out = io.StringIO()
+        panes = [str(uuid.uuid4()), str(uuid.uuid4())]
+        with patch.object(relay, "Relay", Relay), patch.object(relay, "stall_setting", return_value=None), \
+                patch.object(relay.tslog, "install", wraps=relay.tslog.install) as install, \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(0, relay.main(["--hub", "h", "--claude-pane", panes[0], "--codex-pane", panes[1],
+                                            "--repo", "o/r", "--branch", "issue-8-x"]))
+        install.assert_called_once()
+        self.assertRegex(out.getvalue(), self.STAMPED + r"rang codex for m1 \(review\) \[submitted\]\n"
+                                         r"\d\d:\d\d:\d\d watching PR #8\n$")
+
+    def test_log_adds_no_time_of_its_own(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            relay.Relay.log(None, "hello")
+        self.assertEqual("hello\n", out.getvalue())
 
 
 if __name__ == "__main__":
