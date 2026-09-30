@@ -19,6 +19,7 @@ sys.path.insert(0, str(ROOT / 'lib'))
 import conductor as q
 import closer
 import cleanup
+import tslog
 import wb
 
 REAL_FREE_BYTES = q.free_bytes          # QueueCase patches it; the real one is tested on its own
@@ -3672,3 +3673,72 @@ class NamedQueues(unittest.TestCase):
         self.assertIn('settings: revmuxProfile null -> "kimi-only"', self.output())
         with self.assertRaises(q.UsageError):
             self.start('o/r#3', name='kimi', revmux_profile='a b')
+
+
+STAMPED = r'^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d '
+
+
+class Timestamps(unittest.TestCase):
+    """#78: the `#queue` pane (`run`) stamps every line; what is parsed or written to a file does not."""
+    terminal, gh = QueueCase.terminal, QueueCase.gh
+
+    def setUp(self):
+        QueueCase.setUp(self)
+        self.install = self.enterContext(patch.object(q.tslog, 'install', wraps=tslog.install))
+        self.real_start = q.start_queue
+        self.enterContext(patch.object(q, 'start_queue', self.start))    # main() has no root argument
+
+    def start(self, spec, *args, **kwargs):
+        return self.real_start(spec, *args, **dict(kwargs, root=self.root / 'queues'))
+
+    def launching(self, number):
+        self.start(f'o/r#{number}')
+        sys.stdout.seek(0)
+        sys.stdout.truncate()
+        token = str(uuid.uuid4())
+        with self.store.transaction() as data:
+            data['members'][0].update(state='launching', attempt=1, token=token)
+        return token
+
+    def test_run_stamps_every_line_of_the_pane(self):
+        class Worker:
+            def __init__(self, store, token):
+                pass
+
+            def run(self):
+                print('queue paused: low memory: 2.9 GB free < 3 GB', flush=True)
+                print('queue: boom', file=sys.stderr, flush=True)
+                print('Queue o/r — snapshot\n\n| Issue |', flush=True)
+                return 0
+
+        err = io.StringIO()
+        with patch.object(q, 'Worker', Worker), contextlib.redirect_stderr(err):
+            self.assertEqual(0, q.main(['run', '--file', str(self.store.path), '--token', 'T']))
+        lines = sys.stdout.getvalue().splitlines()
+        self.assertRegex(lines[0], STAMPED + r'queue paused: low memory: 2\.9 GB free < 3 GB$')
+        self.assertEqual(4, len(lines))
+        for line in lines[1:]:
+            self.assertRegex(line, r'^\d\d:\d\d:\d\d ')
+        self.assertRegex(err.getvalue(), r'^\d\d:\d\d:\d\d queue: boom\n$')     # one date state for both
+
+    def test_dry_run_json_is_not_stamped(self):
+        self.assertEqual(0, q.main(['start', '--spec', 'o/r#1', '--dry-run']))
+        self.install.assert_not_called()
+        self.assertEqual([1], json.loads(sys.stdout.getvalue())['members'])
+
+    def test_member_context_is_exactly_its_json(self):
+        token = self.launching(1)
+        self.assertEqual(0, q.main(['member-context', '--file', str(self.store.path), '--number', '1',
+                                    '--attempt', '1', '--token', token]))
+        self.install.assert_not_called()
+        self.assertTrue(sys.stdout.getvalue().startswith('{'))
+        self.assertEqual(1, json.loads(sys.stdout.getvalue())['number'])
+
+    def test_mark_is_not_stamped(self):
+        self.launching(1)
+        with self.store.transaction() as data:
+            data['members'][0]['state'] = 'active'
+        self.assertEqual(0, q.main(['mark', '--file', str(self.store.path), '--number', '1',
+                                    '--pr', 'https://github.com/o/r/pull/9']))
+        self.install.assert_not_called()
+        self.assertEqual('marked #1 PR https://github.com/o/r/pull/9\n', sys.stdout.getvalue())

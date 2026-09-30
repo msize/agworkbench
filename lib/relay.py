@@ -90,6 +90,7 @@ sys.path.insert(0, str(HERE))
 from peerchat import is_busy  # noqa: E402 - also available as relay.is_busy
 import limits  # noqa: E402
 import closer  # noqa: E402
+import tslog  # noqa: E402
 
 PR_FIELDS = ("number,url,state,createdAt,updatedAt,closedAt,reviewDecision,mergedAt,reviews,comments,headRefName,"
              "isCrossRepository,statusCheckRollup")
@@ -770,7 +771,7 @@ class Relay:
                 time.sleep(0.05)
 
     def log(self, text: str) -> None:
-        print(f"{time.strftime('%H:%M:%S')} {text}", flush=True)
+        print(text, flush=True)     # main() installed the timestamp prefix (#78)
 
     # mail -----------------------------------------------------------------------------------
     def hold(self, peer: Peer, mid: str, reason: str, *, failed: bool = False,
@@ -1804,6 +1805,7 @@ def peers_for(args: argparse.Namespace) -> list[Peer]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    tslog.install()     # the relay is always a pane: every line timestamped, errors too (#78)
     args = build_parser().parse_args(argv)
     peers = peers_for(args)
     relay = Relay(Path(args.hub), peers, args.repo, args.branch, args.mail_interval,

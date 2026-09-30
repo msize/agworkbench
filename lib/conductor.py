@@ -23,6 +23,7 @@ import agw
 import closer
 import labelquery
 import triage
+import tslog
 
 HERE = Path(__file__).resolve().parent
 STATES = {'pending', 'launching', 'active', 'pr-open', 'blocked', 'failed', 'merged', 'closed'}
@@ -2311,6 +2312,7 @@ def main(argv=None):
                                revmux_profile=args.revmux_profile, big_review=args.big_review,
                                on_limit=args.on_limit)
         if args.command == 'run':
+            tslog.install()         # the #queue pane: every line timestamped (#78)
             return Worker(Store(args.file), args.token).run()
         if args.command == 'mark':
             mark_pr(args.file, args.number, args.pr, args.reason)

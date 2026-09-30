@@ -58,6 +58,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import tslog
+
 HERE = Path(__file__).resolve().parent
 COMMAND = HERE.parent / 'claude' / 'commands' / 'triage-issue.md'
 
@@ -1053,6 +1055,8 @@ def main(argv=None) -> int:
         if verb == 'watch':
             child.add_argument('--interval', type=int, default=300)
     args = parser.parse_args(argv)
+    if args.command == 'watch':
+        tslog.install()     # the #triage pane: every line timestamped, a config error too (#78)
     try:
         if args.limit < 0:
             raise ConfigError('--limit must not be negative')
