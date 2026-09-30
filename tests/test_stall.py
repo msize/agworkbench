@@ -405,6 +405,25 @@ class NoFalseStalls(StallFixture):
         self.r.state['limits'] = {'codex': {'kind': 'limited', 'tool': 'codex', 'announced': True}}
         self.assert_quiet()
 
+    def test_a_usage_limit_waited_out(self):
+        # #77: hours of waiting are not a stall.
+        self.r.state['limits'] = {'codex': {'kind': 'limited', 'tool': 'kimi', 'announced': True, 'wait': True,
+                                            'retryAt': 1_000_000 + 30 * MIN, 'probes': 3, 'probeAt': None}}
+        self.assert_quiet(20 * S)
+
+    def test_a_review_usage_limit_wait_until_its_retry_time(self):
+        # #77: a reviewer's limit stopped a revmux round; the planner waits for the rerun with nothing live.
+        self.write('review-limit.json', {'tool': 'kimi', 'since': 1_000_000, 'retryAt': 1_000_000 + 8 * S * MIN,
+                                         'round': 2})
+        self.assert_quiet(8 * S - 1)
+        self.assertTrue(any('review usage-limit wait until' in line for line in self.logs), self.logs)
+        self.run_until(9 * S, start=8 * S)                  # past retryAt with no rerun running: a stall
+        self.assertEqual(1, len(self.stall_mail()))
+
+    def test_an_unreadable_review_limit_retry_time_still_exempts(self):
+        self.write('review-limit.json', {'tool': 'kimi', 'round': 2})
+        self.assert_quiet()
+
     def test_off_when_stall_minutes_is_zero(self):
         self.r = self.make_relay(minutes=0)
         self.assert_quiet()

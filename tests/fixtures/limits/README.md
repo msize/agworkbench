@@ -44,3 +44,8 @@ item above it, with no blank row), and the error and hint rows follow the templa
 provider's message around the quota words is invented, and `kimi-limited-usage.txt`'s wording
 ("weekly usage limit") is a guess at how a plan limit would read. When a real Kimi limit frame is
 seen, add it here verbatim.
+
+`kimi-limited-5hour.txt` (#77) carries the error text the owner quoted from the 2026-09-29/30 evaluation
+(`Error: [provider.auth_error] 403 You've reached your 5-hour usage limit ... Your quota will reset when
+the current 5-hour window ends.`), wrapped over two rows. That text is real; the rows around it are
+synthesised like the others.

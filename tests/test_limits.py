@@ -51,6 +51,7 @@ EXPECTED = {
     "kimi-limited-quota": ("kimi", "limited", False),
     "kimi-limited-balance": ("kimi", "limited", False),
     "kimi-limited-usage": ("kimi", "limited", False),
+    "kimi-limited-5hour": ("kimi", "limited", False),     # #77: the owner's evaluation, 2026-09-29/30
     "kimi-rate-limit-transient": ("kimi", None, False),
     "kimi-retrying": ("kimi", None, False),
     "kimi-tool-output": ("kimi", None, False),
@@ -133,9 +134,10 @@ class Fixtures(unittest.TestCase):
                 text = frame(name)
                 error = next(row.strip() for row in text.splitlines() if "Error: [provider." in row)
                 code = re.search(r"\[(provider\.[a-z_]+)\]", error).group(1)
-                self.assertTrue(f'"{code}"' in kimi, code)
+                # The strings run may break inside a code: provider.auth_error ends one run as `.auth_error"`.
+                self.assertTrue(f'"{code}"' in kimi or f'.{code.split(".", 1)[1]}":' in kimi, code)
                 self.assertTrue(" ".join(text.split()).find(" ".join(hint.split())) >= 0 or name == "kimi-diff")
-                if kind == "limited" and name != "kimi-limited-usage":
+                if kind == "limited" and name not in ("kimi-limited-usage", "kimi-limited-5hour"):
                     self.assertTrue(any(phrase in " ".join(text.split()) for phrase in
                                         ("exceeded your current quota", "insufficient balance")), name)
 
