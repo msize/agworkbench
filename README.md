@@ -779,7 +779,10 @@ nobody answers it; it fails over as above. `-WaitOnLimit` changes nothing else: 
 over exactly as before.
 
 The `kimi` label selects the issues. Triage sets it when a product's triage entry has
-`"kimiLabel": true` (see Issue triage), and `-Watch -Prune` drops a pending member that lost it. With
+`"kimiLabel": true` (see Issue triage), and `-Watch -Prune` drops a pending member that lost it. When
+a scan finds nothing left to start (no pending or launching member), a watching queue says so once:
+`(kimi) idle: no issues left for where: kimi AND priority IN [P2, P3]`, and again only after a new
+member came and went (#82). It is a line in the conductor's pane, not a notification. With
 Kimi as the implementer, the planner also writes a stricter, Kimi-grade plan (exact edits and what
 must not change, an oracle by path or `STOP AND REPORT`, tests first, pitfalls, and what done means,
 checked by `wb.py plan-check`). It compares Kimi's diff with that plan before each review round.
