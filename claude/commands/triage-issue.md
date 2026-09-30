@@ -62,32 +62,42 @@ Answer with ONE JSON object and nothing else:
 ## Kimi suitability (only when the facts say `kimiLabel: true`)
 
 The product has a `kimi` label for issues Kimi Code, a less careful implementer, can do alone from a
-plan. Judge it by these fixed rules; the tool enforces the priority rule itself.
+plan. Judge it by these named rules and answer with the one that decided it; the tool enforces the
+priority rule itself, and a verdict that contradicts its own rule is treated as not suitable.
 
-**Suitable** only when ALL of these hold:
-- it is P2 or P3;
-- it is self-contained, in one crate or a small area;
-- its correctness can be checked against something already in the repo: existing tests, fixtures,
-  an oracle file, or sibling code to mirror;
-- it is a narrow fix or a small feature, not a new subsystem;
-- it has no data-loss risk on save or open.
+**Excluded** - check these first; the first that holds decides, and the issue is not suitable:
+- `p0-p1`: it is P0 or P1.
+- `save-path`: it touches save or serialise paths, or anything else where a mistake loses data.
+- `outside-format`: it depends on an outside file-format spec, interop behaviour or real sample files,
+  with no oracle for them in the repo.
+- `umbrella-batch`: it is an umbrella or a batch, or a leftovers list whose items do not all sit in one
+  crate or area.
+- `new-subsystem`: it is a new subsystem or a large feature, such as a whole new editor.
+- `multi-crate`: it spans more crates than the allowed rules below permit.
+- `no-oracle`: nothing in the repo can check its correctness: no tests, fixtures, oracle file or
+  sibling code to mirror.
+- `not-narrow`: none of the exclusions above holds, but no allowed rule fits either: too large, too
+  vague, or not clearly one of the allowed shapes.
 
-**Not suitable** when ANY of these holds:
-- it depends on an outside file-format spec or real sample files that are not in the repo;
-- it touches save or serialise paths, where a mistake loses data;
-- it spans several crates, or the UI and the test harness together;
-- it is an umbrella, a batch or a leftovers list;
-- it is P0 or P1.
+**Allowed** - when it is P2 or P3 and no exclusion holds, it is suitable under the first that fits:
+- `narrow-fix`: a self-contained fix or small feature in one crate or a small area, checkable against
+  existing tests, fixtures, an oracle file or sibling code.
+- `leftovers-one-area`: a `Leftovers from #N` list whose items all sit in one crate or area, none on a
+  save or serialise path.
+- `harness-two-crates`: uiharness verbs or one app's control surface, spanning at most 2 crates, where
+  the second crate is only the verb's thin host side.
+- `ui-single-view`: a small UI/UX fix in a single view.
 
-Add two fields to the object above:
+Add three fields to the object above:
 
 ```json
 {"priority": "P2", "ux": false, "rationale": "...", "specRefs": [], "exception": "none",
- "kimiSuitable": true, "kimiReason": "one crate; tests/fixtures/x.docx is the oracle"}
+ "kimiSuitable": true, "kimiRule": "narrow-fix", "kimiReason": "one crate; tests/fixtures/x.docx is the oracle"}
 ```
 
 - `kimiSuitable`: `true` or `false`.
-- `kimiReason`: at most 1000 characters, naming the rule that decided it. It stays private.
+- `kimiRule`: the id of the rule that decided it: an allowed one when suitable, an excluded one when not.
+- `kimiReason`: at most 1000 characters, why that rule holds. It stays private.
 
 When the facts also say `kimiOnly: true`, the priority is not being judged: answer with ONLY
-`{"kimiSuitable": ..., "kimiReason": "..."}`.
+`{"kimiSuitable": ..., "kimiRule": "...", "kimiReason": "..."}`.

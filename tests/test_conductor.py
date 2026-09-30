@@ -3283,6 +3283,95 @@ class LabelQuery(unittest.TestCase):
             q.main(['start', '--spec', 'bugs', '--spec-env'])
 
 
+class IdleNotice(unittest.TestCase):
+    """#82: a watching queue with no pending or launching member says once that nothing is left, and says
+    it again only after a member came and went; never after a failed scan, never for an unwatched queue."""
+    terminal, start, spawn, worker, member, report = (QueueCase.terminal, QueueCase.start, QueueCase.spawn,
+                                                      QueueCase.worker, QueueCase.member, QueueCase.report)
+    SPEC = 'where: kimi AND priority IN [P2, P3]'
+
+    def setUp(self):
+        QueueCase.setUp(self)
+        self.pages = [[listed(1, '2026-01-01', 'kimi', 'priority:P2')]]
+        self.scan_error = None
+
+    def gh(self, *args):
+        if args[:2] == ('repo', 'view'):
+            return {'nameWithOwner': 'o/r'}
+        if args[0] == 'api' and args[1].startswith('repos/o/r/issues?state=open'):
+            if self.scan_error:
+                raise q.QueueError(self.scan_error)
+            return self.pages
+        return QueueCase.gh(self, *args)
+
+    def idle_lines(self):
+        return [line for line in sys.stdout.getvalue().splitlines() if 'idle:' in line]
+
+    def rescan(self, worker):
+        self.now += 300                                   # the watch rescans every 300 s
+        worker.tick()
+
+    def test_a_watching_queue_says_once_when_it_is_idle(self):
+        self.start(self.SPEC, repo='o/r', gh=self.gh, watch=True)
+        worker = self.worker()
+        worker.tick()                                     # #1 launching: work left
+        self.assertEqual([], self.idle_lines())
+        worker.tick()                                     # #1 active: nothing left to start
+        worker.tick()
+        self.rescan(worker)
+        self.assertEqual([f'idle: no issues left for {q.watched_spec(self.store.load())}'], self.idle_lines())
+        self.assertIn('kimi AND priority IN [P2, P3]', self.idle_lines()[0])
+        self.pages = [[listed(1, '2026-01-01', 'kimi', 'priority:P2'), listed(2, '2026-01-02', 'kimi', 'priority:P3')]]
+        self.report(1)                                    # #1's PR frees the slot
+        self.rescan(worker)                               # #2 found and launched
+        self.assertEqual('launching', self.member(2)['state'])
+        self.assertEqual(1, len(self.idle_lines()))
+        worker.tick()                                     # #2 active: dry again
+        self.assertEqual(2, len(self.idle_lines()))
+        worker.notify = Mock()
+        worker.tick()
+        worker.notify.assert_not_called()
+
+    def test_an_unwatched_queue_never_says_idle(self):
+        self.start('o/r#1')
+        worker = self.worker()
+        for _ in range(4):
+            worker.tick()
+        self.assertEqual('active', self.member(1)['state'])
+        self.assertEqual([], self.idle_lines())
+
+    def test_a_failed_scan_is_not_idle(self):
+        self.start(self.SPEC, repo='o/r', gh=self.gh, watch=True)
+        with self.store.transaction() as data:
+            data['members'] = []                          # nothing queued, and the next scan fails
+        self.scan_error = 'HTTP 502'
+        worker = self.worker()
+        worker.tick()
+        self.assertIn('label scan', worker.errors)
+        self.assertEqual([], self.idle_lines())
+        self.pages = [[]]
+        self.scan_error = None
+        self.rescan(worker)                               # the scan works: the queue really is empty
+        self.assertEqual(1, len(self.idle_lines()))
+
+    def test_a_failed_rescan_does_not_repeat_the_idle_line(self):
+        # #82 r1: announced, then a passing 502, then a working scan: still one line, not one per error.
+        self.start(self.SPEC, repo='o/r', gh=self.gh, watch=True)
+        with self.store.transaction() as data:
+            data['members'] = []
+        self.pages = [[]]
+        worker = self.worker()
+        worker.tick()
+        self.assertEqual(1, len(self.idle_lines()))
+        self.scan_error = 'HTTP 502'
+        self.rescan(worker)
+        self.assertIn('label scan', worker.errors)
+        self.scan_error = None
+        self.rescan(worker)
+        self.assertNotIn('label scan', worker.errors)
+        self.assertEqual(1, len(self.idle_lines()))
+
+
 class Specs(unittest.TestCase):
     def test_lists_and_repositories(self):
         self.assertEqual(('o/r', [3, 4], None), q.resolve_spec('o/r#3,#4,3'))

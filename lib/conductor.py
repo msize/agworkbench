@@ -1258,6 +1258,7 @@ class Worker:
         self.ram_announced = False    # ... a memory pause (#61)
         self.tools_announced = False  # ... a tool-limits pause (#61)
         self.waits_announced = ()     # the members whose usage-limit wait this worker printed (#77)
+        self.idle_announced = False   # whether this worker said the watched queue has nothing left (#82)
         self.tick_sessions = _UNREAD  # issue numbers with a live session, read at most once per tick
         self.launch_announced = False
         self.spawn = spawn or self.spawn_launcher
@@ -2125,6 +2126,14 @@ class Worker:
             else:
                 print(f'{self.tag}queue resumed: usage limit cleared', flush=True)
             self.waits_announced = waits
+        # A watching queue with nothing left to start says so once (#82). While the last scan failed, nothing
+        # is known: no claim that the spec is empty, and no reset (a passing gh error does not repeat it).
+        # Not a pause: no notification, no status change.
+        if 'label scan' not in self.errors:
+            idle = current['watch'] and not any(m['state'] in {'pending', 'launching'} for m in current['members'])
+            if idle and not self.idle_announced:
+                print(f'{self.tag}idle: no issues left for {watched_spec(current)}', flush=True)
+            self.idle_announced = idle
         for m in current['members']:
             display = (m['state'], m.get('prState'), m.get('reason'))
             shown = display + (bool(m.get('limitWait')),)

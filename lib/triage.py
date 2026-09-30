@@ -39,7 +39,13 @@ and removes it when not. P0/P1 is never suitable, nor is the deterministic spec-
 the model says. The reason goes to the private log only. A human's `kimi` wins: triage records the ids of
 its own `kimi` labeled/unlabeled issue events, and any other such event - or a `kimi` label it never set -
 leaves the label alone. `run --kimi-only` (implies --retriage) re-judges only suitability on open P2/P3
-issues: no priority change and no public comment.
+issues: no priority change and no public comment; it ends with a one-line count (#82).
+
+Every kimi verdict names the rule that decided it (#82): the model picks `kimiRule` from KIMI_ALLOWED or
+KIMI_EXCLUDED (a schema enum), and an answer whose rule contradicts its verdict is not suitable - never
+label on doubt. The log line reads `kimi: yes (<rule>) - <reason>`. Two ids are the tool's own, never the
+model's: `spec-reference` (the deterministic spec-reference path) and `not-p2-p3` (the issue lost its P2/P3
+label before the kimi write).
 """
 
 from __future__ import annotations
@@ -114,10 +120,19 @@ SCHEMA = {
     },
 }
 KIMI_LABEL = 'kimi'
-KIMI_PROPERTIES = {'kimiSuitable': {'type': 'boolean'}, 'kimiReason': {'type': 'string', 'maxLength': 1000}}
+# #82: the rules the model picks from (triage-issue.md explains each). An allowed one admits an issue that
+# is also P2/P3; an excluded one - checked first by the model - rules it out.
+KIMI_ALLOWED = ('narrow-fix', 'leftovers-one-area', 'harness-two-crates', 'ui-single-view')
+KIMI_EXCLUDED = ('p0-p1', 'save-path', 'outside-format', 'umbrella-batch', 'new-subsystem', 'multi-crate',
+                 'no-oracle', 'not-narrow')
+KIMI_NOT_P2_P3 = 'not-p2-p3'          # tool-only: the issue lost its P2/P3 label before the kimi write
+KIMI_SPEC_REF = 'spec-reference'      # tool-only: the deterministic spec-reference path, whatever its priority
+KIMI_PROPERTIES = {'kimiSuitable': {'type': 'boolean'},
+                   'kimiRule': {'type': 'string', 'enum': [*KIMI_ALLOWED, *KIMI_EXCLUDED]},
+                   'kimiReason': {'type': 'string', 'maxLength': 1000}}
 KIMI_PRIORITIES = ('P2', 'P3')
 PENDING_SLACK = 300     # seconds of clock skew between this machine and GitHub's event times
-DETERMINISTIC_NOT_KIMI = 'an open spec issue references it and makes it P0: spec work waits on it, never Kimi work'
+DETERMINISTIC_NOT_KIMI = 'an open spec issue references it: spec work waits on it, never Kimi work'
 
 
 def event_time(event: dict) -> float | None:
@@ -313,6 +328,7 @@ class Decision:
     capped: bool = False
     exception: str = 'none'
     kimi: bool | None = None                     # #77: None when the product has no kimi label
+    kimiRule: str = ''                           # #82: the rule that decided it
     kimiReason: str = ''
 
 
@@ -369,13 +385,36 @@ def parse_model_output(done: subprocess.CompletedProcess) -> dict:
     return value
 
 
+def kimi_text(suitable: bool, rule: str, reason: str) -> str:
+    """The one shape a kimi verdict is shown in (#82): the log line, --kimi-only and both dry runs."""
+    return f"kimi: {'yes' if suitable else 'no'} ({rule}) - {reason}"
+
+
+def kimi_summary(counts: dict, dry_run: bool) -> str:
+    """The last line of a --kimi-only run (#82); the unchanged and failed counts only when there are any."""
+    if dry_run:
+        text = f"kimi (dry run): {counts['yes']} would be yes, {counts['no']} would be no"
+    else:
+        text = f"kimi: {counts['labelled']} labelled, {counts['cleared']} cleared, {counts['kept']} kept (human)"
+        if counts['unchanged']:
+            text += f", {counts['unchanged']} unchanged"
+    return text + (f", {counts['failed']} failed" if counts['failed'] else '')
+
+
 def validate_kimi(result) -> dict:
-    suitable, reason = result['kimiSuitable'], result['kimiReason']
+    """The kimi fields, checked. A verdict its own rule contradicts is resolved to not suitable (#82)."""
+    suitable, rule, reason = result['kimiSuitable'], result['kimiRule'], result['kimiReason']
     if type(suitable) is not bool:
         raise IssueFailed(f'invalid kimiSuitable {suitable!r}')
+    if rule not in KIMI_ALLOWED and rule not in KIMI_EXCLUDED:
+        raise IssueFailed(f'invalid kimiRule {rule!r}')
     if not isinstance(reason, str) or not reason.strip() or len(reason) > 1000:
         raise IssueFailed('the kimiReason must be 1..1000 characters')
-    return dict(kimiSuitable=suitable, kimiReason=reason.strip())
+    reason = reason.strip()
+    if suitable == (rule in KIMI_EXCLUDED):
+        said, kind = ('suitable', 'excluded') if suitable else ('unsuitable', 'allowed')
+        suitable, reason = False, f'model contradicted itself: said {said} under {kind} rule {rule}: {reason}'
+    return dict(kimiSuitable=suitable, kimiRule=rule, kimiReason=reason)
 
 
 def validate(result, known_refs: dict[str, str], kimi: bool = False, kimi_only: bool = False) -> dict:
@@ -568,7 +607,7 @@ class Triage:
                                           f'(severity {severity or "unknown"}, no data loss/crash/open-save/security); capped at P2')
                     decision.priority, decision.capped = 'P2', True
             if self.config.get('kimiLabel'):
-                decision.kimi, decision.kimiReason = False, DETERMINISTIC_NOT_KIMI
+                decision.kimi, decision.kimiRule, decision.kimiReason = False, KIMI_SPEC_REF, DETERMINISTIC_NOT_KIMI
             return decision
         floor = 'P1' if refs else None
         answer = self.ask_model(issue, refs, floor)
@@ -589,9 +628,10 @@ class Triage:
             decision.notes.append(f'the model said P0 for an author outside the repo ({association}); written as P1')
             decision.priority = 'P1'
         if self.config.get('kimiLabel'):
-            decision.kimi, decision.kimiReason = answer['kimiSuitable'], answer['kimiReason']
+            decision.kimi, decision.kimiRule, decision.kimiReason = (answer['kimiSuitable'], answer['kimiRule'],
+                                                                     answer['kimiReason'])
             if decision.kimi and decision.priority not in KIMI_PRIORITIES:
-                decision.kimi = False
+                decision.kimi, decision.kimiRule = False, 'p0-p1'
                 decision.kimiReason = (f'{decision.priority} is never Kimi work (the model said suitable: '
                                        f'{answer["kimiReason"]})')
         return decision
@@ -690,7 +730,7 @@ class Triage:
                 args += ['--add-label', 'ux']
             elif retriage and any(name.casefold() == 'ux' for name in names):
                 args += ['--remove-label', 'ux']
-        kimi = self.kimi_plan(number, names, decision.kimi, decision.kimiReason)
+        kimi = self.kimi_plan(number, names, decision.kimi, decision.kimiRule, decision.kimiReason)
         args += kimi['args']
         self.log_rationale(issue, decision, kimi['line'])
         at = self.clock()
@@ -808,24 +848,24 @@ class Triage:
             self.save_kimi_state(state)
         return ours
 
-    def kimi_plan(self, number: int, names: list[str], suitable: bool | None, reason: str) -> dict:
-        """What to do with the `kimi` label: {args, line, action}. A human's label - any kimi event triage
-        did not cause, or a kimi label triage never set - is left alone."""
+    def kimi_plan(self, number: int, names: list[str], suitable: bool | None, rule: str, reason: str) -> dict:
+        """What to do with the `kimi` label: {args, line, action, override}. A human's label - any kimi event
+        triage did not cause, or a kimi label triage never set - is left alone."""
         if suitable is None:
-            return dict(args=[], line=None, action=None)
+            return dict(args=[], line=None, action=None, override=False)
         present = any(name.casefold() == KIMI_LABEL for name in names)
         events = self.kimi_events(number)
         ours = self.own_kimi_events(number, events, self.kimi_state())
         foreign = [event for event in events if event.get('id') not in ours]
         if foreign or (present and not ours):
             what = f"{foreign[-1].get('event')} by hand" if foreign else 'set by hand'
-            return dict(args=[], line=f'kimi: human override ({what}); left alone', action=None)
-        line = f"kimi: {'yes' if suitable else 'no'} - {reason}"
+            return dict(args=[], line=f'kimi: human override ({what}); left alone', action=None, override=True)
+        line = kimi_text(suitable, rule, reason)
         if suitable and not present:
-            return dict(args=['--add-label', KIMI_LABEL], line=line, action='labeled')
+            return dict(args=['--add-label', KIMI_LABEL], line=line, action='labeled', override=False)
         if not suitable and present:
-            return dict(args=['--remove-label', KIMI_LABEL], line=line, action='unlabeled')
-        return dict(args=[], line=line, action=None)
+            return dict(args=['--remove-label', KIMI_LABEL], line=line, action='unlabeled', override=False)
+        return dict(args=[], line=line, action=None, override=False)
 
     def record_kimi(self, number: int, plan: dict, at: float) -> None:
         """After our edit (made at `at`): record the id of the kimi event it caused, read back from the
@@ -849,18 +889,19 @@ class Triage:
             self.out(f'#{number}: kimi label {plan["action"]}; its event is not listed yet, recorded as pending')
         self.save_kimi_state(state)
 
-    def judge_kimi(self, issue: dict) -> tuple[bool, str]:
-        """--kimi-only: suitability alone. The deterministic spec-reference path is never Kimi work."""
+    def judge_kimi(self, issue: dict) -> tuple[bool, str, str]:
+        """--kimi-only: suitability alone, as (suitable, rule, reason). The deterministic spec-reference path
+        is never Kimi work."""
         refs = self.referencing(issue['number'])
         is_bug = any(name.casefold() == self.config['bugLabel'].casefold() for name in label_names(issue))
         if refs and (is_bug or any(r['bugMirror'] for r in refs)):
-            return False, DETERMINISTIC_NOT_KIMI
+            return False, KIMI_SPEC_REF, DETERMINISTIC_NOT_KIMI
         answer = self.ask_model(issue, refs, 'P1' if refs else None, kimi_only=True)
-        return answer['kimiSuitable'], answer['kimiReason']
+        return answer['kimiSuitable'], answer['kimiRule'], answer['kimiReason']
 
-    def apply_kimi(self, issue: dict, suitable: bool, reason: str) -> str | None:
+    def apply_kimi(self, issue: dict, suitable: bool, rule: str, reason: str) -> dict | None:
         """The kimi label alone: the private log line, then the label; no public comment, no priority.
-        The log line, or None when the issue closed meanwhile."""
+        The kimi plan (its line, action, override), or None when the issue closed meanwhile."""
         number = issue['number']
         current = self.gh_json('api', f'repos/{self.product}/issues/{number}', what=f'#{number}', error=IssueFailed)
         if current.get('state') != 'open':
@@ -868,8 +909,9 @@ class Triage:
             return None
         priority = priority_of(current.get('labels'))
         if suitable and priority not in KIMI_PRIORITIES:
+            rule = 'p0-p1' if priority in ('P0', 'P1') else KIMI_NOT_P2_P3
             suitable, reason = False, f'{priority or "untriaged"} now, never Kimi work ({reason})'
-        plan = self.kimi_plan(number, label_names(current), suitable, reason)
+        plan = self.kimi_plan(number, label_names(current), suitable, rule, reason)
         if self.specs:
             self.post_log(issue, [f"{self.product}#{number} ({issue.get('title') or ''}) -> kimi only",
                                   plan['line'], '', LOG_MARKER])
@@ -880,7 +922,7 @@ class Triage:
             self.gh_ok('issue', 'edit', str(number), '--repo', self.product, *plan['args'],
                        what=f'labelling #{number}', error=IssueFailed)
             self.record_kimi(number, plan, at)
-        return plan['line']
+        return plan
 
     # the run ------------------------------------------------------------------------------------------
     def failures_path(self) -> Path:
@@ -945,22 +987,26 @@ class Triage:
         failed = False
         # Failure counts and backoff belong to -Watch only: a manual or queue run always tries again.
         failures = self.failures() if watch else {}
+        counts = dict.fromkeys(('yes', 'no', 'labelled', 'cleared', 'kept', 'unchanged', 'failed'), 0)
         for issue in self.select(issues, numbers, retriage, limit, watch, follow_ups, kimi_only):
             number = issue['number']
             try:
                 if kimi_only:
-                    suitable, reason = self.judge_kimi(issue)
+                    suitable, rule, reason = self.judge_kimi(issue)
                     if self.dry_run:
-                        self.out(f"#{number}: would judge kimi: {'yes' if suitable else 'no'} - {reason}")
+                        counts['yes' if suitable else 'no'] += 1
+                        self.out(f'#{number}: would judge {kimi_text(suitable, rule, reason)}')
                         continue
-                    line = self.apply_kimi(issue, suitable, reason)
-                    if line:
-                        self.out(f'#{number}: {line}')
+                    plan = self.apply_kimi(issue, suitable, rule, reason)
+                    if plan:
+                        self.out(f"#{number}: {plan['line']}")
+                        counts['kept' if plan['override'] else
+                               {'labeled': 'labelled', 'unlabeled': 'cleared'}.get(plan['action'], 'unchanged')] += 1
                     continue
                 decision = self.decide(issue)
                 label = f'priority:{decision.priority}' + (' + ux' if decision.ux else '')
                 if self.dry_run:
-                    kimi = '' if decision.kimi is None else f" [kimi: {'yes' if decision.kimi else 'no'} - {decision.kimiReason}]"
+                    kimi = '' if decision.kimi is None else f' [{kimi_text(decision.kimi, decision.kimiRule, decision.kimiReason)}]'
                     self.out(f'#{number}: would label {label} ({decision.source}): {decision.rationale}'
                              + ''.join(f' [{note}]' for note in decision.notes) + kimi)
                     continue
@@ -984,6 +1030,7 @@ class Triage:
                 return err.code
             except IssueFailed as err:
                 failed = True
+                counts['failed'] += 1
                 self.out(f'#{number}: FAILED, nothing written: {err}')
                 entry = failures.get(str(number), {'count': 0})
                 count = entry['count'] + 1
@@ -994,6 +1041,8 @@ class Triage:
                     results[str(number)] = dict(priority=None, written=False, error=str(err)[:300])
         if watch and not self.dry_run:
             self.save_failures(failures)
+        if kimi_only:
+            self.out(kimi_summary(counts, self.dry_run))
         return 1 if failed else 0
 
     def watch(self, interval=300, limit=20, sleep=time.sleep, rounds=None):

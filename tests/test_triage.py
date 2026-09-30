@@ -593,13 +593,15 @@ class Writing(TriageCase):
         self.assertFalse((self.folder / 'state' / 'yeroo' / 'docxy.json').exists())
 
 
-def kimi_answer(priority='P2', suitable=True, reason='one crate, fixtures in tests/', **kwargs):
-    return dict(answer(priority, **kwargs), kimiSuitable=suitable, kimiReason=reason)
+def kimi_answer(priority='P2', suitable=True, reason='one crate, fixtures in tests/', rule=None, **kwargs):
+    rule = rule or ('narrow-fix' if suitable else 'not-narrow')
+    return dict(answer(priority, **kwargs), kimiSuitable=suitable, kimiRule=rule, kimiReason=reason)
 
 
 class KimiLabel(TriageCase):
     """#77: with "kimiLabel": true triage also judges whether an issue suits Kimi and sets or clears the
     `kimi` label; P0/P1 never suits; a human's kimi label wins; --kimi-only judges nothing else."""
+    follow_up = Decisions.follow_up
 
     def setUp(self):
         super().setUp()
@@ -620,7 +622,8 @@ class KimiLabel(TriageCase):
         self.triage().run_once(numbers=[12])
         argv, facts = self.model_calls[-1][1], self.model_calls[-1][3]
         schema = json.loads(argv[argv.index('--json-schema') + 1])
-        self.assertEqual([*t.SCHEMA['required'], 'kimiSuitable', 'kimiReason'], schema['required'])
+        self.assertEqual([*t.SCHEMA['required'], 'kimiSuitable', 'kimiRule', 'kimiReason'], schema['required'])
+        self.assertEqual([*t.KIMI_ALLOWED, *t.KIMI_EXCLUDED], schema['properties']['kimiRule']['enum'])
         self.assertEqual((True, False), (facts['kimiLabel'], facts['kimiOnly']))
         self.config['kimiLabel'] = False
         self.answers[12] = answer()
@@ -640,7 +643,7 @@ class KimiLabel(TriageCase):
         self.assertEqual(0, self.triage().run_once(numbers=[30]))
         self.assertEqual('--add-label', self.kimi_change(30))
         [log] = self.log_for(30)
-        self.assertIn('kimi: yes - PRIVATE RATIONALE: one crate', log)
+        self.assertIn('kimi: yes (narrow-fix) - PRIVATE RATIONALE: one crate', log)
         for args, body in self.public():
             self.assertNotIn('PRIVATE RATIONALE', ' '.join(args) + (body or ''))
             if args[:2] == ('issue', 'comment'):
@@ -650,10 +653,10 @@ class KimiLabel(TriageCase):
     def test_unsuitable_removes_a_kimi_label_triage_set(self):
         self.triage().run_once(numbers=[30])                             # triage sets it
         self.calls.clear()
-        self.answers[30] = kimi_answer('P3', suitable=False, reason='touches the save path')
+        self.answers[30] = kimi_answer('P3', suitable=False, reason='touches the save path', rule='save-path')
         self.assertEqual(0, self.triage().run_once(numbers=[30], retriage=True))
         self.assertEqual('--remove-label', self.kimi_change(30))
-        self.assertIn('kimi: no - touches the save path', self.log_for(30)[0])
+        self.assertIn('kimi: no (save-path) - touches the save path', self.log_for(30)[0])
         self.assertEqual([1001, 1002], json.loads((self.folder / 'state/yeroo/docxy.kimi.json').read_text())['issues']['30'])
 
     def test_an_own_event_github_lists_late_is_still_ours(self):
@@ -686,18 +689,33 @@ class KimiLabel(TriageCase):
         self.answers[20] = kimi_answer('P1', suitable=True)
         self.assertEqual(0, self.triage().run_once(numbers=[20], retriage=True))
         self.assertEqual('--remove-label', self.kimi_change(20))
-        self.assertIn('kimi: no - P1 is never Kimi work', self.log_for(20)[0])
+        self.assertIn('kimi: no (p0-p1) - P1 is never Kimi work', self.log_for(20)[0])
         self.answers[12] = kimi_answer('P0', suitable=True)
         self.triage().run_once(numbers=[12])
         self.assertIsNone(self.kimi_change(12))                           # not present: nothing to remove
-        self.assertIn('kimi: no - P0 is never Kimi work', self.log_for(12)[0])
+        self.assertIn('kimi: no (p0-p1) - P0 is never Kimi work', self.log_for(12)[0])
 
     def test_the_deterministic_path_is_never_suitable(self):
         # #100 is a bug an open spec bug references: P0 without the model.
         self.assertEqual(0, self.triage().run_once(numbers=[100]))
         self.assertEqual([], [n for n, *_ in self.model_calls])
-        self.assertIn(f'kimi: no - {t.DETERMINISTIC_NOT_KIMI}', self.log_for(100)[0])
+        self.assertIn(f'kimi: no (spec-reference) - {t.DETERMINISTIC_NOT_KIMI}', self.log_for(100)[0])
         self.assertIsNone(self.kimi_change(100))
+
+    def test_a_capped_deterministic_path_names_the_spec_reference_not_p0_p1(self):
+        # #82 r1: a minor follow-up an open spec bug references is capped at P2; the rule that decided
+        # kimi is still the spec reference, in a full run and in --kimi-only.
+        self.follow_up(100)
+        self.answers[100] = kimi_answer('P0')
+        self.assertEqual(0, self.triage().run_once(numbers=[100]))
+        self.assertIn('priority:P2', self.labels_written()[100])
+        self.assertIn(f'kimi: no (spec-reference) - {t.DETERMINISTIC_NOT_KIMI}', self.log_for(100)[0])
+        self.assertNotIn('makes it P0', self.log_for(100)[0])
+        self.product[-1]['labels'].append({'name': 'priority:P2'})
+        self.model_calls.clear()
+        self.assertEqual(0, self.triage().run_once(numbers=[100], kimi_only=True))
+        self.assertEqual([], self.model_calls)
+        self.assertIn(f'#100: kimi: no (spec-reference) - {t.DETERMINISTIC_NOT_KIMI}', self.out)
 
     def test_a_human_kimi_label_wins(self):
         # Set by hand (triage never recorded it): left alone although the model says unsuitable.
@@ -723,18 +741,19 @@ class KimiLabel(TriageCase):
 
     def test_kimi_only_changes_no_priority_and_posts_no_public_comment(self):
         self.product[1]['labels'].append({'name': 'priority:P2'})        # #12 P2, #20 P2, the rest untriaged
-        self.answers[12] = {'kimiSuitable': True, 'kimiReason': 'narrow fix'}
-        self.answers[20] = {'kimiSuitable': False, 'kimiReason': 'spans the UI and the harness'}
+        self.answers[12] = {'kimiSuitable': True, 'kimiRule': 'narrow-fix', 'kimiReason': 'narrow fix'}
+        self.answers[20] = {'kimiSuitable': False, 'kimiRule': 'multi-crate', 'kimiReason': 'spans the UI and the harness'}
         self.assertEqual(0, self.triage().run_once(kimi_only=True))
         self.assertEqual([12, 20], sorted(n for n, *_ in self.model_calls))
         argv = self.model_calls[0][1]
-        self.assertEqual(['kimiSuitable', 'kimiReason'], json.loads(argv[argv.index('--json-schema') + 1])['required'])
+        self.assertEqual(['kimiSuitable', 'kimiRule', 'kimiReason'],
+                         json.loads(argv[argv.index('--json-schema') + 1])['required'])
         self.assertTrue(self.model_calls[0][3]['kimiOnly'])
         public = self.public()
         self.assertEqual([('issue', 'edit', '12', '--repo', PRODUCT, '--add-label', 'kimi')], [args for args, _ in public])
-        self.assertIn('#12: kimi: yes - narrow fix', self.out)
-        self.assertIn('#20: kimi: no - spans the UI and the harness', self.out)
-        self.assertIn('kimi: no - spans the UI and the harness', self.log_for(20)[0])
+        self.assertIn('#12: kimi: yes (narrow-fix) - narrow fix', self.out)
+        self.assertIn('#20: kimi: no (multi-crate) - spans the UI and the harness', self.out)
+        self.assertIn('kimi: no (multi-crate) - spans the UI and the harness', self.log_for(20)[0])
 
     def test_kimi_only_refuses_a_product_without_the_label(self):
         self.config['kimiLabel'] = False
@@ -749,7 +768,117 @@ class KimiLabel(TriageCase):
     def test_dry_run_shows_the_kimi_verdict_and_writes_nothing(self):
         self.assertEqual(0, self.triage(dry_run=True).run_once(numbers=[30]))
         self.assertEqual([], self.writes())
-        self.assertTrue(any('[kimi: yes - one crate, fixtures in tests/]' in line for line in self.out), self.out)
+        self.assertTrue(any('[kimi: yes (narrow-fix) - one crate, fixtures in tests/]' in line for line in self.out),
+                        self.out)
+
+    # #82: the loosened rules, each verdict named by its rule ----------------------------------------
+    def test_single_area_leftovers_gets_kimi(self):
+        self.product.append(issue(31, 'Leftovers from #12: table polish', created='2026-01-07'))
+        self.answers[31] = kimi_answer('P3', rule='leftovers-one-area', reason='every item in docxy-table')
+        self.assertEqual(0, self.triage().run_once(numbers=[31]))
+        self.assertEqual('--add-label', self.kimi_change(31))
+        self.assertIn('kimi: yes (leftovers-one-area) - every item in docxy-table', self.log_for(31)[0])
+
+    def test_save_path_leftovers_does_not(self):
+        self.product.append(issue(31, 'Leftovers from #12: save polish', created='2026-01-07'))
+        self.answers[31] = kimi_answer('P3', rule='leftovers-one-area')
+        self.triage().run_once(numbers=[31])                             # triage labelled it earlier
+        self.calls.clear()
+        self.answers[31] = kimi_answer('P3', suitable=False, rule='save-path', reason='item 2 writes the docx')
+        self.assertEqual(0, self.triage().run_once(numbers=[31], retriage=True))
+        self.assertEqual('--remove-label', self.kimi_change(31))
+        self.assertIn('kimi: no (save-path) - item 2 writes the docx', self.log_for(31)[0])
+        self.product.append(issue(32, 'Leftovers from #14: save polish', created='2026-01-08'))
+        self.answers[32] = kimi_answer('P2', suitable=False, rule='save-path')
+        self.assertEqual(0, self.triage().run_once(numbers=[32]))
+        self.assertIsNone(self.kimi_change(32))
+
+    def test_two_crate_harness_verb_gets_kimi(self):
+        self.product.append(issue(31, 'uiharness: a select-cell verb', created='2026-01-07'))
+        self.answers[31] = kimi_answer('P2', rule='harness-two-crates', reason='uiharness + the app host side')
+        self.assertEqual(0, self.triage().run_once(numbers=[31]))
+        self.assertEqual('--add-label', self.kimi_change(31))
+
+    def test_suitable_under_an_excluded_rule_is_not_labelled(self):
+        self.answers[30] = kimi_answer('P2', suitable=True, rule='save-path', reason='small, but on save')
+        self.assertEqual(0, self.triage().run_once(numbers=[30]))
+        self.assertIsNone(self.kimi_change(30))
+        self.assertIn('kimi: no (save-path) - model contradicted itself: said suitable under excluded rule '
+                      'save-path: small, but on save', self.log_for(30)[0])
+
+    def test_unsuitable_under_an_allowed_rule_stays_unsuitable(self):
+        self.triage().run_once(numbers=[30])                             # triage set it
+        self.calls.clear()
+        self.answers[30] = kimi_answer('P2', suitable=False, rule='narrow-fix', reason='unsure')
+        self.assertEqual(0, self.triage().run_once(numbers=[30], retriage=True))
+        self.assertEqual('--remove-label', self.kimi_change(30))
+        self.assertIn('kimi: no (narrow-fix) - model contradicted itself: said unsuitable under allowed rule '
+                      'narrow-fix: unsure', self.log_for(30)[0])
+
+    def test_a_contradiction_is_resolved_in_the_dry_run_too(self):
+        self.product[1]['labels'].append({'name': 'priority:P2'})
+        self.answers[12] = {'kimiSuitable': True, 'kimiRule': 'outside-format', 'kimiReason': 'x'}
+        self.assertEqual(0, self.triage(dry_run=True).run_once(numbers=[12], kimi_only=True))
+        self.assertIn('#12: would judge kimi: no (outside-format) - model contradicted itself: said suitable '
+                      'under excluded rule outside-format: x', self.out)
+
+    def test_an_unknown_rule_fails_the_issue(self):
+        self.answers[30] = kimi_answer('P2', rule='looks-easy')
+        self.assertEqual(1, self.triage().run_once(numbers=[30]))
+        self.assertEqual([], self.public())
+        self.assertTrue(any("invalid kimiRule 'looks-easy'" in line for line in self.out), self.out)
+
+    def test_the_log_line_names_the_rule(self):
+        self.answers[30] = kimi_answer('P2', rule='ui-single-view', reason='the ribbon tooltip only')
+        self.triage().run_once(numbers=[30])
+        self.assertIn('kimi: yes (ui-single-view) - the ribbon tooltip only', self.log_for(30)[0].splitlines())
+
+    def test_an_untriaged_issue_now_is_not_p2_p3(self):
+        # --kimi-only picked it as P2; its priority label was gone by the time the label is written.
+        self.product[1]['labels'].append({'name': 'priority:P2'})
+        triage = self.triage()
+        real, reads = self.gh, []
+
+        def gh(*args, timeout=None):
+            if args[:2] == ('api', f'repos/{PRODUCT}/issues/12'):
+                reads.append(args)
+                if len(reads) > 1:                                       # the read before the write
+                    self.calls.append((args, None))
+                    return done(0, json.dumps(issue(12)))
+            return real(*args, timeout=timeout)
+        triage.gh = gh
+        self.answers[12] = {'kimiSuitable': True, 'kimiRule': 'narrow-fix', 'kimiReason': 'narrow fix'}
+        self.assertEqual(0, triage.run_once(numbers=[12], kimi_only=True))
+        self.assertIsNone(self.kimi_change(12))
+        self.assertIn('#12: kimi: no (not-p2-p3) - untriaged now, never Kimi work (narrow fix)', self.out)
+
+    def test_kimi_only_prints_the_summary(self):
+        # #12 labelled, #20 cleared (triage set it), #30 kept (a human's label), #7 unchanged, #10 failed.
+        for n in (7, 10, 12, 20, 30):
+            [i] = [i for i in self.product if i['number'] == n]
+            i['labels'] = [l for l in i['labels'] if not l['name'].startswith('priority:')] + [{'name': 'priority:P2'}]
+        self.product[4]['labels'].append({'name': 'kimi'})
+        self.events[20] = [[{'id': 1, 'event': 'labeled', 'label': {'name': 'kimi'}}]]
+        (self.folder / 'state/yeroo').mkdir(parents=True)
+        (self.folder / 'state/yeroo/docxy.kimi.json').write_text(json.dumps({'issues': {'20': [1]}}))
+        self.product[5]['labels'].append({'name': 'kimi'})
+        self.event(30, 'labeled')                                        # by hand
+        yes = {'kimiSuitable': True, 'kimiRule': 'narrow-fix', 'kimiReason': 'r'}
+        no = {'kimiSuitable': False, 'kimiRule': 'multi-crate', 'kimiReason': 'r'}
+        self.answers.update({7: no, 10: done(0, 'garbage'), 12: yes, 20: no, 30: no})
+        self.assertEqual(1, self.triage().run_once(numbers=[7, 10, 12, 20, 30], kimi_only=True))
+        self.assertEqual('kimi: 1 labelled, 1 cleared, 1 kept (human), 1 unchanged, 1 failed', self.out[-1])
+        self.out.clear()
+        self.answers[10] = yes
+        self.assertEqual(0, self.triage().run_once(numbers=[10, 30], kimi_only=True))
+        self.assertEqual('kimi: 1 labelled, 0 cleared, 1 kept (human)', self.out[-1])
+        self.out.clear()
+        self.assertEqual(0, self.triage(dry_run=True).run_once(numbers=[7, 12, 20], kimi_only=True))
+        self.assertEqual('kimi (dry run): 1 would be yes, 2 would be no', self.out[-1])
+
+    def test_a_full_run_prints_no_kimi_summary(self):
+        self.triage().run_once(numbers=[30])
+        self.assertFalse(any(line.startswith('kimi:') or line.startswith('kimi (') for line in self.out), self.out)
 
 
 class Watch(TriageCase):
@@ -876,15 +1005,27 @@ class Priorities(unittest.TestCase):
 
 class KimiRules(unittest.TestCase):
     def test_the_prompt_carries_the_owners_fixed_rules_and_the_fields(self):
-        # #77: the rules from the 2026-09-29/30 evaluation, word for word in substance.
+        # #77, loosened by #82: the rules from the owner's evaluation, in substance.
         text = ' '.join(t.COMMAND.read_text(encoding='utf-8').split())
-        for needle in ('`kimiLabel: true`', 'P2 or P3', 'one crate or a small area',
-                       'checked against something already in the repo', 'not a new subsystem',
-                       'no data-loss risk on save or open', 'outside file-format spec or real sample files',
-                       'save or serialise paths', 'several crates, or the UI and the test harness together',
-                       'an umbrella, a batch or a leftovers list', 'it is P0 or P1', '`kimiSuitable`',
-                       '`kimiReason`', '`kimiOnly: true`'):
+        for needle in ('`kimiLabel: true`', 'P2 or P3', 'one crate or a small area', 'P0 or P1',
+                       'save or serialise paths', 'outside file-format spec', 'an umbrella or a batch',
+                       'a leftovers list whose items do not all sit in one crate or area', 'a whole new editor',
+                       '`Leftovers from #N` list whose items all sit in one crate or area',
+                       'spanning at most 2 crates', "the verb's thin host side", 'a small UI/UX fix in a single view',
+                       '`kimiSuitable`', '`kimiRule`', '`kimiReason`', '`kimiOnly: true`'):
             self.assertIn(needle, text)
+
+    def test_the_prompt_names_every_rule(self):
+        # #82: the prompt and the schema enum stay in step; the tool-only id is not the model's to give.
+        text = t.COMMAND.read_text(encoding='utf-8')
+        for rule in (*t.KIMI_ALLOWED, *t.KIMI_EXCLUDED):
+            self.assertIn(f'`{rule}`:', text)
+        for rule in (t.KIMI_NOT_P2_P3, t.KIMI_SPEC_REF):
+            self.assertNotIn(rule, text)
+            self.assertNotIn(rule, t.KIMI_PROPERTIES['kimiRule']['enum'])
+        example = next(block for block in re.findall(r'```json\n(.*?)```', text, re.S) if 'kimiSuitable' in block)
+        self.assertIn('"kimiRule"', example)
+        self.assertIn('{"kimiSuitable": ..., "kimiRule": "...", "kimiReason": "..."}', text)
 
 
 class Command(unittest.TestCase):
