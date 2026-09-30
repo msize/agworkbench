@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """tslog - the local-time prefix on every line a long-running pane prints (#78).
 
-The `#queue` conductor (`conductor.py run`), the `#triage` watch (`triage.py watch`) and the relay
-call `install()` before they print anything. From then on every line they write to stdout or stderr
-starts with `HH:MM:SS `, or with `YYYY-MM-DD HH:MM:SS ` on the process's first line and on the first
-line after the local date changes. The stamp is taken when a line's first character is written.
+The relay calls `install()` before it parses its arguments, so even its argparse errors are stamped.
+The `#queue` conductor (`conductor.py run`) and the `#triage` watch (`triage.py watch`) call it once
+the subcommand is known, since their parsers also serve subcommands whose output is parsed; an
+argparse usage error there stays bare. From then on every line written to stdout or stderr starts
+with `HH:MM:SS `, or with `YYYY-MM-DD HH:MM:SS ` on the first stamped line and on the first line
+after the local date changes. The stamp is taken when a line's first character is written.
 
-Stamping happens at the stream, not at each `print`, so a multi-line write, argparse and a traceback
-are stamped too. Output that is parsed or written to a file (JSON replies, `--dry-run`, the
+Stamping happens at the stream, not at each `print`, so a multi-line write and a traceback are
+stamped too. Output that is parsed or written to a file (JSON replies, `--dry-run`, the
 `triage-N.log` a `triage.py run` writes) never installs it.
 """
 

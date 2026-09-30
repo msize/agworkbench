@@ -7,6 +7,8 @@ correctly" may raise one.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -151,7 +153,9 @@ class Wiring(StallFixture):
 
     def relay_from_main(self, *extra):
         made = []
-        with patch.object(relay.Relay, 'run', autospec=True, side_effect=lambda self: made.append(self) or 0):
+        # main() stamps both streams (#78): capture them, so no wrapper outlives the test.
+        with patch.object(relay.Relay, 'run', autospec=True, side_effect=lambda self: made.append(self) or 0), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(0, relay.main(['--hub', str(self.hub_dir), '--claude-pane', self.PANES[0],
                                             '--codex-pane', self.PANES[1], '--repo', 'o/repo', '--branch', 'issue-7-fix',
                                             *extra]))
