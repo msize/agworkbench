@@ -3906,7 +3906,7 @@ class KimiImplementer(LauncherFixtures):
         self.assertTrue(self.relay_line().endswith("--implementer-tool 'kimi'"))
         agents = self.state('agents.json')['agents']
         self.assertEqual(('kimi', RIGHT_ID), (agents['codex']['tool'], agents['codex']['pane']))
-        self.assertEqual({'tool': 'kimi', 'revmuxProfile': 'claude-only', 'autoMerge': False, 'autonomous': False,
+        self.assertEqual({'tool': 'kimi', 'revmuxProfile': 'claude-only', 'autoMerge': False, 'autonomous': False, 'bigReview': False,
                           'cleanup': 'merged'}, self.state('implementer.json'))
         self.assertIn('Kimi implementer starting in the right pane', result.stdout)
         self.assertFalse((self.checkout / '.workbench/state/implementer-claude.json').exists())
