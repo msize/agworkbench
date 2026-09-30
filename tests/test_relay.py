@@ -3165,6 +3165,20 @@ class HelperMarkers(unittest.TestCase):
         self.assertEqual(('revmux', 2, 1, 'p-1', ['report', 'posted']),
                          (marker['kind'], marker['round'], marker['exit'], marker['pane'], marker['rows']))
 
+    def test_helper_done_records_the_result_mail(self):
+        # #84: the mail id and its box, both or neither.
+        import helper_done
+        folder = Path(__file__).resolve().parent.parent / ('test helper done ' + uuid.uuid4().hex)
+        folder.mkdir()
+        self.addCleanup(shutil.rmtree, folder)
+        with patch.dict(os.environ, {'AGWINTERM_PANE_ID': 'p-3'}), patch.object(agw, 'pane_text', return_value='x\n'):
+            helper_done.main(['--hub', str(folder), '--kind', 'revmux', '--mail', 'm-1', '--to', 'claude'])
+            marker = json.loads((folder / 'state' / 'helpers' / 'p-3.done').read_text(encoding='utf-8'))
+            self.assertEqual(('m-1', 'claude'), (marker['mail'], marker['to']))
+            helper_done.main(['--hub', str(folder), '--kind', 'revmux', '--mail', 'm-1'])
+            marker = json.loads((folder / 'state' / 'helpers' / 'p-3.done').read_text(encoding='utf-8'))
+            self.assertNotIn('mail', marker)
+
     def test_an_unreadable_pane_still_marks_done_but_proves_nothing(self):
         import helper_done
         folder = Path(__file__).resolve().parent.parent / ('test helper done ' + uuid.uuid4().hex)

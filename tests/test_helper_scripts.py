@@ -30,10 +30,14 @@ class HelperScripts(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.folder, True)
         self.addCleanup(hub.reload_paths)
 
-    def run_script(self, script, *params):
+    def run_script(self, script, *params, pane=None):
         env = dict(os.environ, PATH=str(self.bin) + os.pathsep + os.environ.get('PATH', ''))
         for name in ('AGWINTERM_PANE_ID', 'AGWINTERM_SESSION_ID'):
             env.pop(name, None)                          # no pane: no marker, nothing else changes
+        if pane:
+            # A pane id writes the marker; no terminal answers, so its rows are empty.
+            env.update(AGWINTERM_PANE_ID=pane, AGWINTERM_PIPE='agw-test-' + uuid.uuid4().hex,
+                       AGWINTERMCTL=str(self.folder / 'no-agwintermctl.exe'))
         return subprocess.run([PWSH, '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(ROOT / 'lib' / script),
                                '-Checkout', str(self.checkout), *params],
                               capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=120, env=env)
@@ -93,6 +97,34 @@ class HelperScripts(unittest.TestCase):
         record = json.loads((self.checkout / '.workbench/review/revmux-r2.json').read_text(encoding='utf-8-sig'))
         self.assertEqual(('r2-1', 1), (record['run'], record['attempt']))
         self.assertTrue((self.checkout / '.workbench/review/revmux-r2.md').exists())
+
+    def marker(self, pane):
+        return json.loads((self.checkout / '.workbench' / 'state' / 'helpers' / f'{pane}.done').read_text(encoding='utf-8'))
+
+    def mail_ids(self):
+        return [path.stem for path in sorted((self.checkout / '.workbench' / 'inbox' / 'claude').glob('*.md'))]
+
+    def test_the_marker_names_the_posted_report(self):
+        # #84: the relay closes the session once this mail has been read.
+        self.stub_revmux()
+        scope = self.checkout / 'scope.md'
+        scope.write_text('scope', encoding='utf-8')
+        done = self.run_script('run-revmux.ps1', '-ScopeFile', str(scope), '-Round', '2', pane='p-rev')
+        self.assertEqual(0, done.returncode, done.stdout + done.stderr)
+        [mid] = self.mail_ids()
+        marker = self.marker('p-rev')
+        self.assertEqual(('revmux', 2, mid, 'claude'), (marker['kind'], marker['round'], marker['mail'], marker['to']))
+        self.assertIn(f'posted {mid}.md -> claude', done.stdout)            # still echoed to the pane
+
+    def test_the_marker_names_the_fallback_mail(self):
+        (self.bin / 'revmux.cmd').write_text('@echo revmux is broken\r\n@exit /b 3\r\n', encoding='utf-8')
+        scope = self.checkout / 'scope.md'
+        scope.write_text('scope', encoding='utf-8')
+        done = self.run_script('run-revmux.ps1', '-ScopeFile', str(scope), '-Round', '2', pane='p-fail')
+        self.assertNotEqual(0, done.returncode)
+        [mid] = self.mail_ids()
+        self.assertEqual((mid, 'claude'), (self.marker('p-fail')['mail'], self.marker('p-fail')['to']))
+        self.assertIn(f'posted {mid}.md -> claude', done.stdout)
 
     def test_a_review_that_fails_mails_the_planner(self):
         (self.bin / 'revdiff.ps1').write_text("throw 'revdiff crashed'\n", encoding='utf-8')

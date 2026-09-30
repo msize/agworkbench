@@ -107,6 +107,21 @@ class Wrapper(unittest.TestCase):
         self.assertEqual([], self.mails('claude'))
         self.assertEqual('suite abc1234: passed (exit 0, 0 failures)', self.mails('codex')[0]['subject'])
 
+    def test_the_marker_names_the_result_mail_and_its_box(self):
+        # #84: the relay closes the session once this mail has been read in this box.
+        self.run_wrapper(sys.executable, '-c', 'print("OK")', to='codex')
+        [path] = sorted((self.hub_dir / 'inbox' / 'codex').glob('*.md'))
+        marker = self.marker()
+        self.assertEqual((path.stem, 'codex'), (marker['mail'], marker['to']))
+        self.assertEqual(f'result mailed to codex ({path.stem})', marker['rows'][-1])
+
+    def test_a_result_that_could_not_be_mailed_names_no_mail(self):
+        with patch.object(run_helper, 'post_result', side_effect=OSError('disk full')):
+            self.run_wrapper(sys.executable, '-c', 'print("OK")')
+        marker = self.marker()
+        self.assertNotIn('mail', marker)
+        self.assertNotIn('to', marker)
+
     def test_a_command_that_cannot_start_still_mails_and_marks(self):
         self.assertEqual(1, self.run_wrapper(str(self.folder / 'no such program.exe')))
         self.assertIsNone(self.marker()['exit'])

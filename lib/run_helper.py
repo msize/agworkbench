@@ -12,7 +12,8 @@ whatever the child wrote: Windows PowerShell 5.1's `>` redirection wrote UTF-16,
 never sees. When the command ends it mails the result to `--to` (sender `helper`) - the relay rings
 that pane, so nobody depends on a private background watcher that low memory can kill - and, as its
 very last act, writes its completion marker (helper_done.write_marker) with the exit code and the
-failure count, so the autonomous close can prove its pane untouched.
+failure count and the result mail's id and box, so the autonomous close can prove its pane untouched
+and the relay can close it once that mail has been read (#84).
 
 It waits for the command, not for its descendants: a grandchild that inherited the output pipe (a
 build server, MSBuild node reuse, a detached test server) cannot hold the result back. Once the
@@ -267,15 +268,17 @@ def main(argv: list[str] | None = None) -> int:
             print(text, flush=True)
     subject = result_subject(args.label, code, failures, refused=bool(refusal))
     print(f"\n{subject}; log: {log}", flush=True)
+    mid = None
     try:
         mid = post_result(hub, args.to, subject, command, code, failures, log, text)
         print(f"result mailed to {args.to} ({mid})", flush=True)
     except Exception as err:  # noqa: BLE001 - a lost mail is reported on screen, never raised
         print(f"run_helper: could not mail the result to {args.to}: {err}", flush=True)
     # The very last act: nothing may be printed after it, or the close cannot prove the pane untouched.
+    # The marker names the result mail, so the relay closes this session once it has been read (#84).
     sys.stdout.flush()
     import helper_done
-    helper_done.write_marker(hub, "suite", exit=code, failures=failures)
+    helper_done.write_marker(hub, "suite", exit=code, failures=failures, mail=mid, to=args.to)
     return code if isinstance(code, int) and 0 <= code < 256 else 1
 
 
