@@ -178,6 +178,9 @@ class DeliveryFixture(unittest.TestCase):
         self.send = self.enterContext(patch.object(peerchat, 'send', return_value='submitted'))
         self.gh = self.enterContext(patch.object(relay.subprocess, 'run',
                                                 side_effect=AssertionError('real GitHub request')))
+        # #84 r3: the helper sweep is HelperSweep's and HelperSweepInRun's to test; here it would read
+        # the developer's config and trip the terminal guard, which run() would swallow.
+        self.enterContext(patch.object(relay.Relay, 'sweep_helpers'))
 
     def tick(self, instant):
         self.t = instant
@@ -2323,7 +2326,8 @@ class AutonomousClose(unittest.TestCase):
         self.state.mkdir(parents=True)
         self.addCleanup(shutil.rmtree, self.folder)
         self.addCleanup(hub.reload_paths)
-        self.enterContext(patch.dict(os.environ))
+        # No config file (#84): the helper sweep in run() is on by default, not the developer's setting.
+        self.enterContext(patch.dict(os.environ, {'AGWORKBENCH_CONFIG': str(self.folder / 'no-config.json')}))
         self.write('implementer.json', {'tool': 'claude', 'autonomous': True})
         self.write('loop-done.json', {'pr': 7, 'sha': 'abc', 'followUps': []})
         peers = [relay.Peer('claude', 'claude', self.PLANNER), relay.Peer('codex', 'claude', self.IMPLEMENTER)]
@@ -3308,6 +3312,19 @@ class HelperSweep(unittest.TestCase):
                 self.assertEqual([], self.closes())
                 self.assertEqual(1, len(self.logs), self.logs)
                 self.assertTrue(self.logs[0].startswith('helper close off (config '), self.logs)
+
+    def test_close_helpers_is_matched_in_any_case(self):
+        # #84 r3 m1: the launcher reads `CloseHelpers` as closeHelpers; so does the relay.
+        for config, enabled in (({'CloseHelpers': False}, False), ({'CLOSEHELPERS': True}, True),
+                                ({'closeHelpers': True, 'CloseHelpers': False}, False),
+                                ({'closeHelpers': None, 'closehelpers': 'no'}, False)):
+            with self.subTest(config=config):
+                self.config(config)
+                self.assertEqual(enabled, relay.close_helpers_setting()[0])
+        self.config({'CloseHelpers': False})
+        self.sweep(0)
+        self.assertEqual([], self.closes())
+        self.assertEqual(['helper close off (CloseHelpers: false)'], self.logs)
 
     def test_a_missing_config_or_a_null_value_is_the_default_on(self):
         # #84 r1 i1: the launcher skips a null value, so null means the default here too.

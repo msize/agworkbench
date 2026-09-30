@@ -332,7 +332,9 @@ def stall_setting() -> float:
 def close_helpers_setting() -> tuple[bool, str]:
     """(`closeHelpers` from ~/.agworkbench.json, why it is off) (#84). On when the file or the key is
     missing, or the key is null (the launcher skips null too). Fails closed: a config it cannot read or
-    parse (locked, half-written, `//` comments), or a value that is not true or false, closes nothing."""
+    parse (locked, half-written, `//` comments), or a value that is not true or false, closes nothing.
+    The key is matched in any case, as PowerShell's launcher reads it: any spelling set to anything but
+    true or null turns closing off, so `"CloseHelpers": false` or two spellings that disagree keep all."""
     path = Path(os.environ.get("AGWORKBENCH_CONFIG") or (Path.home() / ".agworkbench.json"))
     try:
         config = json.loads(path.read_text(encoding="utf-8-sig"))
@@ -342,10 +344,10 @@ def close_helpers_setting() -> tuple[bool, str]:
         return False, f'config {path} unreadable: {err}'
     if not isinstance(config, dict):
         return False, f'config {path} is not a JSON object'
-    value = config.get("closeHelpers")
-    if value is None or value is True:
-        return True, ''
-    return False, f'closeHelpers: {json.dumps(value)}'
+    for key, value in config.items():
+        if key.casefold() == "closehelpers" and value is not None and value is not True:
+            return False, f'{key}: {json.dumps(value)}'
+    return True, ''
 
 
 def limit_retry_setting() -> float:

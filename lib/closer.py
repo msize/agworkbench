@@ -261,9 +261,7 @@ class Closer:
             label = f"{session.get('name')} ({session.get('id')})"
             if reason:
                 left_open.append(f"{session.get('name')} ({reason})")
-                if self.decided.get(session.get('id')) != reason:
-                    self.decided[session.get('id')] = reason
-                    self.log(f"helper {label} stays open: {reason}")
+                self._decide(session.get('id'), f"helper {label} stays open: {reason}")
                 continue
             if not self.autonomous():
                 self.log(f"NOT closing helper {label}: autonomy was turned off")
