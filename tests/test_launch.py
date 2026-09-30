@@ -2869,7 +2869,7 @@ class ClaudeImplementer(LauncherFixtures):
         self.assertTrue(self.relay_line().endswith("--branch 'issue-7-fix-x'"))
         self.assertIn("pane-codex.ps1'", self.typed_right()[0])
         self.assertEqual('codex', self.state('agents.json')['agents']['codex']['tool'])
-        self.assertEqual({'tool': 'codex', 'revmuxProfile': 'comprehensive', 'autoMerge': False, 'autonomous': False, 'cleanup': 'merged'}, self.state('implementer.json'))
+        self.assertEqual({'tool': 'codex', 'revmuxProfile': 'comprehensive', 'autoMerge': False, 'autonomous': False, 'bigReview': False, 'cleanup': 'merged'}, self.state('implementer.json'))
         self.assertFalse((self.checkout / '.workbench/state/implementer-claude.json').exists())
 
     def test_claude_composes_right_pane_relay_mailbox_identity_and_pin(self):
@@ -2883,7 +2883,7 @@ class ClaudeImplementer(LauncherFixtures):
         agents = self.state('agents.json')['agents']
         self.assertEqual(('claude', RIGHT_ID), (agents['codex']['tool'], agents['codex']['pane']))
         self.assertEqual('claude', agents['claude']['tool'])
-        self.assertEqual({'tool': 'claude', 'revmuxProfile': 'claude-only', 'autoMerge': False, 'autonomous': False, 'cleanup': 'merged'}, self.state('implementer.json'))
+        self.assertEqual({'tool': 'claude', 'revmuxProfile': 'claude-only', 'autoMerge': False, 'autonomous': False, 'bigReview': False, 'cleanup': 'merged'}, self.state('implementer.json'))
         implementer = self.state('implementer-claude.json')
         planner = self.state('claude.json')
         self.assertEqual((RIGHT_ID, 'fresh', 'o/repo#7'), (implementer['pane'], implementer['origin'], implementer['issue']))
@@ -2898,7 +2898,7 @@ class ClaudeImplementer(LauncherFixtures):
     def test_config_selects_claude_and_revmux_profile_is_configurable(self):
         result = self.body(config={'implementer': 'claude', 'revmuxProfile': 'codex-final'})
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
-        self.assertEqual({'tool': 'claude', 'revmuxProfile': 'codex-final', 'autoMerge': False, 'autonomous': False, 'cleanup': 'merged'}, self.state('implementer.json'))
+        self.assertEqual({'tool': 'claude', 'revmuxProfile': 'codex-final', 'autoMerge': False, 'autonomous': False, 'bigReview': False, 'cleanup': 'merged'}, self.state('implementer.json'))
         self.assertTrue(self.relay_line().endswith("--implementer-tool 'claude'"))
 
     def test_invalid_config_and_switch_values_are_refused(self):
@@ -2959,7 +2959,7 @@ class ClaudeImplementer(LauncherFixtures):
         self.assertIn('-Resume', self.typed_right()[-1])
         self.assertIn('pane-codex.ps1', self.pins()[RIGHT_ID])
         self.assertEqual('codex', self.state('agents.json')['agents']['codex']['tool'])
-        self.assertEqual({'tool': 'codex', 'revmuxProfile': 'comprehensive', 'autoMerge': False, 'autonomous': False, 'cleanup': 'merged'}, self.state('implementer.json'))
+        self.assertEqual({'tool': 'codex', 'revmuxProfile': 'comprehensive', 'autoMerge': False, 'autonomous': False, 'bigReview': False, 'cleanup': 'merged'}, self.state('implementer.json'))
         # B2: the relay was asked to stop and was restarted without the Claude profile.
         self.assertTrue(json.loads(self.scenario_path.read_text(encoding='utf-8'))['stop_seen'])
         relay = [c[3] for c in self.calls() if c[:2] == ['session', 'type'] and c[-1] == RELAY_ID]
@@ -3906,7 +3906,7 @@ class KimiImplementer(LauncherFixtures):
         self.assertTrue(self.relay_line().endswith("--implementer-tool 'kimi'"))
         agents = self.state('agents.json')['agents']
         self.assertEqual(('kimi', RIGHT_ID), (agents['codex']['tool'], agents['codex']['pane']))
-        self.assertEqual({'tool': 'kimi', 'revmuxProfile': 'claude-only', 'autoMerge': False, 'autonomous': False,
+        self.assertEqual({'tool': 'kimi', 'revmuxProfile': 'claude-only', 'autoMerge': False, 'autonomous': False, 'bigReview': False,
                           'cleanup': 'merged'}, self.state('implementer.json'))
         self.assertIn('Kimi implementer starting in the right pane', result.stdout)
         self.assertFalse((self.checkout / '.workbench/state/implementer-claude.json').exists())
@@ -4255,6 +4255,50 @@ class KimiFailover(LauncherFixtures):
                 out = ps(". ./lib/Workbench.ps1; (Get-FailoverTarget -Checkout " + ps_quote(self.checkout) +
                          " -Config (Get-WorkbenchConfig) -Saved " + saved + " -NoProbe).Target", env=self.env)
                 self.assertEqual(expected, out.stdout.strip(), out.stderr)
+
+
+class BigReviewLaunch(LauncherFixtures):
+    """#75: -BigReview is per-checkout policy like auto-merge; wb.py reads it for the review cap."""
+    body = ClaudeImplementer.body
+    state = ClaudeImplementer.state
+    reuse_scenario = ClaudeImplementer.reuse_scenario
+
+    def test_default_is_off(self):
+        result = self.body()
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertIs(False, self.state('implementer.json')['bigReview'])
+        self.assertIn('big review off', result.stdout)
+
+    def test_on_is_saved_a_rerun_keeps_it_and_off_saves_false(self):
+        on = self.body(extra=' -BigReview $true')
+        self.assertEqual(0, on.returncode, on.stdout + on.stderr)
+        self.assertIs(True, self.state('implementer.json')['bigReview'])
+        self.assertIn('big review on', on.stdout)
+        self.reuse_scenario('esc to interrupt')      # policy: a live agent does not block it
+        again = self.body()
+        self.assertEqual(0, again.returncode, again.stdout + again.stderr)
+        self.assertIs(True, self.state('implementer.json')['bigReview'])
+        off = self.body(extra=' -BigReview $false')
+        self.assertEqual(0, off.returncode, off.stdout + off.stderr)
+        self.assertIs(False, self.state('implementer.json')['bigReview'])
+        self.assertEqual('codex', self.state('implementer.json')['tool'])
+
+    def test_entry_refuses_both_switches(self):
+        result = subprocess.run([PWSH, '-NoProfile', '-File', str(LIB / 'github-workbench.ps1'), 'o/repo#7',
+                                 '-BigReview', '-NoBigReview'], env=self.env, cwd=ROOT, capture_output=True, text=True,
+                                encoding='utf-8', errors='replace', timeout=20)
+        self.assertEqual(2, result.returncode, result.stdout + result.stderr)
+        self.assertIn('-BigReview and -NoBigReview cannot be combined', result.stdout)
+        self.assertFalse(self.calls())
+
+    def test_dry_run_prints_big_review_and_writes_nothing(self):
+        self.cmd('gh', 'echo {"title":"fix-x","state":"OPEN"}\nexit /b 0')
+        result = subprocess.run([PWSH, '-NoProfile', '-File', str(LIB / 'github-workbench.ps1'), 'o/repo#7',
+                                 '-NewSession', '-DryRun', '-BigReview'], env=self.env, cwd=ROOT, capture_output=True,
+                                text=True, encoding='utf-8', errors='replace', timeout=20)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertIn('autonomous off; big review on', result.stdout)
+        self.assertFalse((self.checkout / '.workbench').exists())
 
 
 class AutonomyLaunch(LauncherFixtures):

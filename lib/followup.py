@@ -299,7 +299,9 @@ def load_settings(config: dict) -> dict:
 
 
 def review_settings(config: dict) -> dict:
-    """`review.stopWhenNoMajor` (default on) and `review.minRounds` (default 1, an int in 1..5) (#64)."""
+    """`review.stopWhenNoMajor` (default on) and `review.minRounds` (default 1, an int in 1..5) (#64);
+    the review cap, `review.maxRounds` (default 5) and `review.maxRoundsBig` (default 10) for a big issue,
+    one whose diff exceeds `review.bigDiffLines` (default 1500) among other signs (#75)."""
     section = config.get("review", {})
     if not isinstance(section, dict):
         raise SettingsError("review must be an object")
@@ -309,7 +311,19 @@ def review_settings(config: dict) -> dict:
     rounds = section.get("minRounds", 1)
     if type(rounds) is not int or not 1 <= rounds <= 5:
         raise SettingsError("review.minRounds must be an integer from 1 to 5")
-    return {"stopWhenNoMajor": stop, "minRounds": rounds}
+    cap = section.get("maxRounds", 5)
+    if type(cap) is not int or not 1 <= cap <= 20:
+        raise SettingsError("review.maxRounds must be an integer from 1 to 20")
+    if rounds > cap:
+        raise SettingsError(f"review.minRounds ({rounds}) must not exceed review.maxRounds ({cap})")
+    big = section.get("maxRoundsBig", max(10, cap))
+    if type(big) is not int or not cap <= big <= 20:
+        raise SettingsError(f"review.maxRoundsBig must be an integer from review.maxRounds ({cap}) to 20")
+    lines = section.get("bigDiffLines", 1500)
+    if type(lines) is not int or lines < 1:
+        raise SettingsError("review.bigDiffLines must be an integer of 1 or more")
+    return {"stopWhenNoMajor": stop, "minRounds": rounds, "maxRounds": cap, "maxRoundsBig": big,
+            "bigDiffLines": lines}
 
 
 def triage_on(config: dict, repo: str) -> bool:

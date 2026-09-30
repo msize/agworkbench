@@ -216,7 +216,7 @@ def checkout_settings(root: Path) -> dict:
         # implementer.json is missing, so it stays claude-only, which every revmux has.
         profile = "comprehensive" if tool == "codex" else "claude-only"
     return {"implementer": tool, "revmuxProfile": profile, "autoMerge": saved.get("autoMerge") is True,
-            "autonomous": saved.get("autonomous") is True}
+            "autonomous": saved.get("autonomous") is True, "bigReview": saved.get("bigReview") is True}
 
 
 def failover_setting() -> bool:
@@ -235,11 +235,15 @@ def cmd_settings(args: argparse.Namespace) -> int:
         review = followup.review_settings(followup.read_config())
         review_line = (f"stopWhenNoMajor={'true' if review['stopWhenNoMajor'] else 'false'} "
                        f"minRounds={review['minRounds']}")
+        # Seeing an issue big here is a moment it is judged big (#75): latching only ever raises the cap.
+        cap = review_cap(checkout(), review)
+        cap_line = f"reviewCap={cap['cap']}" + (f" (big: {cap['reason']})" if cap["big"] else "")
     except followup.SettingsError:
         review_line = "stopWhenNoMajor=invalid minRounds=invalid"    # review-round refuses with the reason
+        cap_line = "reviewCap=invalid"
     print(f"implementer={settings['implementer']} revmuxProfile={settings['revmuxProfile']} "
           f"autoMerge={'true' if settings['autoMerge'] else 'false'} "
-          f"autonomous={'true' if settings['autonomous'] else 'false'} {review_line} "
+          f"autonomous={'true' if settings['autonomous'] else 'false'} {review_line} {cap_line} "
           f"failover={'true' if failover_setting() else 'false'}")
     return 0
 
@@ -533,8 +537,8 @@ def merge_failures(pr: dict, inline: list[dict], head: str, root: Path, checks: 
 # After verifying a revmux report the planner records the round's decision: another round, stop (no
 # verified Major: this round's fix is the last), clean, or the cap. merge-check reads the record, so
 # a review that still owes a round cannot be merged, and a stop's deferred minors must be filed.
+# The cap is review.maxRounds, or review.maxRoundsBig once the issue is judged big (#75).
 
-REVIEW_CAP = 5
 SEVERE_SECTIONS = ("blocker", "critical", "major")
 MINOR_SECTIONS = ("minor", "immaterial")
 APART_SECTIONS = ("pre-existing", "open questions")      # counted, but they decide nothing
@@ -575,7 +579,8 @@ def parse_revmux_report(text: str) -> dict:
 
 
 def review_decision(round_: int, severe: int, minor: int, degraded: bool, settings: dict) -> str:
-    another = "cap" if round_ >= REVIEW_CAP else "continue"
+    """settings["cap"] is the effective cap review_cap chose; without it, review.maxRounds."""
+    another = "cap" if round_ >= settings.get("cap", settings.get("maxRounds", 5)) else "continue"
     if degraded:
         return another                 # a partial review is never clean, and never stops review
     if severe == 0 and minor == 0:
@@ -587,6 +592,116 @@ def review_decision(round_: int, severe: int, minor: int, degraded: bool, settin
 
 def review_rounds_path(root: Path) -> Path:
     return root / ".workbench" / "state" / "review-rounds.json"
+
+
+# --- the review cap (#75) ------------------------------------------------------------------------
+# A big issue - a `Batch:` title, a `batch` or `big` label, a diff past review.bigDiffLines, or a
+# checkout launched with -BigReview - gets review.maxRoundsBig rounds instead of review.maxRounds.
+# Judged big once, it stays big: the verdict is latched in state/review-big.json and never removed.
+
+BIG_LABELS = ("batch", "big")
+
+
+def review_big_path(root: Path) -> Path:
+    return root / ".workbench" / "state" / "review-big.json"
+
+
+def issue_facts(root: Path) -> dict | None:
+    """The issue's title and labels, read live, so a label added mid-loop counts. None when they cannot
+    be read - no issue branch, no GitHub origin, gh failing - which is never fatal to the caller."""
+    number = issue_number(root)
+    if number == "?":
+        return None
+    try:
+        done = subprocess.run(["git", "-C", str(root), "--git-dir", ".git", "remote", "get-url", "origin"],
+                              capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if done.returncode != 0 or not triage.github_repo(done.stdout):
+            return None                # workbench_repo would exit 2 here; the cap only loses a source
+        done = gh_run(root, "issue", "view", number, "--json", "title,labels")
+        data = json.loads(done.stdout) if done.returncode == 0 else None
+    except (OSError, ValueError, SystemExit):
+        return None
+    if not isinstance(data, dict):
+        return None
+    labels = [label.get("name") for label in data.get("labels") or [] if isinstance(label, dict)]
+    return {"title": str(data.get("title") or ""), "labels": [name for name in labels if isinstance(name, str)]}
+
+
+def issue_md_title(root: Path) -> str | None:
+    """The title the planner wrote at intake: `.workbench/issue.md`'s first `# ` line."""
+    try:
+        text = (root / ".workbench" / "issue.md").read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        return None
+    return next((line[2:].strip() for line in text.splitlines() if line.startswith("# ")), None)
+
+
+def diff_lines(root: Path) -> tuple[int, str] | None:
+    """Lines added + deleted by the committed branch against its base (origin/HEAD's target, else
+    origin/main), from the merge-base, so a merged-in default branch does not count. Binary files count
+    0. None when it cannot be measured. Only root's own .git counts, as in workbench_repo."""
+    def git(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "-C", str(root), "--git-dir", ".git", *args], capture_output=True,
+                              text=True, encoding="utf-8", errors="replace")
+    try:
+        head = git("symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+        base = head.stdout.strip() if head.returncode == 0 and head.stdout.strip() else "origin/main"
+        done = git("diff", "--numstat", f"{base}...HEAD")
+    except OSError:
+        return None
+    if done.returncode != 0:
+        return None
+    total = 0
+    for line in done.stdout.splitlines():
+        counts = line.split("\t")[:2]
+        total += sum(int(n) for n in counts if n.isdigit())
+    return total, base
+
+
+def judge_big(root: Path, settings: dict) -> str | None:
+    """Why the issue is big now, or None: the launch flag, the title and labels, then the diff."""
+    if checkout_settings(root)["bigReview"]:
+        return "-BigReview"
+    facts = issue_facts(root)
+    title = facts["title"] if facts else issue_md_title(root)
+    if title and title.strip().casefold().startswith("batch:"):
+        return "title starts with Batch:" + ("" if facts else " (from issue.md; labels unknown)")
+    for label in (facts or {}).get("labels", []):
+        if label.strip().casefold() in BIG_LABELS:
+            return f"label {label.strip()}"
+    measured = diff_lines(root)
+    if measured and measured[0] > settings["bigDiffLines"]:
+        return f"diff {measured[0]} lines > {settings['bigDiffLines']} vs {measured[1]}"
+    return None
+
+
+def latched_big(root: Path) -> str | None:
+    try:
+        record = json.loads(review_big_path(root).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    if not (isinstance(record, dict) and record.get("big") is True):
+        return None
+    return str(record.get("reason") or "judged big earlier")
+
+
+def review_cap(root: Path, settings: dict) -> dict:
+    """{"cap", "big", "reason"}. A big verdict is recorded once and stays: a diff that
+    shrinks later, a label removed or -NoBigReview does not lower the cap of an issue judged big."""
+    reason = latched_big(root)
+    if reason is None:
+        reason = judge_big(root, settings)
+        if reason is not None:
+            from conductor import atomic_json
+            atomic_json(review_big_path(root), {"big": True, "reason": reason, "at": time.time()})
+    big = reason is not None
+    return {"cap": settings["maxRoundsBig"] if big else settings["maxRounds"], "big": big, "reason": reason}
+
+
+def recorded_cap(entry: dict) -> int:
+    """The cap a round was decided under; an entry written before #75 had the fixed five."""
+    cap = entry.get("cap")
+    return cap if type(cap) is int and cap >= 1 else 5
 
 
 def load_review_rounds(root: Path) -> list[dict]:
@@ -627,8 +742,8 @@ def check_review(root: Path) -> list[str]:
                 f"minRounds={last.get('minRounds')}); another revmux round is due"]
     if last["decision"] == "cap" and last.get("stopWhenNoMajor") is not False:
         if last.get("degraded"):
-            return [f"review: round {k} ended at the cap (degraded) - this is the human's"]
-        return [f"review: round {k} had a Major at the cap - this is the human's"]
+            return [f"review: round {k} ended at the {recorded_cap(last)}-round cap (degraded) - this is the human's"]
+        return [f"review: round {k} had a Major at the {recorded_cap(last)}-round cap - this is the human's"]
     return []
 
 
@@ -658,6 +773,8 @@ def cmd_review_round(args: argparse.Namespace) -> int:
     except followup.SettingsError as err:
         print(f"wb: review-round: {err}", file=sys.stderr)
         return 2
+    cap = review_cap(root, settings)
+    settings = {**settings, "cap": cap["cap"]}
     report = Path(args.report or f".workbench/review/revmux-r{args.round}.md")
     report = report if report.is_absolute() else root / report
     try:
@@ -681,13 +798,15 @@ def cmd_review_round(args: argparse.Namespace) -> int:
     decision = review_decision(args.round, severe, minor, parsed["degraded"], settings)
     entry = {"round": args.round, "counts": counts, "revmuxSevere": revmux_severe, "severe": severe,
              "reason": (args.reason or "").strip() or None, "degraded": parsed["degraded"], "decision": decision,
-             "stopWhenNoMajor": settings["stopWhenNoMajor"], "minRounds": settings["minRounds"], "at": time.time()}
+             "stopWhenNoMajor": settings["stopWhenNoMajor"], "minRounds": settings["minRounds"],
+             "cap": cap["cap"], "big": cap["big"], "bigReason": cap["reason"], "at": time.time()}
     entries = [e for e in load_review_rounds(root) if e["round"] != args.round] + [entry]
     save_review_rounds(root, sorted(entries, key=lambda e: e["round"]))
     print(f"review: {decision}{' (degraded)' if parsed['degraded'] else ''}")
     print(f"round {args.round}: {severe} Major+ (revmux {revmux_severe}), {minor} minor, "
           f"{counts['pre-existing']} pre-existing, {counts['open questions']} open question(s); "
-          f"stopWhenNoMajor={'true' if settings['stopWhenNoMajor'] else 'false'} minRounds={settings['minRounds']}")
+          f"stopWhenNoMajor={'true' if settings['stopWhenNoMajor'] else 'false'} minRounds={settings['minRounds']} "
+          f"cap={cap['cap']}" + (f" (big: {cap['reason']})" if cap["big"] else ""))
     return 0
 
 
@@ -716,7 +835,7 @@ def review_summary(root: Path) -> int:
     if decision == "stop":
         line = f"review stopped: round {k} had no Major; {deferred or 'all findings fixed'}"
     else:
-        line = f"review clean after round {k}" if decision == "clean" else f"review ended at the five-round cap (round {k})"
+        line = f"review clean after round {k}" if decision == "clean" else f"review ended at the {recorded_cap(last)}-round cap (round {k})"
         line += f"; {deferred}" if deferred else ""
     revmux_severe, severe = int(last.get("revmuxSevere") or 0), int(last.get("severe") or 0)
     if severe < revmux_severe:

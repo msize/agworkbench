@@ -41,7 +41,7 @@ all stop you exactly as they do without autonomy.
 
 - **Follow-ups are recorded as you go, and filed before the merge**, as "Follow-ups" below says.
   Under autonomy that covers every deferred finding and every out-of-scope plan item.
-- **What may be deferred.** After a `stop` (Phase 4) or at most five rounds, a remaining Minor or
+- **What may be deferred.** After a `stop` (Phase 4) or at the review cap, a remaining Minor or
   Immaterial finding may be deferred, but only as a filed follow-up. A Major or blocker **never** may, disputed or not: it
   stops as today. merge-check refuses any Major or blocker review item in follow-ups.json, so record
   it honestly (with `--disputed` when it ended disputed) and the human decides.
@@ -384,7 +384,13 @@ yourself before reviewing it: `git log --oneline origin/<default>..HEAD` and
    | `continue` | a verified Major+, a degraded run, or `review.stopWhenNoMajor` is false or `review.minRounds` is not reached | `FIX r<K>`, then round K+1 |
    | `stop` | no verified Major+ (and at or past `minRounds`) | `FIX r<K> (final)`: no revmux round after it |
    | `clean` | no findings at all | review is done |
-   | `cap` | round 5 or later still has a Major+ or is degraded | `FIX r5`, then the human (with `stopWhenNoMajor: false`, today's rule: the fixes verified, as condition 1 says) |
+   | `cap` | a round at or past the review cap still has a Major+ or is degraded | `FIX r<K>`, then the human (with `stopWhenNoMajor: false`, today's rule: the fixes verified, as condition 1 says) |
+
+   **The review cap** is `review.maxRounds` (5), or `review.maxRoundsBig` (10) for a **big** issue: a
+   title starting with `Batch:`, a `batch` or `big` label, a diff past `review.bigDiffLines` (1500
+   lines added + deleted against the base) when a round is recorded, or a checkout launched with
+   `-BigReview` (#75). Judged big once, an issue stays big. `review-round` prints the cap it used
+   (`cap=10 (big: <why>)`), and `wb.py settings` prints `reviewCap=<n>` with the same reason.
 
 5. Send the verified findings to Codex (kind `review`, subject `FIX r<K>`, or `FIX r<K> (final)`
    after a `stop`): one block per finding with file:line, the failure it causes, and your evidence.
@@ -395,8 +401,8 @@ yourself before reviewing it: `git log --oneline origin/<default>..HEAD` and
    `follow-up add ... --origin "review r<K>"` (see "Follow-ups"). **Review stops once a round has no
    Major**: its minors are fixed if cheap and recorded otherwise, and no further revmux round runs.
 
-A round with a Major gets another round after its fix. At most five revmux rounds; after that, what
-is left goes to the human with both positions. A deferred finding is always a recorded and filed
+A round with a Major gets another round after its fix. At most the review cap's revmux rounds (five,
+or ten for a big issue); after that, what is left goes to the human with both positions. A deferred finding is always a recorded and filed
 follow-up (see "Follow-ups").
 In queue mode, report `wb.py loop-state blocked --reason "review rounds exhausted: <remaining issue>"`
 before ending the turn to wait for the human.
@@ -430,14 +436,14 @@ again, put its line (now with the leftovers URL) in `.workbench/pr-body.md`, and
 on, you merge only when **all** of these hold:
 
 1. **The review is clean.** The last revmux round's findings are all fixed and verified, or disputed
-   with evidence. None is deferred, and it is within the five-round cap. A review that **stopped**
+   with evidence. None is deferred, and it is within the review cap. A review that **stopped**
    (`review-round` decided `stop`: that round had no Major) is clean too, when each of its findings is
    fixed or recorded as a follow-up; file the recorded ones (`follow-up file --source <N> --pr <P>`)
    before merge-check, with or without autonomy. With full autonomy, a
    remaining Minor or Immaterial finding may also be deferred **with a filed follow-up issue**; a
    Major or blocker never may, disputed or not. A round that ended with open findings goes to the
    human instead. merge-check refuses a last round that decided `continue`; a `cap` (a Major or a
-   degraded run at round 5 or later) unless it was recorded with `stopWhenNoMajor: false`; and the
+   degraded run at or past the review cap) unless it was recorded with `stopWhenNoMajor: false`; and the
    newest revmux report when it has no recorded decision.
 2. **The whole suite passed on the PR head.** Note that commit's full SHA (`git rev-parse HEAD`
    after the push) and the test count. Run it with `wb.py suite --label <sha7> -- <command>` (see
@@ -537,7 +543,8 @@ reviews, comments, line comments, the review decision). For each round of it:
    `gh pr comment` rather than turning it into code.
 2. Send the change requests to Codex as a fix round. Review the fix - a direct diff read for small
    changes, another revmux round for substantial ones (recorded with `review-round` like any
-   other, round 6 and later included, or merge-check refuses its report; a Major there is a `cap`).
+   other, rounds past the review cap included, or merge-check refuses its report; a Major at or past
+   the cap is a `cap`).
 3. Push, and reply on the PR saying what changed for each point.
 
 ## Phase 7 - done

@@ -683,6 +683,8 @@ class Store:
                 raise ValueError('invalid autonomous')
             if 'autoMerge' in data and data['autoMerge'] is not None and type(data['autoMerge']) is not bool:
                 raise ValueError('invalid autoMerge')
+            if data.get('bigReview') is not None and type(data['bigReview']) is not bool:
+                raise ValueError('invalid bigReview')
             if data.get('triage') is not None and type(data['triage']) is not bool:
                 raise ValueError('invalid triage')
             # #66: the file name is the one its recorded repo and name give - which also tells a dotted
@@ -826,13 +828,13 @@ def pin_conductor(store, owner):
 
 
 def settings_changes(data, parallel, yes, implementer, auto_merge, autonomous, watch, label, triage_on=False,
-                     revmux_profile=None):
+                     revmux_profile=None, big_review=None):
     """What this start or append changes in a queue's saved settings (#28): {key: [old, new]}. A revmux
     profile is saved only when the human passed one (#66): the kimi default is the launcher's, per launch."""
     current = data or {}
     wanted = {'parallel': parallel, 'yes': True if yes else None, 'implementer': implementer,
               'autoMerge': auto_merge, 'autonomous': autonomous, 'triage': True if triage_on else None,
-              'revmuxProfile': revmux_profile}
+              'revmuxProfile': revmux_profile, 'bigReview': big_review}
     changes = {key: [current.get(key), value] for key, value in wanted.items()
                if value is not None and data is not None and current.get(key) != value}
     if watch and data is not None:
@@ -875,7 +877,7 @@ def check_workspace(workspace, siblings):
 
 def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=False, dry_run=False, root=None,
                 implementer=None, auto_merge=None, autonomous=None, gh=gh_json, triage_on=False,
-                prune=False, clear_limit=None, name=None, workspace=None, revmux_profile=None):
+                prune=False, clear_limit=None, name=None, workspace=None, revmux_profile=None, big_review=None):
     name = queue_name(name)
     if workspace is not None and name is None:
         raise UsageError('-Workspace requires -QueueName: the main queue uses the workspace named after the repo')
@@ -928,7 +930,7 @@ def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=Fa
         live = store.running() if store.worker_lock.exists() else False
         mode = 'start' if existing is None else ('append to a running queue' if live else 'append to a stopped queue')
         changes = settings_changes(existing, parallel, yes, implementer, auto_merge, autonomous, watch, label, triage_on,
-                                   revmux_profile)
+                                   revmux_profile, big_review)
         query = dict(query=label.text, matches=matches) if isinstance(label, labelquery.Query) else {}
         limits = dict(clearLimit=dict(tool=clear_limit, recorded=((existing or {}).get('toolLimits') or {}).get(clear_limit))
                       ) if clear_limit else {}
@@ -955,10 +957,10 @@ def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=Fa
                 if name:
                     data.update(name=name, workspace=workspace)
             # One mapping decides and applies every switch, and is what gets reported (#28). All apply to
-            # members launched from now on; autonomous/autoMerge are saved explicitly, false included,
+            # members launched from now on; autonomous/autoMerge/bigReview are saved explicitly, false included,
             # and -Watch onto a queue started from a list turns watching on.
             changes = settings_changes(data, parallel, yes, implementer, auto_merge, autonomous, watch, label,
-                                       triage_on, revmux_profile)
+                                       triage_on, revmux_profile, big_review)
             for key, (_, new) in changes.items():
                 data[key] = new
             cleared = None
@@ -1300,6 +1302,8 @@ class Worker:
             args.append('-Autonomous' if data['autonomous'] else '-NoAutonomous')
         if data.get('autoMerge') is not None and not (data.get('autonomous') and not data['autoMerge']):
             args.append('-AutoMerge' if data['autoMerge'] else '-NoAutoMerge')
+        if data.get('bigReview') is not None:
+            args.append('-BigReview' if data['bigReview'] else '-NoBigReview')     # #75
         try:
             process = subprocess.Popen(args, cwd=HERE.parent, env=env, stdout=stream, stderr=subprocess.STDOUT)
         except BaseException:
@@ -2168,6 +2172,10 @@ def main(argv=None):
     autonomy = start.add_mutually_exclusive_group()
     autonomy.add_argument('--autonomous', dest='autonomous', action='store_const', const=True)
     autonomy.add_argument('--no-autonomous', dest='autonomous', action='store_const', const=False)
+    big = start.add_mutually_exclusive_group()
+    big.add_argument('--big-review', dest='big_review', action='store_const', const=True,
+                     help='every member is a big issue: up to review.maxRoundsBig revmux rounds (#75)')
+    big.add_argument('--no-big-review', dest='big_review', action='store_const', const=False)
     run = sub.add_parser('run')
     run.add_argument('--file', required=True)
     run.add_argument('--token', required=True)
@@ -2207,7 +2215,7 @@ def main(argv=None):
                                implementer=args.implementer, auto_merge=args.auto_merge,
                                autonomous=args.autonomous, triage_on=args.triage, prune=args.prune,
                                clear_limit=args.clear_limit, name=args.name, workspace=args.workspace,
-                               revmux_profile=args.revmux_profile)
+                               revmux_profile=args.revmux_profile, big_review=args.big_review)
         if args.command == 'run':
             return Worker(Store(args.file), args.token).run()
         if args.command == 'mark':

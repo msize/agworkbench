@@ -955,6 +955,37 @@ class QueueCase(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             q.main(['start', '--spec', 'o/r#1', '--auto-merge', '--no-auto-merge'])
 
+    # #75: -BigReview / -NoBigReview on a queue are saved (false included) and passed to members.
+    def test_big_review_is_saved_and_passed_to_members(self):
+        self.start('o/r#1')
+        self.assertNotIn('bigReview', self.store.load())
+        self.assertNotIn('-BigReview', self.launched_args())
+        self.assertNotIn('-NoBigReview', self.launched_args())
+        self.start('o/r#2', big_review=True)
+        self.assertIs(True, self.store.load()['bigReview'])
+        self.assertIn('-BigReview', self.launched_args())
+        self.start('o/r#3')
+        self.assertIs(True, self.store.load()['bigReview'])
+        self.start('o/r#4', big_review=False)
+        self.assertIs(False, self.store.load()['bigReview'])
+        args = self.launched_args()
+        self.assertIn('-NoBigReview', args)
+        self.assertNotIn('-BigReview', args)
+
+    def test_invalid_saved_big_review_is_refused(self):
+        self.start('o/r#1')
+        data = json.loads(self.store.path.read_text())
+        for bad in ('yes', 1):
+            with self.subTest(value=bad):
+                data['bigReview'] = bad
+                self.store.path.write_text(json.dumps(data))
+                with self.assertRaises(q.StateError):
+                    self.store.load()
+
+    def test_cli_big_review_flags_are_exclusive(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            q.main(['start', '--spec', 'o/r#1', '--big-review', '--no-big-review'])
+
     # #27: -Autonomous / -NoAutonomous on a queue are saved (false included) and passed to members.
     def test_autonomy_is_saved_and_passed_to_members(self):
         self.start('o/r#1')

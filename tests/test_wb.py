@@ -1224,6 +1224,8 @@ class Settings(unittest.TestCase):
         self.config = self.folder / 'config.json'
         self.enterContext(patch.dict(os.environ, {'AI_HUB': str(self.folder / '.workbench'),
                                                  'AGWORKBENCH_CONFIG': str(self.config)}))
+        self.enterContext(patch.object(wb, 'issue_facts', return_value={'title': 'Plain', 'labels': []}))
+        self.enterContext(patch.object(wb, 'diff_lines', return_value=(0, 'origin/main')))
 
     def printed(self, record=None):
         if record is not None:
@@ -1234,14 +1236,14 @@ class Settings(unittest.TestCase):
         return out.getvalue().strip()
 
     def test_defaults_and_records(self):
-        self.assertEqual('implementer=codex revmuxProfile=comprehensive autoMerge=false autonomous=false stopWhenNoMajor=true minRounds=1 failover=true', self.printed())
+        self.assertEqual('implementer=codex revmuxProfile=comprehensive autoMerge=false autonomous=false stopWhenNoMajor=true minRounds=1 reviewCap=5 failover=true', self.printed())
         # a #20 record has no autoMerge key: off
-        self.assertEqual('implementer=claude revmuxProfile=claude-only autoMerge=false autonomous=false stopWhenNoMajor=true minRounds=1 failover=true',
+        self.assertEqual('implementer=claude revmuxProfile=claude-only autoMerge=false autonomous=false stopWhenNoMajor=true minRounds=1 reviewCap=5 failover=true',
                          self.printed('{"tool": "claude", "revmuxProfile": "claude-only"}'))
-        self.assertEqual('implementer=claude revmuxProfile=claude-only autoMerge=true autonomous=false stopWhenNoMajor=true minRounds=1 failover=true',
+        self.assertEqual('implementer=claude revmuxProfile=claude-only autoMerge=true autonomous=false stopWhenNoMajor=true minRounds=1 reviewCap=5 failover=true',
                          self.printed('{"tool": "claude", "revmuxProfile": "claude-only", "autoMerge": true}'))
         self.assertIn('autoMerge=false', self.printed('{"tool": "codex", "autoMerge": "true"}'))
-        self.assertEqual('implementer=kimi revmuxProfile=claude-only autoMerge=false autonomous=false stopWhenNoMajor=true minRounds=1 failover=true',
+        self.assertEqual('implementer=kimi revmuxProfile=claude-only autoMerge=false autonomous=false stopWhenNoMajor=true minRounds=1 reviewCap=5 failover=true',
                          self.printed('{"tool": "kimi", "revmuxProfile": "claude-only"}'))
         self.assertIn('implementer=codex', self.printed('{"tool": "aider"}'))
         import hub
@@ -1285,6 +1287,9 @@ class ReviewRound(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.folder)
         self.addCleanup(hub.reload_paths)
         make_origin(self.folder)
+        self.facts, self.lines = {'title': 'Plain issue', 'labels': []}, (0, 'origin/main')
+        self.enterContext(patch.object(wb, 'issue_facts', side_effect=lambda root: self.facts))
+        self.enterContext(patch.object(wb, 'diff_lines', side_effect=lambda root: self.lines))
         self.config = self.folder / 'agworkbench.json'
         self.enterContext(patch.dict(os.environ, {'AI_HUB': str(self.folder / '.workbench'), 'AI_BOX': 'claude',
                                                  'AGWORKBENCH_CONFIG': str(self.config)}))
@@ -1351,9 +1356,160 @@ class ReviewRound(unittest.TestCase):
         self.assertEqual(2, self.record(0, revmux_report([('Minor', 1)])))
         self.assertEqual([], self.entries())
         self.assertEqual('review: cap', self.decision(6, revmux_report([('Major', 1)])))
-        self.assertEqual((1, ["review: round 6 had a Major at the cap - this is the human's"]), self.merge_check())
+        self.assertEqual((1, ["review: round 6 had a Major at the 5-round cap - this is the human's"]), self.merge_check())
         self.assertEqual('review: stop', self.decision(6, revmux_report([('Minor', 1)])))
         self.assertEqual((0, ['ok']), self.merge_check())
+
+    # --- the review cap (#75) -----------------------------------------------------------------------
+
+    def majors(self, rounds):
+        return [self.decision(k, revmux_report([('Major', 1)])) for k in rounds]
+
+    def reset_cap(self):
+        for name in ('review-big.json', 'review-rounds.json'):
+            (self.state / name).unlink(missing_ok=True)
+
+    def settings_line(self):
+        self.wb('settings')
+        return self.out.getvalue().strip()
+
+    def test_review_decision_reads_the_cap_from_settings(self):
+        settings = {'stopWhenNoMajor': True, 'minRounds': 1, 'maxRounds': 5}
+        self.assertEqual('cap', wb.review_decision(5, 1, 0, False, settings))
+        self.assertEqual('continue', wb.review_decision(9, 1, 0, False, {**settings, 'cap': 10}))
+        self.assertEqual('cap', wb.review_decision(10, 1, 0, False, {**settings, 'cap': 10}))
+        self.assertEqual('cap', wb.review_decision(10, 0, 0, True, {**settings, 'cap': 10}))
+        self.assertEqual('stop', wb.review_decision(7, 0, 1, False, {**settings, 'cap': 10}))
+
+    def test_a_batch_issue_gets_the_ten_round_cap(self):
+        # #75 AC1: continue at rounds 5-9, cap at 10; a normal issue still caps at 5.
+        self.facts = {'title': 'Batch: docxy tables', 'labels': []}
+        self.assertEqual(['review: continue'] * 9, self.majors(range(1, 10)))
+        self.assertEqual(['review: cap'], self.majors([10]))
+        last = self.entries()[-1]
+        self.assertEqual((10, True, 'title starts with Batch:'), (last['cap'], last['big'], last['bigReason']))
+        self.assertIn('cap=10 (big: title starts with Batch:)', self.out.getvalue())
+        for title in ('batch: lower case', '  BATCH: shouting'):
+            with self.subTest(title=title):
+                self.reset_cap()
+                self.facts = {'title': title, 'labels': []}
+                self.assertEqual(['review: continue'], self.majors([5]))
+        self.reset_cap()
+        self.facts = {'title': 'Batching is not a batch: title', 'labels': []}
+        self.assertEqual(['review: cap'], self.majors([5]))
+        self.assertEqual((5, False, None), (self.entries()[-1]['cap'], self.entries()[-1]['big'],
+                                            self.entries()[-1]['bigReason']))
+        self.assertIn('cap=5\n', self.out.getvalue() + '\n')
+
+    def test_a_batch_or_big_label_makes_the_issue_big(self):
+        # #75 AC2
+        for label in ('batch', 'big', 'BIG', 'Batch'):
+            with self.subTest(label=label):
+                self.reset_cap()
+                self.facts = {'title': 'Plain', 'labels': ['bug', label]}
+                self.assertEqual(['review: continue'], self.majors([5]))
+                self.assertEqual(f'label {label}', self.entries()[-1]['bigReason'])
+        self.reset_cap()
+        self.facts = {'title': 'Plain', 'labels': ['bigger', 'batches']}
+        self.assertEqual(['review: cap'], self.majors([5]))
+
+    def test_the_title_falls_back_to_issue_md_when_gh_cannot_answer(self):
+        self.facts = None
+        (self.folder / '.workbench/issue.md').write_text('# Batch: offline\n\nhttps://x\n', encoding='utf-8')
+        self.assertEqual(['review: continue'], self.majors([5]))
+        self.assertEqual('title starts with Batch: (from issue.md; labels unknown)', self.entries()[-1]['bigReason'])
+        self.reset_cap()
+        (self.folder / '.workbench/issue.md').write_text('# Plain offline\n', encoding='utf-8')
+        self.assertEqual(['review: cap'], self.majors([5]))
+
+    def test_a_growing_diff_switches_to_the_big_cap_and_stays(self):
+        # #75 AC3
+        self.assertEqual('stopWhenNoMajor=true minRounds=1 reviewCap=5 failover=true',
+                         self.settings_line().split('autonomous=false ')[1])
+        self.lines = (1500, 'origin/main')                 # at the threshold is not past it
+        self.assertEqual(['review: continue'] * 4, self.majors(range(1, 5)))
+        self.assertFalse((self.state / 'review-big.json').exists())
+        self.lines = (1623, 'origin/main')
+        self.assertEqual(['review: continue'], self.majors([5]))
+        self.assertEqual('diff 1623 lines > 1500 vs origin/main', self.entries()[-1]['bigReason'])
+        self.lines = (1000, 'origin/main')                 # shrinks: judged big once, stays big
+        self.assertEqual(['review: continue'], self.majors([6]))
+        self.assertIn('reviewCap=10 (big: diff 1623 lines > 1500 vs origin/main) failover=true', self.settings_line())
+        self.configure({'bigDiffLines': 200, 'maxRoundsBig': 12})
+        self.assertIn('reviewCap=12 (big: diff 1623', self.settings_line())
+
+    def test_settings_latches_a_big_issue_it_sees(self):
+        self.lines = (1600, 'origin/trunk')
+        self.assertIn('reviewCap=10 (big: diff 1600 lines > 1500 vs origin/trunk)', self.settings_line())
+        self.lines = (0, 'origin/trunk')
+        self.assertEqual(['review: continue'], self.majors([5]))
+
+    def test_the_big_review_flag_makes_the_issue_big(self):
+        (self.state / 'implementer.json').write_text(json.dumps({'tool': 'claude', 'bigReview': True}), encoding='utf-8')
+        self.assertEqual(['review: continue'], self.majors([5]))
+        self.assertEqual('-BigReview', self.entries()[-1]['bigReason'])
+        # -NoBigReview later does not un-judge it
+        (self.state / 'implementer.json').write_text(json.dumps({'tool': 'claude', 'bigReview': False}), encoding='utf-8')
+        self.assertEqual(['review: continue'], self.majors([6]))
+        self.reset_cap()
+        self.assertEqual(['review: cap'], self.majors([5]))
+
+    def test_a_big_loop_still_stops_at_the_first_round_without_a_major(self):
+        # #75 AC5
+        self.facts = {'title': 'Batch: x', 'labels': []}
+        self.assertEqual(['review: continue'] * 6, self.majors(range(1, 7)))
+        self.assertEqual('review: stop', self.decision(7, revmux_report([('Minor', 2)])))
+        self.assertEqual('review: clean', self.decision(8, revmux_report(no_findings=True)))
+
+    def test_merge_check_on_a_big_loop(self):
+        # #75 AC6: main records cap at rounds 5-7; a big loop records continue, and a clean round 8 merges.
+        self.facts = {'title': 'Batch: x', 'labels': []}
+        self.assertEqual(['review: continue'] * 7, self.majors(range(1, 8)))
+        self.assertEqual((1, ['review: round 7 had 1 Major finding(s); another revmux round is due']), self.merge_check())
+        self.decision(8, revmux_report(no_findings=True))
+        self.assertEqual((0, ['ok']), self.merge_check())
+        self.assertEqual(['continue'] * 7 + ['clean'], [e['decision'] for e in self.entries()])
+
+    def test_merge_check_refuses_a_big_loops_major_when_stop_when_no_major_is_off(self):
+        # #75 AC6: main records cap at round 6 and, with stopWhenNoMajor false, accepts it.
+        self.configure({'stopWhenNoMajor': False})
+        self.facts = {'title': 'Plain', 'labels': ['big']}
+        self.assertEqual(['review: continue'], self.majors([6]))
+        self.assertEqual((1, ['review: round 6 had 1 Major finding(s); another revmux round is due']), self.merge_check())
+        self.assertEqual(['review: cap'], self.majors([10]))
+        self.assertEqual((0, ['ok']), self.merge_check())
+
+    def test_the_summary_names_the_recorded_cap(self):
+        # #75 AC7
+        self.configure({'stopWhenNoMajor': False})
+        self.facts = {'title': 'Batch: x', 'labels': []}
+        self.majors(range(1, 11))
+        self.assertEqual(0, self.wb('review-round', '--summary'))
+        self.assertEqual('review ended at the 10-round cap (round 10)', self.out.getvalue().strip())
+        # an entry recorded before #75 has no cap: it was the fixed five
+        entries = self.entries()
+        for entry in entries:
+            entry.pop('cap')
+        (self.state / 'review-rounds.json').write_text(json.dumps(entries), encoding='utf-8')
+        self.wb('review-round', '--summary')
+        self.assertEqual('review ended at the 5-round cap (round 10)', self.out.getvalue().strip())
+
+    def test_the_cap_settings_are_validated(self):
+        # #75 AC8
+        for review in ({'maxRounds': 0}, {'maxRounds': 21}, {'maxRounds': '5'}, {'maxRounds': True},
+                       {'maxRounds': 5.0}, {'maxRoundsBig': 4}, {'maxRoundsBig': 21}, {'maxRounds': 8, 'maxRoundsBig': 7},
+                       {'bigDiffLines': 0}, {'bigDiffLines': 1.5}, {'bigDiffLines': None},
+                       {'minRounds': 3, 'maxRounds': 2}):
+            with self.subTest(review=review):
+                self.configure(review)
+                self.assertEqual(2, self.record(1, revmux_report([('Minor', 1)])))
+                self.assertIn('review.', self.err.getvalue())
+                self.assertIn('reviewCap=invalid', self.settings_line())
+        self.assertEqual([], self.entries())
+        self.configure({'maxRounds': 3, 'minRounds': 3})
+        self.assertEqual(['review: continue', 'review: continue', 'review: cap'], self.majors(range(1, 4)))
+        self.configure({'maxRounds': 12})                  # maxRoundsBig follows a maxRounds past 10
+        self.assertIn('reviewCap=12 failover', self.settings_line())
 
     def test_stop_when_no_major_off_keeps_todays_rule(self):
         # AC3
@@ -1460,10 +1616,10 @@ class ReviewRound(unittest.TestCase):
     def test_settings_prints_the_review_keys(self):
         self.configure({'stopWhenNoMajor': False, 'minRounds': 3})
         self.wb('settings')
-        self.assertIn('stopWhenNoMajor=false minRounds=3 failover=true', self.out.getvalue())
+        self.assertIn('stopWhenNoMajor=false minRounds=3 reviewCap=5 failover=true', self.out.getvalue())
         self.configure({'minRounds': 9})
         self.wb('settings')
-        self.assertIn('stopWhenNoMajor=invalid minRounds=invalid', self.out.getvalue())
+        self.assertIn('stopWhenNoMajor=invalid minRounds=invalid reviewCap=invalid', self.out.getvalue())
 
     def test_a_rerecorded_earlier_round_does_not_become_the_last(self):
         self.decision(2, revmux_report([('Major', 1)]))
@@ -1518,7 +1674,7 @@ class ReviewRound(unittest.TestCase):
         self.configure({'stopWhenNoMajor': False})
         self.decision(5, revmux_report([('Major', 1)]))
         self.assertEqual(0, self.wb('review-round', '--summary'))
-        self.assertEqual(f'review ended at the five-round cap (round 5); 1 minor finding(s) from round 2 in {leftovers}',
+        self.assertEqual(f'review ended at the 5-round cap (round 5); 1 minor finding(s) from round 2 in {leftovers}',
                          self.out.getvalue().strip())
 
     # --- merge-check -------------------------------------------------------------------------------
@@ -1556,9 +1712,9 @@ class ReviewRound(unittest.TestCase):
                               'another revmux round is due']), self.merge_check())
         self.configure({})
         self.decision(5, revmux_report([('Major', 1)]))
-        self.assertEqual((1, ["review: round 5 had a Major at the cap - this is the human's"]), self.merge_check())
+        self.assertEqual((1, ["review: round 5 had a Major at the 5-round cap - this is the human's"]), self.merge_check())
         self.decision(5, revmux_report([('Minor', 1)], ('failed',)))
-        self.assertEqual((1, ["review: round 5 ended at the cap (degraded) - this is the human's"]), self.merge_check())
+        self.assertEqual((1, ["review: round 5 ended at the 5-round cap (degraded) - this is the human's"]), self.merge_check())
         # With the setting off, the cap is today's rule: condition 1 stays the planner's check.
         self.configure({'stopWhenNoMajor': False})
         self.decision(5, revmux_report([('Major', 1)]))
@@ -1577,6 +1733,84 @@ class ReviewRound(unittest.TestCase):
         (self.reviews / 'revmux-r2.md').write_text(revmux_report([('Minor', 1)]), encoding='utf-8')
         self.assertEqual((1, ['review: revmux round 2 has no recorded decision - run wb.py review-round --round 2']),
                          self.merge_check())
+
+
+def git(folder, *args):
+    return subprocess.run(['git', '-C', str(folder), '-c', 'user.name=t', '-c', 'user.email=t@t', *args],
+                          check=True, capture_output=True, text=True).stdout
+
+
+class ReviewCapSources(unittest.TestCase):
+    """#75: the diff size and the issue's title and labels, read live."""
+
+    def setUp(self):
+        self.folder = Path(__file__).resolve().parent.parent / ('test wb cap ' + uuid.uuid4().hex)
+        self.folder.mkdir()
+        self.addCleanup(remove_tree, self.folder)
+        git(self.folder, 'init', '-q', '-b', 'main')
+
+    def commit(self, files, message):
+        for name, content in files.items():
+            path = self.folder / name
+            if content is None:
+                path.unlink()
+            elif isinstance(content, bytes):
+                path.write_bytes(content)
+            else:
+                path.write_text(content, encoding='utf-8')
+        git(self.folder, 'add', '-A')
+        git(self.folder, 'commit', '-q', '-m', message)
+
+    def test_diff_lines_counts_the_branch_against_its_base(self):
+        self.commit({'a.txt': 'one\ntwo\nthree\n', 'old.txt': 'x\ny\n'}, 'base')
+        self.assertIsNone(wb.diff_lines(self.folder))                  # no origin ref: unmeasurable
+        git(self.folder, 'update-ref', 'refs/remotes/origin/main', 'HEAD')
+        git(self.folder, 'checkout', '-q', '-b', 'issue-75-x')
+        self.commit({'a.txt': 'one\nTWO\nthree\nfour\n', 'old.txt': None, 'b.bin': b'\x00\x01\x02' * 50}, 'work')
+        # a.txt: 2 added, 1 deleted; old.txt: 2 deleted; the binary counts 0
+        self.assertEqual((5, 'origin/main'), wb.diff_lines(self.folder))
+        # the default branch moving on (and merged in) does not count: the diff is from the merge-base
+        git(self.folder, 'checkout', '-q', 'main')
+        self.commit({'main.txt': 'm\n' * 40}, 'main moves')
+        git(self.folder, 'update-ref', 'refs/remotes/origin/main', 'HEAD')
+        git(self.folder, 'checkout', '-q', 'issue-75-x')
+        git(self.folder, 'merge', '-q', '--no-ff', '-m', 'update', 'main')
+        self.assertEqual((5, 'origin/main'), wb.diff_lines(self.folder))
+        # origin/HEAD names the base when it is set
+        git(self.folder, 'update-ref', 'refs/remotes/origin/trunk', 'main')
+        git(self.folder, 'symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/trunk')
+        self.assertEqual((5, 'origin/trunk'), wb.diff_lines(self.folder))
+
+    def test_diff_lines_reads_only_the_checkouts_own_git(self):
+        # the enclosing repo is measurable, so without --git-dir git would find it and count its diff
+        self.commit({'a.txt': 'one\n'}, 'base')
+        git(self.folder, 'update-ref', 'refs/remotes/origin/main', 'HEAD')
+        self.commit({'a.txt': 'one\ntwo\n'}, 'work')
+        self.assertEqual((1, 'origin/main'), wb.diff_lines(self.folder))
+        inner = self.folder / 'not a checkout'
+        inner.mkdir()
+        self.assertIsNone(wb.diff_lines(inner))
+
+    def test_issue_facts_never_exits(self):
+        self.commit({'a.txt': 'a\n'}, 'base')
+        git(self.folder, 'checkout', '-q', '-b', 'issue-75-x')
+        with patch.object(wb, 'gh_run', side_effect=AssertionError('gh called')):
+            self.assertIsNone(wb.issue_facts(self.folder))            # no origin
+            git(self.folder, 'remote', 'add', 'origin', 'https://gitlab.com/o/r.git')
+            self.assertIsNone(wb.issue_facts(self.folder))            # not GitHub: no exit 2
+        git(self.folder, 'remote', 'set-url', 'origin', 'https://github.com/o/r.git')
+        answer = json.dumps({'title': 'Batch: x', 'labels': [{'name': 'big'}, {'name': 'bug'}]})
+        with patch.object(wb, 'gh_run', return_value=subprocess.CompletedProcess([], 0, answer, '')) as gh:
+            self.assertEqual({'title': 'Batch: x', 'labels': ['big', 'bug']}, wb.issue_facts(self.folder))
+        self.assertEqual(('issue', 'view', '75', '--json', 'title,labels'), gh.call_args.args[1:])
+        for done in (subprocess.CompletedProcess([], 1, '', 'HTTP 502'), subprocess.CompletedProcess([], 0, 'nope', '')):
+            with patch.object(wb, 'gh_run', return_value=done):
+                self.assertIsNone(wb.issue_facts(self.folder))
+        with patch.object(wb, 'gh_run', side_effect=OSError('no gh')):
+            self.assertIsNone(wb.issue_facts(self.folder))
+        git(self.folder, 'checkout', '-q', '-b', 'feature')
+        with patch.object(wb, 'gh_run', side_effect=AssertionError('gh called')):
+            self.assertIsNone(wb.issue_facts(self.folder))            # not an issue branch
 
 
 class Handover(unittest.TestCase):
@@ -1643,7 +1877,7 @@ class AutoMergeProse(unittest.TestCase):
         text = (Path(__file__).resolve().parent.parent / 'claude/commands/start-github-issue.md').read_text(encoding='utf-8')
         phase6 = text.split('## Phase 6')[1].split('## Phase 7')[0]
         for needle in ['wb.py" settings', 'autoMerge=true', 'wb.py" merge-check --pr <N> --head <full sha>',
-                       '--match-head-commit <full sha>', 'None is deferred', 'five-round cap',
+                       '--match-head-commit <full sha>', 'None is deferred', 'within the review cap',
                        'whole suite passed on the PR head', 'If any condition fails, do not merge',
                        'UNKNOWN', 'go ahead']:
             self.assertIn(needle, ' '.join(phase6.split()) if ' ' in needle else phase6)
@@ -1915,7 +2149,8 @@ class FollowUps(unittest.TestCase):
 
     def test_settings_prints_autonomous(self):
         self.settings(True)
-        self.run_wb('settings')
+        with patch.object(wb, 'issue_facts', return_value=None), patch.object(wb, 'diff_lines', return_value=None):
+            self.run_wb('settings')
         self.assertIn('autonomous=true', self.out.getvalue())
 
     # --- merge-check's autonomous conditions ------------------------------------------------------
@@ -2022,7 +2257,9 @@ class ReviewRoundProse(unittest.TestCase):
                        "Never go below revmux's count without a reason", '| `continue` |', '| `stop` |', '| `clean` |',
                        '| `cap` |', '`FIX r<K> (final)`', '--origin "review r<K>"',
                        '**Review stops once a round has no Major**', 'no further revmux round runs',
-                       'A round with a Major gets another round after its fix', 'At most five revmux rounds']:
+                       'A round with a Major gets another round after its fix', "At most the review cap's revmux rounds",
+                       '**The review cap** is `review.maxRounds` (5), or `review.maxRoundsBig` (10) for a **big** issue',
+                       '`Batch:`', '`-BigReview`', 'Judged big once, an issue stays big', '`reviewCap=<n>`']:
             self.assertIn(needle, phase4)
         self.assertLess(phase4.index('review-round --round <K>'), phase4.index('Send the verified findings'))
         self.assertIn('The difference counts as Minor findings, so the round stops rather than reads clean', phase4)
@@ -2035,12 +2272,15 @@ class ReviewRoundProse(unittest.TestCase):
             self.assertIn(needle, phase5)
         self.assertLess(phase5.index('gh pr create'), phase5.index('gh pr edit <P>'))
         self.assertNotIn('filed at merge', text)
+        for stale in ('five-round', 'At most five', 'round 5 or later', 'FIX r5', 'round 6 and later'):
+            self.assertNotIn(stale, text)        # #75: the cap is the review cap, five or ten
         phase6 = text.split('## Phase 6')[1].split('## Phase 7')[0]
         for needle in ['A review that **stopped**', 'fixed or recorded as a follow-up',
                        '`follow-up file --source <N> --pr <P>`) before merge-check, with or without autonomy',
                        'the newest revmux report when it has no recorded decision', '<the `wb.py review-round --summary` line>',
                        'review stopped: round K had no Major; N minor finding(s) in <leftovers URL>',
-                       'recorded with `review-round` like any other', 'round 6 and later included',
+                       'recorded with `review-round` like any other', 'rounds past the review cap included',
+                       'within the review cap', 'a degraded run at or past the review cap',
                        'unless it was recorded with `stopWhenNoMajor: false`']:
             self.assertIn(needle, phase6)
 
