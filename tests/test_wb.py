@@ -1804,6 +1804,13 @@ class ReviewLimit(unittest.TestCase):
         self.assertIn('revmux --round 1 --rerun --profile claude-only', self.out.getvalue())
         self.assertIsNone(self.review_limit())
 
+    def test_a_fractional_retry_is_rounded_up_to_whole_minutes(self):
+        self.on_limit()
+        self.config.write_text(json.dumps({'limitRetryMinutes': 0.5}), encoding='utf-8')
+        self.run_dir(1, self.RATE_LIMITED)
+        self.decision(1, self.LIMITED)
+        self.assertIn('--rerun --after 1 ', self.out.getvalue())
+
     def test_failover_and_other_degradations_decide_as_before(self):
         self.run_dir(1, self.RATE_LIMITED)
         self.on_limit('failover')

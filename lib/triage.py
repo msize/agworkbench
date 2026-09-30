@@ -114,7 +114,17 @@ SCHEMA = {
 KIMI_LABEL = 'kimi'
 KIMI_PROPERTIES = {'kimiSuitable': {'type': 'boolean'}, 'kimiReason': {'type': 'string', 'maxLength': 1000}}
 KIMI_PRIORITIES = ('P2', 'P3')
+PENDING_SLACK = 300     # seconds of clock skew between this machine and GitHub's event times
 DETERMINISTIC_NOT_KIMI = 'an open spec issue references it and makes it P0: spec work waits on it, never Kimi work'
+
+
+def event_time(event: dict) -> float | None:
+    """An issue event's `created_at` as epoch seconds; None when absent or unreadable."""
+    from datetime import datetime
+    try:
+        return datetime.fromisoformat(str(event.get('created_at')).replace('Z', '+00:00')).timestamp()
+    except ValueError:
+        return None
 
 
 def schema_for(kimi: bool = False, kimi_only: bool = False) -> dict:
@@ -681,8 +691,9 @@ class Triage:
         kimi = self.kimi_plan(number, names, decision.kimi, decision.kimiReason)
         args += kimi['args']
         self.log_rationale(issue, decision, kimi['line'])
+        at = self.clock()
         self.gh_ok(*args, what=f'labelling #{number}', error=IssueFailed)
-        self.record_kimi(number, kimi)
+        self.record_kimi(number, kimi, at)
         try:
             self.post(['issue', 'comment', str(number), '--repo', self.product],
                       public_comment(decision.priority, decision.ux, decision.capped), what=f'commenting on #{number}')
@@ -741,14 +752,28 @@ class Triage:
         owner, name = self.product.split('/')
         return self.state / owner / f'{name}.kimi.json'
 
-    def kimi_record(self) -> dict:
-        """{issue number: [ids of the `kimi` labeled/unlabeled events triage itself caused]}."""
+    def kimi_state(self) -> dict:
+        """{"issues": {number: [ids of the kimi events triage's own edits caused]},
+            "pending": {number: [{"action", "at"}]}}: an edit whose event GitHub had not listed yet."""
         try:
             data = json.loads(self.kimi_path().read_text(encoding='utf-8'))
         except (OSError, ValueError):
-            return {}
-        issues = data.get('issues') if isinstance(data, dict) else None
-        return issues if isinstance(issues, dict) else {}
+            data = {}
+        data = data if isinstance(data, dict) else {}
+        issues, pending = data.get('issues'), data.get('pending')
+        return {'issues': issues if isinstance(issues, dict) else {},
+                'pending': pending if isinstance(pending, dict) else {}}
+
+    def save_kimi_state(self, state: dict) -> None:
+        state = {'issues': state['issues'], 'pending': {n: p for n, p in state['pending'].items() if p}}
+        path = self.kimi_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_name(path.name + '.tmp')
+            temporary.write_text(json.dumps(state, indent=2), encoding='utf-8')
+            os.replace(temporary, path)
+        except OSError as err:
+            self.out(f'cannot save the kimi label record: {err}')
 
     def kimi_events(self, number: int) -> list[dict]:
         """The issue's `kimi` labeled/unlabeled events, every page, oldest first."""
@@ -760,14 +785,36 @@ class Triage:
         return [event for event in events if isinstance(event, dict) and event.get('event') in ('labeled', 'unlabeled')
                 and str((event.get('label') or {}).get('name') or '').casefold() == KIMI_LABEL]
 
+    def own_kimi_events(self, number: int, events: list[dict], state: dict) -> set:
+        """The ids of our own kimi events. A pending edit (its event was not listed yet right after it)
+        claims the first unclaimed event of its kind from its time on: GitHub lists events late."""
+        key = str(number)
+        ours = set(state['issues'].get(key) or [])
+        still = []
+        for entry in state['pending'].get(key) or []:
+            at = entry.get('at') if isinstance(entry, dict) else None
+            match = next((event for event in events if event.get('id') not in ours
+                          and event.get('event') == entry.get('action')
+                          and (event_time(event) or 0) >= (at or 0) - PENDING_SLACK), None)
+            if match:
+                ours.add(match['id'])
+            else:
+                still.append(entry)
+        if still != (state['pending'].get(key) or []):
+            state['issues'][key] = sorted(ours, key=str)
+            state['pending'][key] = still
+            self.save_kimi_state(state)
+        return ours
+
     def kimi_plan(self, number: int, names: list[str], suitable: bool | None, reason: str) -> dict:
         """What to do with the `kimi` label: {args, line, action}. A human's label - any kimi event triage
-        did not record, or a kimi label triage never set - is left alone."""
+        did not cause, or a kimi label triage never set - is left alone."""
         if suitable is None:
             return dict(args=[], line=None, action=None)
         present = any(name.casefold() == KIMI_LABEL for name in names)
-        ours = set(self.kimi_record().get(str(number)) or [])
-        foreign = [event for event in self.kimi_events(number) if event.get('id') not in ours]
+        events = self.kimi_events(number)
+        ours = self.own_kimi_events(number, events, self.kimi_state())
+        foreign = [event for event in events if event.get('id') not in ours]
         if foreign or (present and not ours):
             what = f"{foreign[-1].get('event')} by hand" if foreign else 'set by hand'
             return dict(args=[], line=f'kimi: human override ({what}); left alone', action=None)
@@ -778,30 +825,27 @@ class Triage:
             return dict(args=['--remove-label', KIMI_LABEL], line=line, action='unlabeled')
         return dict(args=[], line=line, action=None)
 
-    def record_kimi(self, number: int, plan: dict) -> None:
-        """After our edit: record the id of the `kimi` event it caused, read back from the issue."""
+    def record_kimi(self, number: int, plan: dict, at: float) -> None:
+        """After our edit (made at `at`): record the id of the kimi event it caused, read back from the
+        issue; when GitHub does not list it yet, record the edit as pending."""
         if not plan['action']:
             return
-        record = self.kimi_record()
-        ours = set(record.get(str(number)) or [])
+        state = self.kimi_state()
+        key = str(number)
         try:
             events = self.kimi_events(number)
-        except IssueFailed as err:
-            self.out(f'#{number}: kimi label written, but its event could not be read back: {err}')
-            return
-        mine = [event for event in events if event.get('id') not in ours and event.get('event') == plan['action']]
-        if not mine:
-            self.out(f'#{number}: kimi label written, but no {plan["action"]} event came back')
-            return
-        record[str(number)] = sorted(ours | {mine[-1]['id']}, key=str)
-        path = self.kimi_path()
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = path.with_name(path.name + '.tmp')
-            temporary.write_text(json.dumps({'issues': record}, indent=2), encoding='utf-8')
-            os.replace(temporary, path)
-        except OSError as err:
-            self.out(f'cannot save the kimi label record: {err}')
+        except IssueFailed:
+            events = []
+        ours = self.own_kimi_events(number, events, state)
+        mine = [event for event in events if event.get('id') not in ours and event.get('event') == plan['action']
+                and (event_time(event) or at) >= at - PENDING_SLACK]
+        if mine:
+            state['issues'][key] = sorted(ours | {mine[-1]['id']}, key=str)
+        else:
+            state['issues'][key] = sorted(ours, key=str)
+            state['pending'].setdefault(key, []).append({'action': plan['action'], 'at': at})
+            self.out(f'#{number}: kimi label {plan["action"]}; its event is not listed yet, recorded as pending')
+        self.save_kimi_state(state)
 
     def judge_kimi(self, issue: dict) -> tuple[bool, str]:
         """--kimi-only: suitability alone. The deterministic spec-reference path is never Kimi work."""
@@ -830,9 +874,10 @@ class Triage:
         else:
             self.out(f'#{number}: no spec repo exists; the reason stays here: {plan["line"]}')
         if plan['args']:
+            at = self.clock()
             self.gh_ok('issue', 'edit', str(number), '--repo', self.product, *plan['args'],
                        what=f'labelling #{number}', error=IssueFailed)
-            self.record_kimi(number, plan)
+            self.record_kimi(number, plan, at)
         return plan['line']
 
     # the run ------------------------------------------------------------------------------------------

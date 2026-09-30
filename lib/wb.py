@@ -999,12 +999,12 @@ def review_limit(root: Path, round_: int, agents: list[str]) -> int:
         print(f"next: rerun now with python \"$AGWORKBENCH/lib/wb.py\" revmux --round {round_} --rerun "
               "--profile claude-only (reviewOnLimit=fallback)")
         return 0
-    minutes = limit_retry_minutes()
+    minutes = max(1, math.ceil(limit_retry_minutes()))      # revmux --after takes whole minutes
     since = time.time()
     from conductor import atomic_json
     atomic_json(review_limit_path(root), {"tool": limited_tool(agents), "agents": agents, "since": since,
                                           "retryAt": since + minutes * 60, "round": round_})
-    print(f"next: rerun with python \"$AGWORKBENCH/lib/wb.py\" revmux --round {round_} --rerun --after {minutes:g} "
+    print(f"next: rerun with python \"$AGWORKBENCH/lib/wb.py\" revmux --round {round_} --rerun --after {minutes} "
           "(it waits on screen, then reviews); keep your waiter and end your turn")
     return 0
 

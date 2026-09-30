@@ -59,6 +59,7 @@ class TriageCase(unittest.TestCase):
         self.calls, self.model_calls, self.git_calls, self.out = [], [], [], []
         self.failing = {}                      # a gh call prefix -> the CompletedProcess it returns
         self.events = {}                       # issue number -> pages of its issue events (#77)
+        self.unlisted = {}                     # issue number -> event ids the next events read leaves out
         self.next_event = 1000
 
     # --- fakes ----------------------------------------------------------------------------------
@@ -82,7 +83,9 @@ class TriageCase(unittest.TestCase):
             events = re.fullmatch(rf'repos/{PRODUCT}/issues/(\d+)/events\?per_page=100', path)
             if events:
                 self.assertEqual(('--paginate', '--slurp'), args[2:4])
-                return done(0, json.dumps(self.events.get(int(events[1]), [[]])))
+                listed = self.events.get(int(events[1]), [[]])
+                hidden = self.unlisted.pop(int(events[1]), set())    # GitHub lists a new event late
+                return done(0, json.dumps([[e for e in page if e['id'] not in hidden] for page in listed]))
             for repo, issues in [(PRODUCT, self.product), *self.spec.items()]:
                 if path.startswith(f'repos/{repo}/issues?'):
                     return done(0, json.dumps([issues]))
@@ -114,7 +117,8 @@ class TriageCase(unittest.TestCase):
         if len(pages[-1]) >= 30:
             pages.append([])
         self.next_event += 1
-        pages[-1].append({'id': self.next_event, 'event': kind, 'label': {'name': label}})
+        pages[-1].append({'id': self.next_event, 'event': kind, 'label': {'name': label},
+                          'created_at': '1970-01-01T00:16:40Z'})            # the triage clock's 1000.0
         return self.next_event
 
     def git(self, *args, timeout=None):
@@ -648,6 +652,28 @@ class KimiLabel(TriageCase):
         self.assertEqual('--remove-label', self.kimi_change(30))
         self.assertIn('kimi: no - touches the save path', self.log_for(30)[0])
         self.assertEqual([1001, 1002], json.loads((self.folder / 'state/yeroo/docxy.kimi.json').read_text())['issues']['30'])
+
+    def test_an_own_event_github_lists_late_is_still_ours(self):
+        real = self.event
+
+        def late(number, kind, label='kimi'):
+            made = real(number, kind, label)
+            if label == 'kimi':
+                self.unlisted[number] = {made}          # missing from the read-back right after the edit
+            return made
+        self.event = late
+        self.triage().run_once(numbers=[30])
+        self.assertEqual('--add-label', self.kimi_change(30))
+        self.assertIn('#30: kimi label labeled; its event is not listed yet, recorded as pending', self.out)
+        state = json.loads((self.folder / 'state/yeroo/docxy.kimi.json').read_text())
+        self.assertEqual({'30': [{'action': 'labeled', 'at': 1000.0}]}, state['pending'])
+        self.event = real
+        self.calls.clear()
+        self.answers[30] = kimi_answer('P3', suitable=False, reason='touches the save path')
+        self.assertEqual(0, self.triage().run_once(numbers=[30], retriage=True))
+        self.assertEqual('--remove-label', self.kimi_change(30))          # ours, not a human's
+        state = json.loads((self.folder / 'state/yeroo/docxy.kimi.json').read_text())
+        self.assertEqual(({'30': [1001, 1002]}, {}), (state['issues'], state['pending']))
 
     def test_p0_and_p1_are_never_suitable_whatever_the_model_says(self):
         self.product[4]['labels'].append({'name': 'kimi'})               # #20 was kimi (set by triage)
