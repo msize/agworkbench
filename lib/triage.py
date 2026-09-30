@@ -32,6 +32,14 @@ How a decision is made:
 
 No private content reaches the public repo: it gets labels and one comment from a fixed template.
 The rationale goes to the "Triage log" issue in the first spec repo that exists.
+
+The `kimi` label (#77), for a product whose triage entry says `"kimiLabel": true`: the model also judges
+whether the issue suits Kimi (the fixed rules in triage-issue.md), and triage.py adds `kimi` when it does
+and removes it when not. P0/P1 is never suitable, nor is the deterministic spec-reference path, whatever
+the model says. The reason goes to the private log only. A human's `kimi` wins: triage records the ids of
+its own `kimi` labeled/unlabeled issue events, and any other such event - or a `kimi` label it never set -
+leaves the label alone. `run --kimi-only` (implies --retriage) re-judges only suitability on open P2/P3
+issues: no priority change and no public comment.
 """
 
 from __future__ import annotations
@@ -103,6 +111,21 @@ SCHEMA = {
         'exception': {'type': 'string', 'enum': list(EXCEPTIONS)},
     },
 }
+KIMI_LABEL = 'kimi'
+KIMI_PROPERTIES = {'kimiSuitable': {'type': 'boolean'}, 'kimiReason': {'type': 'string', 'maxLength': 1000}}
+KIMI_PRIORITIES = ('P2', 'P3')
+DETERMINISTIC_NOT_KIMI = 'an open spec issue references it and makes it P0: spec work waits on it, never Kimi work'
+
+
+def schema_for(kimi: bool = False, kimi_only: bool = False) -> dict:
+    """The answer's JSON schema for this run (#77): the priority fields, the kimi fields, or both."""
+    if kimi_only:
+        return {'type': 'object', 'additionalProperties': False, 'required': list(KIMI_PROPERTIES),
+                'properties': dict(KIMI_PROPERTIES)}
+    if not kimi:
+        return SCHEMA
+    return dict(SCHEMA, required=[*SCHEMA['required'], *KIMI_PROPERTIES],
+                properties={**SCHEMA['properties'], **KIMI_PROPERTIES})
 
 
 class TriageError(Exception):
@@ -251,7 +274,10 @@ def load_config(path: Path, product: str) -> dict:
     label = bug_label_of(settings)
     if label is None:
         raise ConfigError(f'bugLabel in {path} must be a non-empty label name without a comma')
-    return dict(specRepos=repos, model=model, bugLabel=label)
+    kimi = entry.get('kimiLabel', False)
+    if type(kimi) is not bool:
+        raise ConfigError(f'triage.{product}.kimiLabel in {path} must be true or false')
+    return dict(specRepos=repos, model=model, bugLabel=label, kimiLabel=kimi)
 
 
 def state_root() -> Path:
@@ -274,6 +300,8 @@ class Decision:
     notes: list = field(default_factory=list)
     capped: bool = False
     exception: str = 'none'
+    kimi: bool | None = None                     # #77: None when the product has no kimi label
+    kimiReason: str = ''
 
 
 def follow_up_severity(issue: dict) -> str | None:
@@ -329,10 +357,21 @@ def parse_model_output(done: subprocess.CompletedProcess) -> dict:
     return value
 
 
-def validate(result, known_refs: dict[str, str]) -> dict:
+def validate_kimi(result) -> dict:
+    suitable, reason = result['kimiSuitable'], result['kimiReason']
+    if type(suitable) is not bool:
+        raise IssueFailed(f'invalid kimiSuitable {suitable!r}')
+    if not isinstance(reason, str) or not reason.strip() or len(reason) > 1000:
+        raise IssueFailed('the kimiReason must be 1..1000 characters')
+    return dict(kimiSuitable=suitable, kimiReason=reason.strip())
+
+
+def validate(result, known_refs: dict[str, str], kimi: bool = False, kimi_only: bool = False) -> dict:
     """The model's answer, checked against the contract. `known_refs` maps casefolded refs to refs."""
-    if not isinstance(result, dict) or set(result) != set(SCHEMA['required']):
+    if not isinstance(result, dict) or set(result) != set(schema_for(kimi, kimi_only)['required']):
         raise IssueFailed(f'the model output does not match the contract: {str(result)[:200]}')
+    if kimi_only:
+        return validate_kimi(result)
     priority, ux, rationale, refs, exception = (result[key] for key in
                                                 ('priority', 'ux', 'rationale', 'specRefs', 'exception'))
     if priority not in PRIORITIES:
@@ -348,8 +387,9 @@ def validate(result, known_refs: dict[str, str]) -> dict:
     unknown = [r for r in refs if r.casefold() not in known_refs]
     if unknown:
         raise IssueFailed(f'specRefs not among the open spec issues: {unknown}')
-    return dict(priority=priority, ux=ux, rationale=rationale.strip(),
-                specRefs=[known_refs[r.casefold()] for r in refs], exception=exception)
+    checked = dict(priority=priority, ux=ux, rationale=rationale.strip(),
+                   specRefs=[known_refs[r.casefold()] for r in refs], exception=exception)
+    return {**checked, **validate_kimi(result)} if kimi else checked
 
 
 # --- a run -----------------------------------------------------------------------------------------
@@ -515,6 +555,8 @@ class Triage:
                     decision.notes.append(f'follow-up cap: deterministic uncapped grade P0 '
                                           f'(severity {severity or "unknown"}, no data loss/crash/open-save/security); capped at P2')
                     decision.priority, decision.capped = 'P2', True
+            if self.config.get('kimiLabel'):
+                decision.kimi, decision.kimiReason = False, DETERMINISTIC_NOT_KIMI
             return decision
         floor = 'P1' if refs else None
         answer = self.ask_model(issue, refs, floor)
@@ -534,10 +576,17 @@ class Triage:
         if decision.priority == 'P0' and not refs and association not in TRUSTED:
             decision.notes.append(f'the model said P0 for an author outside the repo ({association}); written as P1')
             decision.priority = 'P1'
+        if self.config.get('kimiLabel'):
+            decision.kimi, decision.kimiReason = answer['kimiSuitable'], answer['kimiReason']
+            if decision.kimi and decision.priority not in KIMI_PRIORITIES:
+                decision.kimi = False
+                decision.kimiReason = (f'{decision.priority} is never Kimi work (the model said suitable: '
+                                       f'{answer["kimiReason"]})')
         return decision
 
     def ask_model(self, issue: dict, refs: list[dict], floor: str | None,
-                  deterministic_p0: bool = False) -> dict:
+                  deterministic_p0: bool = False, kimi_only: bool = False) -> dict:
+        kimi = bool(self.config.get('kimiLabel'))
         if self.claude is None:
             self.claude = find_claude()
         try:
@@ -556,6 +605,8 @@ class Triage:
                            authorAssociation=issue.get('author_association') or 'NONE'),
                 floor=floor,
                 deterministicP0=deterministic_p0,
+                kimiLabel=kimi,
+                kimiOnly=kimi_only,
                 referencingSpecIssues=[{k: r[k] for k in ('ref', 'title', 'body', 'labels')} for r in refs],
                 specRepos=[dict(repo=s['repo'], path=str(s['path']),
                                 openIssues=[dict(ref=f"{s['repo']}#{i['number']}", title=i.get('title') or '',
@@ -565,7 +616,7 @@ class Triage:
             try:
                 facts_file = facts_dir / 'facts.json'
                 facts_file.write_text(json.dumps(facts, indent=2), encoding='utf-8')
-                argv = self.model_argv(facts_file)
+                argv = self.model_argv(facts_file, schema_for(kimi, kimi_only))
             except OSError as err:
                 raise IssueFailed(f'cannot write the facts file: {err}') from err
             cwd = str(self.specs[0]['path']) if self.specs else str(facts_dir)
@@ -578,14 +629,14 @@ class Triage:
                 raise IssueFailed(f'the model timed out after {MODEL_TIMEOUT}s') from None
             except OSError as err:
                 raise IssueFailed(f'the model could not start: {err}') from err
-            return validate(parse_model_output(done), known)
+            return validate(parse_model_output(done), known, kimi, kimi_only)
         finally:
             try:
                 remove_tree(facts_dir)
             except OSError:
                 pass
 
-    def model_argv(self, facts_file: Path) -> list[str]:
+    def model_argv(self, facts_file: Path, schema: dict = SCHEMA) -> list[str]:
         home = self.state / 'claude'
         home.mkdir(parents=True, exist_ok=True)
         settings, mcp = home / 'settings.json', home / 'mcp.json'
@@ -595,7 +646,7 @@ class Triage:
         argv = [*self.claude, '-p', prompt, '--restricted', '--tools', 'Read,Grep,Glob',
                 '--strict-mcp-config', '--mcp-config', str(mcp), '--settings', str(settings),
                 '--no-session-persistence', '--output-format', 'json',
-                '--json-schema', json.dumps(SCHEMA, separators=(',', ':'))]
+                '--json-schema', json.dumps(schema, separators=(',', ':'))]
         if self.config.get('model'):
             argv += ['--model', self.config['model']]
         for spec in self.specs[1:]:
@@ -627,8 +678,11 @@ class Triage:
                 args += ['--add-label', 'ux']
             elif retriage and any(name.casefold() == 'ux' for name in names):
                 args += ['--remove-label', 'ux']
-        self.log_rationale(issue, decision)
+        kimi = self.kimi_plan(number, names, decision.kimi, decision.kimiReason)
+        args += kimi['args']
+        self.log_rationale(issue, decision, kimi['line'])
         self.gh_ok(*args, what=f'labelling #{number}', error=IssueFailed)
+        self.record_kimi(number, kimi)
         try:
             self.post(['issue', 'comment', str(number), '--repo', self.product],
                       public_comment(decision.priority, decision.ux, decision.capped), what=f'commenting on #{number}')
@@ -649,10 +703,27 @@ class Triage:
         finally:
             Path(handle.name).unlink(missing_ok=True)
 
-    def log_rationale(self, issue: dict, decision: Decision) -> None:
+    def log_rationale(self, issue: dict, decision: Decision, kimi_line: str | None = None) -> None:
         if not self.specs:
             self.out(f"#{issue['number']}: no spec repo exists; the rationale stays here: {decision.rationale}")
+            if kimi_line:
+                self.out(f"#{issue['number']}: {kimi_line}")
             return
+        lines = [f"{self.product}#{issue['number']} ({issue.get('title') or ''}) -> priority:{decision.priority}"
+                 + (' + ux' if decision.ux else ''),
+                 f'source: {decision.source}']
+        if decision.specRefs:
+            lines.append('spec refs: ' + ', '.join(decision.specRefs))
+        if decision.exception != 'none':
+            lines.append('exception: ' + decision.exception)
+        lines += [f'note: {note}' for note in decision.notes]
+        if kimi_line:
+            lines.append(kimi_line)
+        lines += ['', decision.rationale, '', LOG_MARKER]
+        self.post_log(issue, lines)
+
+    def post_log(self, issue: dict, lines: list[str]) -> None:
+        """One comment on the private triage log, created in the first spec repo when absent."""
         repo = self.specs[0]['repo']
         if self.log_number is None:
             body = (f'{LOG_MARKER}\nagworkbench triage decisions for {self.product}, one comment each: the '
@@ -662,17 +733,107 @@ class Triage:
             if not match:
                 raise IssueFailed(f'creating the triage log in {repo}: no issue URL in {url!r}')
             self.log_number = int(match[1])
-        lines = [f"{self.product}#{issue['number']} ({issue.get('title') or ''}) -> priority:{decision.priority}"
-                 + (' + ux' if decision.ux else ''),
-                 f'source: {decision.source}']
-        if decision.specRefs:
-            lines.append('spec refs: ' + ', '.join(decision.specRefs))
-        if decision.exception != 'none':
-            lines.append('exception: ' + decision.exception)
-        lines += [f'note: {note}' for note in decision.notes]
-        lines += ['', decision.rationale, '', LOG_MARKER]
         self.post(['issue', 'comment', str(self.log_number), '--repo', repo], '\n'.join(lines) + '\n',
                   what=f'logging #{issue["number"]} in {repo}#{self.log_number}')
+
+    # the kimi label (#77) -------------------------------------------------------------------------------
+    def kimi_path(self) -> Path:
+        owner, name = self.product.split('/')
+        return self.state / owner / f'{name}.kimi.json'
+
+    def kimi_record(self) -> dict:
+        """{issue number: [ids of the `kimi` labeled/unlabeled events triage itself caused]}."""
+        try:
+            data = json.loads(self.kimi_path().read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            return {}
+        issues = data.get('issues') if isinstance(data, dict) else None
+        return issues if isinstance(issues, dict) else {}
+
+    def kimi_events(self, number: int) -> list[dict]:
+        """The issue's `kimi` labeled/unlabeled events, every page, oldest first."""
+        pages = self.gh_json('api', f'repos/{self.product}/issues/{number}/events?per_page=100', '--paginate', '--slurp',
+                             what=f'reading the events of #{number}', error=IssueFailed)
+        if not isinstance(pages, list):
+            raise IssueFailed(f'reading the events of #{number}: unexpected output')
+        events = [event for page in pages for event in (page if isinstance(page, list) else [page])]
+        return [event for event in events if isinstance(event, dict) and event.get('event') in ('labeled', 'unlabeled')
+                and str((event.get('label') or {}).get('name') or '').casefold() == KIMI_LABEL]
+
+    def kimi_plan(self, number: int, names: list[str], suitable: bool | None, reason: str) -> dict:
+        """What to do with the `kimi` label: {args, line, action}. A human's label - any kimi event triage
+        did not record, or a kimi label triage never set - is left alone."""
+        if suitable is None:
+            return dict(args=[], line=None, action=None)
+        present = any(name.casefold() == KIMI_LABEL for name in names)
+        ours = set(self.kimi_record().get(str(number)) or [])
+        foreign = [event for event in self.kimi_events(number) if event.get('id') not in ours]
+        if foreign or (present and not ours):
+            what = f"{foreign[-1].get('event')} by hand" if foreign else 'set by hand'
+            return dict(args=[], line=f'kimi: human override ({what}); left alone', action=None)
+        line = f"kimi: {'yes' if suitable else 'no'} - {reason}"
+        if suitable and not present:
+            return dict(args=['--add-label', KIMI_LABEL], line=line, action='labeled')
+        if not suitable and present:
+            return dict(args=['--remove-label', KIMI_LABEL], line=line, action='unlabeled')
+        return dict(args=[], line=line, action=None)
+
+    def record_kimi(self, number: int, plan: dict) -> None:
+        """After our edit: record the id of the `kimi` event it caused, read back from the issue."""
+        if not plan['action']:
+            return
+        record = self.kimi_record()
+        ours = set(record.get(str(number)) or [])
+        try:
+            events = self.kimi_events(number)
+        except IssueFailed as err:
+            self.out(f'#{number}: kimi label written, but its event could not be read back: {err}')
+            return
+        mine = [event for event in events if event.get('id') not in ours and event.get('event') == plan['action']]
+        if not mine:
+            self.out(f'#{number}: kimi label written, but no {plan["action"]} event came back')
+            return
+        record[str(number)] = sorted(ours | {mine[-1]['id']}, key=str)
+        path = self.kimi_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_name(path.name + '.tmp')
+            temporary.write_text(json.dumps({'issues': record}, indent=2), encoding='utf-8')
+            os.replace(temporary, path)
+        except OSError as err:
+            self.out(f'cannot save the kimi label record: {err}')
+
+    def judge_kimi(self, issue: dict) -> tuple[bool, str]:
+        """--kimi-only: suitability alone. The deterministic spec-reference path is never Kimi work."""
+        refs = self.referencing(issue['number'])
+        is_bug = any(name.casefold() == self.config['bugLabel'].casefold() for name in label_names(issue))
+        if refs and (is_bug or any(r['bugMirror'] for r in refs)):
+            return False, DETERMINISTIC_NOT_KIMI
+        answer = self.ask_model(issue, refs, 'P1' if refs else None, kimi_only=True)
+        return answer['kimiSuitable'], answer['kimiReason']
+
+    def apply_kimi(self, issue: dict, suitable: bool, reason: str) -> str | None:
+        """The kimi label alone: the private log line, then the label; no public comment, no priority.
+        The log line, or None when the issue closed meanwhile."""
+        number = issue['number']
+        current = self.gh_json('api', f'repos/{self.product}/issues/{number}', what=f'#{number}', error=IssueFailed)
+        if current.get('state') != 'open':
+            self.out(f'#{number}: closed meanwhile; nothing written')
+            return None
+        priority = priority_of(current.get('labels'))
+        if suitable and priority not in KIMI_PRIORITIES:
+            suitable, reason = False, f'{priority or "untriaged"} now, never Kimi work ({reason})'
+        plan = self.kimi_plan(number, label_names(current), suitable, reason)
+        if self.specs:
+            self.post_log(issue, [f"{self.product}#{number} ({issue.get('title') or ''}) -> kimi only",
+                                  plan['line'], '', LOG_MARKER])
+        else:
+            self.out(f'#{number}: no spec repo exists; the reason stays here: {plan["line"]}')
+        if plan['args']:
+            self.gh_ok('issue', 'edit', str(number), '--repo', self.product, *plan['args'],
+                       what=f'labelling #{number}', error=IssueFailed)
+            self.record_kimi(number, plan)
+        return plan['line']
 
     # the run ------------------------------------------------------------------------------------------
     def failures_path(self) -> Path:
@@ -696,11 +857,13 @@ class Triage:
         except OSError as err:
             self.out(f'cannot save the failure counts: {err}')
 
-    def select(self, issues, numbers, retriage, limit, watch, follow_ups=False):
+    def select(self, issues, numbers, retriage, limit, watch, follow_ups=False, kimi_only=False):
         if numbers:
             chosen = [i for i in issues if i['number'] in set(numbers)]
         else:
             chosen = [i for i in issues if retriage or priority_of(i.get('labels')) is None]
+        if kimi_only:
+            chosen = [i for i in chosen if priority_of(i.get('labels')) in KIMI_PRIORITIES]
         if follow_ups:
             chosen = [i for i in chosen if any(name.casefold() in FOLLOW_UP_LABELS for name in label_names(i))]
         chosen.sort(key=lambda i: (i.get('created_at') or '', i['number']))
@@ -711,8 +874,12 @@ class Triage:
         return chosen[:limit] if limit else chosen
 
     def run_once(self, numbers=None, retriage=False, limit=20, watch=False, results=None,
-                 follow_ups=False) -> int:
+                 follow_ups=False, kimi_only=False) -> int:
         """0 all decided, 1 an issue failed, 3 stopped (limit/auth), 4 facts incomplete (nothing written)."""
+        if kimi_only and not self.config.get('kimiLabel'):
+            raise ConfigError(f'--kimi-only: the triage entry for {self.product} has no "kimiLabel": true '
+                              '(only a product with a kimi label is judged for it)')
+        retriage = retriage or kimi_only
         try:
             self.gather()
             if numbers:
@@ -731,14 +898,24 @@ class Triage:
         failed = False
         # Failure counts and backoff belong to -Watch only: a manual or queue run always tries again.
         failures = self.failures() if watch else {}
-        for issue in self.select(issues, numbers, retriage, limit, watch, follow_ups):
+        for issue in self.select(issues, numbers, retriage, limit, watch, follow_ups, kimi_only):
             number = issue['number']
             try:
+                if kimi_only:
+                    suitable, reason = self.judge_kimi(issue)
+                    if self.dry_run:
+                        self.out(f"#{number}: would judge kimi: {'yes' if suitable else 'no'} - {reason}")
+                        continue
+                    line = self.apply_kimi(issue, suitable, reason)
+                    if line:
+                        self.out(f'#{number}: {line}')
+                    continue
                 decision = self.decide(issue)
                 label = f'priority:{decision.priority}' + (' + ux' if decision.ux else '')
                 if self.dry_run:
+                    kimi = '' if decision.kimi is None else f" [kimi: {'yes' if decision.kimi else 'no'} - {decision.kimiReason}]"
                     self.out(f'#{number}: would label {label} ({decision.source}): {decision.rationale}'
-                             + ''.join(f' [{note}]' for note in decision.notes))
+                             + ''.join(f' [{note}]' for note in decision.notes) + kimi)
                     continue
                 written = self.apply(issue, decision, retriage)
                 if written:
@@ -822,6 +999,8 @@ def main(argv=None) -> int:
         child.add_argument('--limit', type=int, default=20)
         if verb == 'run':
             child.add_argument('--retriage', action='store_true')
+            child.add_argument('--kimi-only', action='store_true',
+                               help='re-judge only the kimi label on open P2/P3 issues (#77); implies --retriage')
             child.add_argument('--follow-ups', action='store_true')
             child.add_argument('--dry-run', action='store_true')
             child.add_argument('--issue', type=int, action='append')
@@ -852,7 +1031,7 @@ def main(argv=None) -> int:
             return 0
         results = {}
         code = triage.run_once(args.issue, args.retriage, args.limit, results=results,
-                               follow_ups=args.follow_ups)
+                               follow_ups=args.follow_ups, kimi_only=args.kimi_only)
         if args.result_file:
             Path(args.result_file).write_text(json.dumps(results), encoding='utf-8')
         return code

@@ -51,6 +51,7 @@
   github-workbench -Triage -Repo yeroo/docxy -Watch     # and keep doing it for new ones, in its own session
   github-workbench -Retriage -Repo yeroo/docxy -DryRun  # re-judge the labelled ones too; print, write nothing
   github-workbench -Triage -Retriage -FollowUps -Repo yeroo/docxy -Limit 200
+  github-workbench -Triage -Retriage -KimiOnly -Repo yeroo/docxy   # only the kimi label, on open P2/P3 (#77)
 .EXAMPLE
   github-workbench -Cleanup -DryRun                     # list finished checkouts and their sizes; delete nothing
   github-workbench -Cleanup -Repo yeroo/docxy           # delete docxy's finished checkouts that are safe to delete
@@ -89,6 +90,7 @@ param(
     [switch] $Triage,
     [switch] $Retriage,
     [switch] $FollowUps,
+    [switch] $KimiOnly,
     [int] $Limit,
     [switch] $Cleanup,
     [switch] $BuildOnly,
@@ -284,7 +286,7 @@ if ($PSBoundParameters.ContainsKey('Queue')) {
     if ($WaitOnLimit) { $queueArgs += '--wait-on-limit' }
     if ($NoWaitOnLimit) { $queueArgs += '--no-wait-on-limit' }
     if ($Triage) { $queueArgs += '--triage' }
-    if ($Retriage -or $PSBoundParameters.ContainsKey('Limit')) {
+    if ($Retriage -or $KimiOnly -or $PSBoundParameters.ContainsKey('Limit')) {
         Write-Host '-Retriage and -Limit belong to -Triage without -Queue; a queue triages each untriaged member once.' -ForegroundColor Yellow
         exit 2
     }
@@ -302,8 +304,8 @@ if ($Triage -or $Retriage) {
     if (-not $Repo -or $Issue -or $NewSession -or $NoRelay -or $QueueMember -or $Retry -or $Implementer -or
         $PSBoundParameters.ContainsKey('Parallel') -or $AutoMerge -or $NoAutoMerge -or $Autonomous -or $NoAutonomous -or $BigReview -or $NoBigReview -or
         $WaitOnLimit -or $NoWaitOnLimit -or $Failover -or $Prune -or ($FollowUps -and $Watch) -or
-        ($PSBoundParameters.ContainsKey('Limit') -and $Limit -lt 1) -or ($Watch -and ($Retriage -or $DryRun))) {
-        Write-Host 'usage: github-workbench -Triage|-Retriage -Repo owner/name [-Limit N] [-DryRun] [-FollowUps] | -Triage -Repo owner/name -Watch' -ForegroundColor Yellow
+        ($PSBoundParameters.ContainsKey('Limit') -and $Limit -lt 1) -or ($Watch -and ($Retriage -or $DryRun -or $KimiOnly))) {
+        Write-Host 'usage: github-workbench -Triage|-Retriage -Repo owner/name [-Limit N] [-DryRun] [-FollowUps] [-KimiOnly] | -Triage -Repo owner/name -Watch' -ForegroundColor Yellow
         exit 2
     }
     $triageArgs = @((Join-Path $script:Lib 'triage.py'))
@@ -314,15 +316,16 @@ if ($Triage -or $Retriage) {
         $triageArgs += @('run', '--repo', $Repo)
         if ($Retriage) { $triageArgs += '--retriage' }
         if ($FollowUps) { $triageArgs += '--follow-ups' }
+        if ($KimiOnly) { $triageArgs += '--kimi-only' }      # #77: implies --retriage in triage.py
         if ($DryRun) { $triageArgs += '--dry-run' }
     }
     if ($PSBoundParameters.ContainsKey('Limit')) { $triageArgs += @('--limit', "$Limit") }
     & python @triageArgs
     exit $LASTEXITCODE
 }
-if ($PSBoundParameters.ContainsKey('Parallel') -or $Watch -or $Retry -or $Prune -or $FollowUps -or $PSBoundParameters.ContainsKey('Limit') -or
+if ($PSBoundParameters.ContainsKey('Parallel') -or $Watch -or $Retry -or $Prune -or $FollowUps -or $KimiOnly -or $PSBoundParameters.ContainsKey('Limit') -or
     ((-not $QueueMember) -and ($QueueAttempt -or $QueueToken))) {
-    Write-Host 'Parallel/Retry require -Queue; -Prune requires -Queue -Watch; -FollowUps requires -Triage or -Retriage; Watch/Limit also go with Triage; QueueAttempt/QueueToken require QueueMember.'
+    Write-Host 'Parallel/Retry require -Queue; -Prune requires -Queue -Watch; -FollowUps and -KimiOnly require -Triage or -Retriage; Watch/Limit also go with Triage; QueueAttempt/QueueToken require QueueMember.'
     exit 2
 }
 
@@ -331,7 +334,7 @@ if (-not $Issue) {
     Write-Host "       github-workbench -Version"
     Write-Host "       (<spec> is a list like 3,4,5, label:<name>, bugs = label:<bugLabel>, or where: <label query>)"
     Write-Host "       github-workbench -Queue <spec> [-Repo owner/name] [-Parallel 1..8] [-Watch] [-Prune] [-Retry] [-Yes] [-DryRun] [-Implementer codex|claude|kimi] [-ClearLimit codex|claude|kimi] [-AutoMerge|-NoAutoMerge] [-Autonomous|-NoAutonomous] [-BigReview|-NoBigReview] [-WaitOnLimit|-NoWaitOnLimit] [-Triage] [-RevmuxProfile <profile>] [-QueueName <name> [-Workspace <ws>]]"
-    Write-Host "       github-workbench -Triage|-Retriage -Repo owner/name [-Limit N] [-DryRun] [-FollowUps] [-Watch]"
+    Write-Host "       github-workbench -Triage|-Retriage -Repo owner/name [-Limit N] [-DryRun] [-FollowUps] [-KimiOnly] [-Watch]"
     Write-Host "       github-workbench -Cleanup [-Repo owner/name] [-DryRun] [-BuildOnly]"
     Write-Host "  <issue> is 123, owner/repo#123, or https://github.com/owner/repo/issues/123"
     exit 2

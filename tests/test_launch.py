@@ -1613,6 +1613,8 @@ class QueueEntry(LauncherFixtures):
                                    (('-Triage', '-Repo', 'o/repo', '-Watch'), f'{triage} start-watch --repo o/repo'),
                                    (('-Triage', '-Retriage', '-FollowUps', '-Repo', 'o/repo'),
                                     f'{triage} run --repo o/repo --retriage --follow-ups'),
+                                   (('-Triage', '-Retriage', '-KimiOnly', '-Repo', 'o/repo'),
+                                    f'{triage} run --repo o/repo --retriage --kimi-only'),
                                    (('-Queue', 'bugs', '-Repo', 'o/repo', '-Watch', '-Prune'), '--watch --prune'),
                                    (('-Queue', 'bugs', '-Repo', 'o/repo', '-Triage'), '--triage')):
                 with self.subTest(shell=shell, args=args):
@@ -1653,6 +1655,8 @@ class QueueEntry(LauncherFixtures):
                      ('-Queue', 'bugs', '-Repo', 'o/repo', '-FollowUps'),
                      ('-Triage', '-Repo', 'o/repo', '-Watch', '-FollowUps'),
                      ('-Triage', '-Repo', 'o/repo', '-Prune'), ('-Prune',), ('-FollowUps',),
+                     ('-KimiOnly',), ('-Triage', '-Repo', 'o/repo', '-Watch', '-KimiOnly'),
+                     ('-Queue', 'bugs', '-Repo', 'o/repo', '-KimiOnly'), ('7', '-KimiOnly'),
                      ('7', '-Limit', '3')):
             with self.subTest(args=args):
                 result, seen = self.launcher(*args)

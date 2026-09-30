@@ -58,3 +58,36 @@ Answer with ONE JSON object and nothing else:
   Classify every issue. Data loss includes corruption on save or load; crash includes hangs;
   open-save-failure means a document fails to open or save. Choose an exception only when the
   issue describes that failure, regardless of its stated severity.
+
+## Kimi suitability (only when the facts say `kimiLabel: true`)
+
+The product has a `kimi` label for issues Kimi Code, a less careful implementer, can do alone from a
+plan. Judge it by these fixed rules; the tool enforces the priority rule itself.
+
+**Suitable** only when ALL of these hold:
+- it is P2 or P3;
+- it is self-contained, in one crate or a small area;
+- its correctness can be checked against something already in the repo: existing tests, fixtures,
+  an oracle file, or sibling code to mirror;
+- it is a narrow fix or a small feature, not a new subsystem;
+- it has no data-loss risk on save or open.
+
+**Not suitable** when ANY of these holds:
+- it depends on an outside file-format spec or real sample files that are not in the repo;
+- it touches save or serialise paths, where a mistake loses data;
+- it spans several crates, or the UI and the test harness together;
+- it is an umbrella, a batch or a leftovers list;
+- it is P0 or P1.
+
+Add two fields to the object above:
+
+```json
+{"priority": "P2", "ux": false, "rationale": "...", "specRefs": [], "exception": "none",
+ "kimiSuitable": true, "kimiReason": "one crate; tests/fixtures/x.docx is the oracle"}
+```
+
+- `kimiSuitable`: `true` or `false`.
+- `kimiReason`: at most 1000 characters, naming the rule that decided it. It stays private.
+
+When the facts also say `kimiOnly: true`, the priority is not being judged: answer with ONLY
+`{"kimiSuitable": ..., "kimiReason": "..."}`.
