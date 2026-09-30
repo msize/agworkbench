@@ -855,6 +855,75 @@ def cmd_review_round(args: argparse.Namespace) -> int:
     return 0
 
 
+# --- a Kimi-grade plan (#77) ----------------------------------------------------------------------
+# When Kimi implements, the planner's plan must spell out what to edit and what not, what defines
+# correct, the tests to write first, the traps and what "done" means - or say STOP AND REPORT when
+# correctness rests on an outside spec or sample the repo does not have.
+
+KIMI_PLAN_SECTIONS = ("Exact edits", "Must not change", "Tests first", "Pitfalls", "Done means")
+STOP_LINE = "STOP AND REPORT"
+PLAN_HEADING = re.compile(r"^\s*(?:#{1,6}\s+(?P<hash>.+?)|\*\*(?P<bold>[^*]+?)\*\*[\s:.-]*)\s*$")
+PLAN_PATH = re.compile(r"(?<![\w/\\])[\w.@-]+(?:[/\\][\w.@-]+)+")
+
+
+def plan_sections(text: str) -> dict[str, list[str]]:
+    """{casefolded heading: its lines} for `#`..`######` headings and lines that are only `**bold**`."""
+    sections: dict[str, list[str]] = {}
+    current = None
+    for line in text.splitlines():
+        match = PLAN_HEADING.match(line)
+        if match:
+            title = (match["hash"] or match["bold"]).strip().strip("*:").strip()
+            title = re.sub(r"^(?:\d+[.)]\s*)", "", title)          # "1. Exact edits"
+            current = title.casefold()
+            sections.setdefault(current, [])
+        elif current is not None:
+            sections[current].append(line)
+    return sections
+
+
+def plan_problems(text: str) -> list[str]:
+    sections = plan_sections(text)
+
+    def find(name: str) -> list[str] | None:
+        key = name.casefold()
+        found = [lines for title, lines in sections.items() if title.startswith(key)]
+        return [line for lines in found for line in lines] if found else None
+
+    problems = [f"missing section: {name}" for name in KIMI_PLAN_SECTIONS if find(name) is None]
+    done = find("Done means")
+    if done is not None and not re.search(r"\bskipped\b", "\n".join(done), re.I):
+        problems.append("Done means does not ask for skipped tests by name")
+    oracle = find("Oracle")
+    stop = any(STOP_LINE in line for line in text.splitlines())
+    if not stop and not (oracle and any(PLAN_PATH.search(line) for line in oracle)):
+        problems.append(f"no Oracle section naming at least one path, and no {STOP_LINE} line")
+    return problems
+
+
+def cmd_plan_check(args: argparse.Namespace) -> int:
+    root = checkout()
+    tool = checkout_settings(root)["implementer"]
+    if tool != "kimi":
+        print(f"plan-check: not required (implementer={tool})")
+        return 0
+    path = Path(args.plan) if args.plan else root / ".workbench" / "plan.md"
+    path = path if path.is_absolute() else root / path
+    try:
+        text = path.read_text(encoding="utf-8-sig", errors="replace")
+    except OSError as err:
+        print(f"plan-check: cannot read {path}: {err}", file=sys.stderr)
+        return 2
+    problems = plan_problems(text)
+    for problem in problems:
+        print(f"plan-check: {problem}")
+    if problems:
+        print(f"plan-check: {path.name} is not a Kimi-grade plan (start-github-issue.md, Phase 2)")
+        return 1
+    print("plan-check: ok" + (f" ({STOP_LINE})" if STOP_LINE in text else ""))
+    return 0
+
+
 # --- a reviewer's usage limit in a checkout that waits limits out (#77) ------------------------------
 
 def review_limit_path(root: Path) -> Path:
@@ -2127,6 +2196,9 @@ def main() -> int:
     p.add_argument("--after", type=int, metavar="MINUTES",
                    help="with --rerun: wait this long on screen first, for the reviewer's limit to reset")
     p.set_defaults(func=cmd_revmux)
+    p = subs.add_parser("plan-check", help="with a Kimi implementer: is the plan Kimi-grade? (#77)")
+    p.add_argument("--plan", help="default .workbench/plan.md")
+    p.set_defaults(func=cmd_plan_check)
     p = subs.add_parser("settings", help="print this checkout's settings (implementer, revmux profile, auto-merge, review, failover)")
     p.set_defaults(func=cmd_settings)
     p = subs.add_parser("handover", help="facts for a HANDOVER mail to a new implementer (#24)")

@@ -65,6 +65,15 @@ Agree because the plan is right, not to be agreeable. Do not write code before a
 - Check the branch first: `git branch --show-current` must start with `issue-`. Never work on the
   default branch.
 - Follow the agreed plan. If the code forces a deviation, make the smallest one and say so.
+- **Follow the plan's Exact edits literally** (#77): change what they name, only within the scope
+  each one states, and never touch anything under Must not change. An edit that seems to need more
+  reach is a question for the planner, not a judgement call.
+- **Never invent a file format, a field id, an offset or a sample.** Correctness comes from the plan's
+  Oracle (a fixture, a reference file or sibling code in the repo). When the plan says
+  `STOP AND REPORT`, or you find that correctness depends on an outside spec or sample the repo does
+  not have, stop: reply with what is missing and implement nothing on a guess. New decoding of an
+  outside format is lenient: an unknown value keeps the old behaviour, never a new error.
+- Write the plan's Tests first, and see each one fail on the current code before you fix it.
 - **Commit your own work** on the issue branch: small, focused commits whose messages say why. The
   planner will not commit for you, since you share one index, so leave nothing uncommitted when you
   report. Tests are part of the change: each acceptance criterion gets a test that fails without it.
@@ -76,7 +85,9 @@ Agree because the plan is right, not to be agreeable. Do not write code before a
 - **Never push.** The planner pushes after review.
 
 Then reply (kind `answer`, subject `IMPLEMENTED <short sha>`): what you changed, the commits, the
-commands you ran and their results, and anything in the plan you did not do and why.
+commands you ran and their results (test names and counts), **every skipped test by name** with why
+it skipped, and anything in the plan you did not do and why. A reader or writer fix whose real-file
+tests skipped (no corpus) is not done: say so plainly rather than report it green.
 
 ## Phase 3 - review findings
 

@@ -2395,6 +2395,144 @@ class AutonomyProse(unittest.TestCase):
         self.assertIn('loop-state done --pr <P> --sha <sha>` as the very last step', text.split('## Phase 7')[1])
 
 
+KIMI_PLAN = """# Plan v1 for #616
+
+## Goal
+Keep sheet edits on save.
+
+## Exact edits
+- `crates/xlsx/src/save.rs` `save_sheets`: guard only the `splice_worksheet` call, not the rest of the loop.
+
+## Must not change
+- the per-sheet loop's other steps; `crates/xlsx/src/read.rs`.
+
+## Oracle
+- `tests/fixtures/macro-sheet.xlsm` and `crates/xlsx/tests/roundtrip.rs` (sibling code to mirror).
+
+## Tests first
+- `macro_sheet_edit_survives_save` fails today (a side effect: the edit is lost on save).
+
+## Pitfalls
+- the save path is shared with the chart writer.
+
+## Done means
+- `cargo fmt`, `cargo clippy -p xlsx -- -D warnings`, `cargo test -p xlsx`; IMPLEMENTED <sha> with test
+  names, counts, and every skipped test by name.
+"""
+
+
+class PlanCheck(unittest.TestCase):
+    """#77: with a Kimi implementer the plan must be Kimi-grade: `wb.py plan-check` says what is missing."""
+
+    def setUp(self):
+        self.folder = Path(__file__).resolve().parent.parent / ('test wb plan ' + uuid.uuid4().hex)
+        (self.folder / '.workbench/state').mkdir(parents=True)
+        self.addCleanup(shutil.rmtree, self.folder)
+        self.enterContext(patch.dict(os.environ, {'AI_HUB': str(self.folder / '.workbench')}))
+        (self.folder / '.workbench/state/implementer.json').write_text('{"tool": "kimi"}', encoding='utf-8')
+
+    def check(self, plan, *extra):
+        (self.folder / '.workbench/plan.md').write_text(plan, encoding='utf-8')
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), patch.object(sys, 'argv', ['wb.py', 'plan-check', *extra]):
+            code = wb.main()
+        return code, out.getvalue()
+
+    def test_a_kimi_grade_plan_passes(self):
+        self.assertEqual((0, 'plan-check: ok\n'), self.check(KIMI_PLAN))
+
+    def test_each_missing_section_is_named(self):
+        for name in ('Exact edits', 'Must not change', 'Tests first', 'Pitfalls', 'Done means'):
+            with self.subTest(section=name):
+                code, out = self.check(KIMI_PLAN.replace(f'## {name}', '## Notes'))
+                self.assertEqual(1, code)
+                self.assertIn(f'plan-check: missing section: {name}', out)
+        code, out = self.check('# Plan\n\n## Goal\nx\n')
+        self.assertEqual(1, code)
+        self.assertEqual(7, out.count('plan-check: '), out)     # five sections, the oracle, and the verdict
+
+    def test_a_plan_without_an_oracle_path_and_without_stop_is_rejected(self):
+        for plan in (KIMI_PLAN.replace('## Oracle', '## Background'),
+                     KIMI_PLAN.replace("- `tests/fixtures/macro-sheet.xlsm` and `crates/xlsx/tests/roundtrip.rs` "
+                                       "(sibling code to mirror).", '- the usual files')):
+            with self.subTest(plan=plan[:0]):
+                code, out = self.check(plan)
+                self.assertEqual(1, code)
+                self.assertIn('no Oracle section naming at least one path, and no STOP AND REPORT line', out)
+
+    def test_stop_and_report_stands_in_for_the_oracle(self):
+        plan = KIMI_PLAN.replace('## Oracle', '## Background') + '\nSTOP AND REPORT: the MPX layout is not in the repo.\n'
+        self.assertEqual((0, 'plan-check: ok (STOP AND REPORT)\n'), self.check(plan))
+
+    def test_bold_and_numbered_headings_count(self):
+        plan = KIMI_PLAN.replace('## Exact edits', '**Exact edits**').replace('## Pitfalls', '### 4. Pitfalls:')
+        self.assertEqual(0, self.check(plan)[0])
+
+    def test_done_means_must_ask_for_skipped_tests(self):
+        code, out = self.check(KIMI_PLAN.replace(', and every skipped test by name', ''))
+        self.assertEqual(1, code)
+        self.assertIn('Done means does not ask for skipped tests by name', out)
+
+    def test_not_required_for_other_implementers_and_another_path(self):
+        (self.folder / '.workbench/state/implementer.json').write_text('{"tool": "codex"}', encoding='utf-8')
+        self.assertEqual((0, 'plan-check: not required (implementer=codex)\n'), self.check('# nothing'))
+        (self.folder / '.workbench/state/implementer.json').write_text('{"tool": "kimi"}', encoding='utf-8')
+        (self.folder / 'other.md').write_text(KIMI_PLAN, encoding='utf-8')
+        self.assertEqual(0, self.check('# nothing', '--plan', 'other.md')[0])
+
+
+class KimiPlanProse(unittest.TestCase):
+    """#77: the planner's prompt requires the Kimi-grade sections and plan-check; Kimi's role follows them."""
+
+    def text(self, path):
+        return ' '.join((Path(__file__).resolve().parent.parent / path).read_text(encoding='utf-8').split())
+
+    def test_the_planner_requires_the_sections_the_rules_and_plan_check(self):
+        text = self.text('claude/commands/start-github-issue.md')
+        phase2 = text.split('## Phase 2')[1].split('## Phase 3')[0]
+        kimi = phase2.split('### When the implementer is Kimi')[1]
+        for needle in ['**Exact edits**', 'scope of the edit', '**Must not change**', '**Oracle**', '**by path**',
+                       '`STOP AND REPORT`', 'never invent a format or a sample', '**Tests first**',
+                       'must fail on the current code', '**side effect**', '**Pitfalls**', '**Done means**',
+                       '**every skipped test by name**', 'runs the real-file oracle (the corpus) when one exists',
+                       'is lenient: an unknown value falls back to the old behaviour, never to a new hard error',
+                       'cites its source in the repo', 'wb.py" plan-check', 'never implemented as a guess']:
+            self.assertIn(needle, kimi)
+        self.assertLess(kimi.index('plan-check'), kimi.index('Send it as `plan v1`'))
+        phase4 = text.split('## Phase 4')[1].split('## Phase 5')[0]
+        for needle in ["compare the diff with the plan's Exact edits and Must not change",
+                       "Judge the code, not Kimi's report", "Never merge on Kimi's own report"]:
+            self.assertIn(needle, phase4)
+        self.assertLess(phase4.index('Exact edits and Must not change'), phase4.index('Launch revmux'))
+
+    def test_the_planner_knows_the_limit_decision_and_the_wait_mode(self):
+        text = self.text('claude/commands/start-github-issue.md')
+        phase4 = text.split('## Phase 4')[1].split('## Phase 5')[0]
+        for needle in ['| `limit` |', 'never counts toward the cap', 'revmux --round <K> --rerun --after <minutes>',
+                       '--rerun --profile claude-only', 'run `review-round --round <K>` again']:
+            self.assertIn(needle, phase4)
+        limits = text.split('## Usage limits')[1].split('## Stall pointers')[0]
+        for needle in ['`onLimit=wait`', '**Never fail over and never report blocked**', 'end your turn',
+                       '`... waiting, cannot probe`', 'A Codex `warning` chooser is not waited out']:
+            self.assertIn(needle, limits)
+
+    def test_kimi_follows_the_plan_literally_and_reports_skipped_tests(self):
+        text = self.text('kimi/AGENTS.md')
+        for needle in ["**Follow the plan's Exact edits literally**", 'never touch anything under Must not change',
+                       '**Never invent a file format, a field id, an offset or a sample.**', '`STOP AND REPORT`',
+                       'implement nothing on a guess', '**every skipped test by name**']:
+            self.assertIn(needle, text)
+
+    def test_the_readme_describes_the_slow_queue(self):
+        text = self.text('README.md')
+        section = text.split('### A slow queue that waits out usage limits')[1].split('### ')[0]
+        for needle in ["github-workbench -Queue 'where: kimi AND priority IN [P2, P3]' -Repo yeroo/docxy -QueueName kimi "
+                       "-Workspace docxy-kimi -Implementer kimi -WaitOnLimit -Autonomous -Watch",
+                       '`limitRetryMinutes`', '`"reviewOnLimit": "fallback"`', '`waiting-limit (active)`',
+                       '`kimi` label', 'wb.py plan-check']:
+            self.assertIn(needle, section)
+
+
 class ReviewRoundProse(unittest.TestCase):
     """#64: the planner records each round's decision and stops at a round with no Major; the
     implementers know a final fix round has no revmux round after it."""
