@@ -116,15 +116,20 @@ class HelperScripts(unittest.TestCase):
         self.assertEqual(('revmux', 2, mid, 'claude'), (marker['kind'], marker['round'], marker['mail'], marker['to']))
         self.assertIn(f'posted {mid}.md -> claude', done.stdout)            # still echoed to the pane
 
-    def test_the_marker_names_the_fallback_mail(self):
+    def test_a_failed_rounds_marker_names_no_mail(self):
+        # #84 r1: the fallback note is not a result - it sends the planner to this session - so the
+        # marker names no mail and the relay keeps the session open.
         (self.bin / 'revmux.cmd').write_text('@echo revmux is broken\r\n@exit /b 3\r\n', encoding='utf-8')
         scope = self.checkout / 'scope.md'
         scope.write_text('scope', encoding='utf-8')
         done = self.run_script('run-revmux.ps1', '-ScopeFile', str(scope), '-Round', '2', pane='p-fail')
         self.assertNotEqual(0, done.returncode)
         [mid] = self.mail_ids()
-        self.assertEqual((mid, 'claude'), (self.marker('p-fail')['mail'], self.marker('p-fail')['to']))
-        self.assertIn(f'posted {mid}.md -> claude', done.stdout)
+        marker = self.marker('p-fail')
+        self.assertEqual(('revmux', 2), (marker['kind'], marker['round']))
+        self.assertNotIn('mail', marker)
+        self.assertNotIn('to', marker)
+        self.assertIn(f'posted {mid}.md -> claude', done.stdout)            # the note is still echoed
 
     def test_a_review_that_fails_mails_the_planner(self):
         (self.bin / 'revdiff.ps1').write_text("throw 'revdiff crashed'\n", encoding='utf-8')

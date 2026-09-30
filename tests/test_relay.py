@@ -3294,6 +3294,29 @@ class HelperSweep(unittest.TestCase):
         self.config({'closeHelpers': 'yes'})
         self.sweep(0, 30, 4000)
         self.assertEqual([], self.closes())
+        self.assertEqual(['helper close off (closeHelpers: "yes")'], self.logs)
+
+    def test_an_unreadable_config_closes_nothing(self):
+        # #84 r1 m1: fail closed - a config with // comments (PowerShell reads it, json does not),
+        # half-written, or not an object may hold `closeHelpers: false`.
+        for text in ('{\n  // mine\n  "closeHelpers": false\n}', '{"closeHelpers": fal', '[]'):
+            with self.subTest(text=text):
+                (self.folder / 'config.json').write_text(text, encoding='utf-8')
+                self.logs.clear()
+                self.r.sweep_note = None
+                self.sweep(0, 30)
+                self.assertEqual([], self.closes())
+                self.assertEqual(1, len(self.logs), self.logs)
+                self.assertTrue(self.logs[0].startswith('helper close off (config '), self.logs)
+
+    def test_a_missing_config_or_a_null_value_is_the_default_on(self):
+        # #84 r1 i1: the launcher skips a null value, so null means the default here too.
+        self.config({'closeHelpers': None})
+        self.sweep(0)
+        self.assertEqual([self.SUITE, self.REVMUX], self.closes())
+        self.assertEqual((True, ''), relay.close_helpers_setting())
+        (self.folder / 'config.json').unlink()
+        self.assertEqual((True, ''), relay.close_helpers_setting())
 
     def test_a_marker_that_names_no_mail_is_kept(self):
         self.marker(self.SUITE, 'suite', self.SUITE_ROWS)                                  # before #84, or post failed

@@ -298,7 +298,7 @@ class Closer:
         keeps it: without that proof nobody is known to have seen the result."""
         mail, box = marker.get('mail'), marker.get('to')
         if not isinstance(mail, str) or not MAIL_ID_RE.fullmatch(mail):
-            return 'its marker names no result mail (a helper from before #84, or its post failed)'
+            return 'its marker names no result mail (a helper from before #84, a failed round, or its post failed)'
         import hub
         if not isinstance(box, str) or not hub.BOX_RE.match(box):
             return f'its marker names no valid mailbox for its result mail {mail}'

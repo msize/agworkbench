@@ -12,7 +12,8 @@ A helper that is killed writes none, and stays open.
 
 It also names the mail that carries the helper's result (#84): `mail` (the message id) and `to` (the
 box it went to). The relay closes a finished helper early only once that mail has been read, so a
-marker without them - a helper from before #84, or one whose post failed - keeps its session open.
+marker without them - a helper from before #84, a revmux round that failed (its note sends the planner
+to the session), or one whose post failed - keeps its session open.
 """
 
 from __future__ import annotations

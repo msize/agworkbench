@@ -329,15 +329,23 @@ def stall_setting() -> float:
     return float(value)
 
 
-def close_helpers_setting() -> bool:
-    """`closeHelpers` from ~/.agworkbench.json (#84): on by default. The launcher refuses an invalid
-    value; one that slips through here turns closing off - a flag we cannot read closes nothing."""
+def close_helpers_setting() -> tuple[bool, str]:
+    """(`closeHelpers` from ~/.agworkbench.json, why it is off) (#84). On when the file or the key is
+    missing, or the key is null (the launcher skips null too). Fails closed: a config it cannot read or
+    parse (locked, half-written, `//` comments), or a value that is not true or false, closes nothing."""
     path = Path(os.environ.get("AGWORKBENCH_CONFIG") or (Path.home() / ".agworkbench.json"))
     try:
         config = json.loads(path.read_text(encoding="utf-8-sig"))
-    except (OSError, ValueError):
-        return True
-    return (config.get("closeHelpers", True) if isinstance(config, dict) else True) is True
+    except FileNotFoundError:
+        return True, ''
+    except (OSError, ValueError) as err:
+        return False, f'config {path} unreadable: {err}'
+    if not isinstance(config, dict):
+        return False, f'config {path} is not a JSON object'
+    value = config.get("closeHelpers")
+    if value is None or value is True:
+        return True, ''
+    return False, f'closeHelpers: {json.dumps(value)}'
 
 
 def limit_retry_setting() -> float:
@@ -1078,8 +1086,9 @@ class Relay:
     def sweep_helpers(self) -> None:
         """One look for finished helpers to close (closer.step_finished_helpers). Never raises for a
         setting, a queue membership or a terminal it cannot read: it says so once and tries again."""
-        if not close_helpers_setting():
-            self.sweep_note_once('helper close off (closeHelpers: false)')
+        enabled, why = close_helpers_setting()
+        if not enabled:
+            self.sweep_note_once(f'helper close off ({why})')
             return
         if self.sweeper is None:
             try:

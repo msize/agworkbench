@@ -38,7 +38,7 @@ New-Item -ItemType Directory -Force -Path $reviewDir | Out-Null
 $report = Join-Path $reviewDir "revmux-r$Round.md"
 
 function Get-PostedId($lines) {
-    # post.py prints `posted <id>.md -> <box>`; the id names the result mail in the marker (#84).
+    # post.py prints `posted <id>.md -> <box>`; the report's id names the result mail in the marker (#84).
     foreach ($line in @($lines)) { if ("$line" -match '^posted (\S+)\.md -> ') { return $Matches[1] } }
     return $null
 }
@@ -92,15 +92,17 @@ if ($postExit -eq 0) {
         $out = & python (Join-Path $script:Lib 'post.py') --hub $hubDir --to claude --sender helper --kind note `
             --subject "revmux round ${Round}: ended without a report ($why)" `
             --text "run-revmux.ps1 for round $Round ended without posting its report ($why). Look at the '#N revmux r$Round' session and $report."
+        # Not a result (#84 r1): the note sends Claude to this session, so its marker names no mail
+        # and the relay leaves the session open.
         $out | Out-Host
-        $mail = Get-PostedId $out
     }
     # The last act (#33): mark this helper done, with what its pane shows now, so an autonomous close
     # can prove nobody touched the pane since. A killed script writes no marker and stays open.
     $doneArgs = @((Join-Path $script:Lib 'helper_done.py'), '--hub', $hubDir, '--kind', 'revmux', '--round', "$Round")
     if ($null -ne $code) { $doneArgs += @('--exit', "$code") }
     # The mail that carries the result (#84): the relay closes this session once Claude has read it.
-    if ($mail) { $doneArgs += @('--mail', $mail, '--to', 'claude') }
+    # Only a posted report is a result; a failed round keeps its session, the only record of the error.
+    if ($posted -and $mail) { $doneArgs += @('--mail', $mail, '--to', 'claude') }
     & python @doneArgs
 }
 if (-not $posted) { exit 1 }
