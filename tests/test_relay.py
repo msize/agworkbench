@@ -3137,8 +3137,9 @@ class AutonomousClose(unittest.TestCase):
 
 
 class HelperSweep(unittest.TestCase):
-    """#84: on every loop the relay closes a finished revmux or suite helper once its result mail has
-    been read and the grace has passed - never the human's revdiff, never another workspace's."""
+    """#84: on every loop the relay closes a finished revmux or suite helper on the first look after its
+    result mail has been read, whatever its pane shows - never the human's revdiff, never another
+    workspace's."""
     PLANNER = '11111111-1111-4111-8111-111111111111'
     IMPLEMENTER = '22222222-2222-4222-8222-222222222222'
     SUITE, REVMUX, REVIEW, OTHER = 's1', 'a1', 'a2', 'a3'
@@ -3219,36 +3220,38 @@ class HelperSweep(unittest.TestCase):
         path = self.state / 'relay-close.log'
         return path.read_text(encoding='utf-8') if path.exists() else ''
 
-    def test_a_finished_helper_with_its_mail_read_closes_after_the_grace(self):
-        self.sweep(0, closer.CLOSE_SETTLE)                  # settled: eligible from here
-        start = closer.CLOSE_SETTLE
-        self.sweep(start + 60, start + relay.HELPER_CLOSE_SECONDS - 1)
-        self.assertEqual([], self.closes())
-        self.sweep(start + relay.HELPER_CLOSE_SECONDS)
+    def test_mail_read_closes_on_the_next_sweep(self):
+        self.sweep(0)                                       # no grace, no settle wait
         self.assertEqual([self.SUITE, self.REVMUX], self.closes())
         self.assertIn(('unpin', self.SUITE), self.actions)
         self.assertFalse((self.state / 'helpers' / f'{self.SUITE}.done').exists())
         self.assertFalse((self.state / 'helpers' / f'{self.REVMUX}.done').exists())
         self.assertTrue((self.hub_dir / 'review' / 'suite-abc1234.log').exists())       # logs survive
-        self.assertIn('closing finished helper #7 suite abc1234 (s1): done, result mail m-suite read', self.close_log())
-        self.assertIn('close: closing finished helper #7 revmux r1 (a1): done, result mail m-revmux read', self.logs)
-        # The grace is logged once, not on every look.
-        self.assertEqual(1, self.close_log().count('#7 suite abc1234 (s1) stays open: finished; closing after 120s grace'))
+        self.assertIn('closing finished helper #7 suite abc1234 (s1): result mail m-suite read', self.close_log())
+        self.assertIn('close: closing finished helper #7 revmux r1 (a1): result mail m-revmux read', self.logs)
 
-    def test_the_grace_comes_from_the_config(self):
-        self.config({'helperCloseSeconds': 0})
-        self.sweep(0, closer.CLOSE_SETTLE)
+    def test_busy_or_changed_pane_still_closes_once_mail_is_read(self):
+        # The owner's rule: once the result is read the session goes, whatever the pane shows.
+        self.tree['workspaces'][0]['sessions'][1]['foregroundShell'] = 'pwsh'
+        self.text[self.SUITE] += '\nPS C:\\repo> still printing'
+        with patch.object(agw, 'pane_text', side_effect=AssertionError('the pane is not read')):
+            self.sweep(0)
         self.assertEqual([self.SUITE, self.REVMUX], self.closes())
+
+    def test_a_split_helper_session_is_kept(self):
+        self.tree['workspaces'][0]['sessions'][1]['paneIds'] = [self.SUITE, 'human-pane']
+        self.sweep(0, 4000)
+        self.assertNotIn(self.SUITE, self.closes())
+        self.assertIn('#7 suite abc1234 (s1) stays open: not a single-pane helper', self.close_log())
 
     def test_an_unread_result_mail_keeps_the_helper_until_it_is_read(self):
         self.mail('claude', 'm-suite')
         self.sweep(0, 30, 200, 400)
         self.assertNotIn(self.SUITE, self.closes())
         self.assertIn('#7 suite abc1234 (s1) stays open: its result mail m-suite is unread in claude', self.close_log())
+        self.assertEqual(1, self.close_log().count('its result mail m-suite is unread'))    # said once
         self.mail('claude', 'm-suite', 'archive')           # archived counts as read
         self.sweep(430)
-        self.assertNotIn(self.SUITE, self.closes())         # the grace starts now
-        self.sweep(430 + relay.HELPER_CLOSE_SECONDS)
         self.assertIn(self.SUITE, self.closes())
 
     def test_an_implementer_suite_is_judged_in_the_implementers_box(self):
@@ -3259,7 +3262,7 @@ class HelperSweep(unittest.TestCase):
         self.assertNotIn(self.SUITE, self.closes())
         self.assertIn('its result mail m-codex is unread in codex', self.close_log())
         self.mail('codex', 'm-codex', 'read')
-        self.sweep(230, 230 + relay.HELPER_CLOSE_SECONDS)
+        self.sweep(230)
         self.assertIn(self.SUITE, self.closes())
 
     def test_a_running_helper_without_a_marker_is_never_closed(self):
@@ -3311,12 +3314,6 @@ class HelperSweep(unittest.TestCase):
         self.assertNotIn(self.OTHER, [target for _, target in self.actions])
         self.assertTrue((self.state / 'helpers' / f'{self.OTHER}.done').exists())
 
-    def test_a_touched_pane_is_kept(self):
-        self.text[self.SUITE] += '\nPS C:\\repo> '
-        self.sweep(0, 30, 4000)
-        self.assertNotIn(self.SUITE, self.closes())
-        self.assertIn('#7 suite abc1234 (s1) stays open: the pane shows something other', self.close_log())
-
     def test_an_unreadable_queue_membership_is_logged_once_and_retried(self):
         membership = self.state / 'queue-member.json'
         membership.write_text('{', encoding='utf-8')
@@ -3324,7 +3321,7 @@ class HelperSweep(unittest.TestCase):
         self.assertEqual([], self.closes())
         self.assertEqual(1, sum('helper close skipped: unreadable queue membership' in line for line in self.logs))
         membership.unlink()
-        self.sweep(60, 90, 90 + relay.HELPER_CLOSE_SECONDS)
+        self.sweep(60)
         self.assertEqual([self.SUITE, self.REVMUX], self.closes())
 
     def test_dry_run_closes_nothing_and_says_so_once(self):

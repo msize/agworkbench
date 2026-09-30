@@ -24,11 +24,13 @@ delivering mail, and the conductor can advance one check per tick without blocki
   no .git/index.lock exists, and both agent panes
   are idle with a provably empty composer and unchanged for CLOSE_SETTLE seconds.
 - Finished helpers close early, on every loop (#84): the relay runs `step_finished_helpers` on its own
-  timer, outside the autonomous close and whatever `autonomous` says. It adds one condition to the
-  evidence above - the result mail the marker names (`mail`, in box `to`) has been read - and waits
-  `grace` seconds from the first look at which everything held. The human's revdiff (`your review`)
-  never closes this way. While the autonomous close runs, the relay is inside it and this step does
-  not run: `step_helpers` covers that window.
+  timer, outside the autonomous close and whatever `autonomous` says. Its trigger is the result mail:
+  a revmux or suite helper closes on the first look after the mail its completion marker names
+  (`mail`, in box `to`) has been read. The marker must exist, since it names the mail, but the pane
+  is not read: the owner's rule is that once the result is read the session goes, whatever it
+  shows - its report or log is already saved. The human's revdiff (`your review`) never closes
+  this way. While the autonomous close runs, the relay is inside it and this step does not run:
+  `step_helpers` covers that window.
 - Mail the implementer never has to act on does not count as unread (#44): the relay's own final
   notices for this PR (`github-pr<N>-...`), and anything created at or after the merge or no-PR done
   time (`close_merged_at` in relay.json). Other unread implementer mail is a soft blocker: it waits for
@@ -125,7 +127,6 @@ class Closer:
         self.dry_run = dry_run
         self.settled: dict[str, tuple[str, float]] = {}
         self.decided: dict[str, str] = {}       # helper session id -> last logged decision
-        self.eligible_since: dict[str, float] = {}  # finished helper session id -> first look it could close (#84)
         self.hard: list[str] = []               # the last agent_blockers(): what a timeout never overrides
         self.soft: list[str] = []               # ... and the unread implementer mail ids it does (#44)
         self.deadline = clock() + CLOSE_WAIT
@@ -308,27 +309,27 @@ class Closer:
             return None
         return f'its result mail {mail} is not in the {box} mailbox'
 
-    def step_finished_helpers(self, grace: float) -> list[str]:
-        """One look at every helper (#84): closes a revmux or suite helper that is proven done and
-        untouched, whose result mail has been read, once `grace` seconds have passed since the first
-        look at which all of that held. Never the human's revdiff. Returns the names it closed."""
+    def step_finished_helpers(self) -> list[str]:
+        """One look at every helper (#84): closes a revmux or suite helper whose completion marker
+        exists and names a result mail that has been read. Whatever its pane shows - no settle, no
+        rows compared. Never the human's revdiff, never a split session. Returns the names it closed."""
         closed = []
-        live = set()
         for session in self.helper_sessions(agw.tree()):
             session_id = session.get('id')
-            live.add(session_id)
             name = session.get('name') or ''
             label = f"{name} ({session_id})"
             panes = agw.panes_of(session)
-            reason = None
+            reason, marker = None, None
             if name.endswith(' your review'):
                 reason = "the human's revdiff closes only with the human or the loop's end"
-            if reason is None:
-                reason = self.helper_reason(panes, session)
-            marker = None
-            if reason is None:
+            elif len(panes) != 1:
+                # Identity, not idleness: a pane someone split beside the helper must not go with it.
+                reason = 'not a single-pane helper'
+            else:
                 try:
                     marker = json.loads(self.marker_path(panes[0]).read_text(encoding='utf-8-sig'))
+                except FileNotFoundError:
+                    reason = 'no completion marker (still running, or ended without one)'
                 except (OSError, ValueError):
                     reason = 'unreadable completion marker'
             if reason is None:
@@ -337,22 +338,14 @@ class Closer:
                 else:
                     reason = self.result_mail_unread(marker)
             if reason:
-                self.eligible_since.pop(session_id, None)
                 self._decide(session_id, f"helper {label} stays open: {reason}")
-                continue
-            since = self.eligible_since.setdefault(session_id, self.clock())
-            if self.clock() - since < grace:
-                self._decide(session_id, f"helper {label} stays open: finished; closing after {grace:g}s grace")
                 continue
             if self.dry_run:
                 self._decide(session_id, f"[dry-run] would close finished helper {label}")
                 continue
-            self._close_helper(session, panes, f"closing finished helper {label}: done, result mail {marker['mail']} read")
-            self.eligible_since.pop(session_id, None)
+            self._close_helper(session, panes, f"closing finished helper {label}: result mail {marker['mail']} read")
             self.decided.pop(session_id, None)
             closed.append(name)
-        for session_id in set(self.eligible_since) - live:
-            del self.eligible_since[session_id]
         return closed
 
     def helper_reason(self, panes: list[str], session: dict) -> str | None:

@@ -648,10 +648,10 @@ How the close proves each thing (#33):
   exactly the marker's rows, and it has been unchanged for 30 s. Helpers close first, even while the
   agents are still busy. A helper session opened the old way, inside a shell, is left for you.
 - **Finished helpers, before the merge (#84):** on every loop, autonomous or not, the relay also
-  closes a `#N revmux r<K>` or `#N suite <label>` session as soon as it is finished: the same
-  evidence as above, plus the result mail its marker names (the revmux report, or the suite's
-  result) has been read in the box it went to, and `helperCloseSeconds` (default 120) have passed
-  since all of that first held. A helper whose result is still unread stays, and so does your
+  closes a `#N revmux r<K>` or `#N suite <label>` session as soon as its result has been read: its
+  completion marker exists and the result mail it names (the revmux report, or the suite's result)
+  has been read in the box it went to. The pane is not checked - once the result is read the
+  session goes, whatever it shows. A helper whose result is still unread stays, and so does your
   revdiff (`#N your review`). The report and log files in `.workbench/review/` stay; each close is
   logged in `.workbench/state/relay-close.log` and in the relay's pane. `closeHelpers: false` keeps
   every helper open until the loop's close, as before.
@@ -937,7 +937,6 @@ the result mail's id and box, so the relay can close it once that mail has been 
 | `stallMinutes` | `15` | minutes a loop may sit idle with nothing to wake it before the relay mails the planner a stall pointer (see Stalls); `0` turns the watch off |
 | `limitRetryMinutes` | `30` | with `-WaitOnLimit`: minutes between the relay's probes of an agent waiting out its usage limit, and the wait before rerunning a review round a reviewer's limit stopped (more than 0; see A slow queue that waits out usage limits) |
 | `closeHelpers` | `true` | the relay closes a finished revmux or suite helper session once its result mail has been read (see Finished helpers, before the merge); `false` keeps them until the loop's close |
-| `helperCloseSeconds` | `120` | seconds a finished helper with its result read stays before the relay closes it (0 or more) |
 | `reviewOnLimit` | `"wait"` | with `-WaitOnLimit`, a review round a reviewer's usage limit degraded: `wait` reruns it after `limitRetryMinutes`, `fallback` reruns it at once with `claude-only` |
 | `autoMerge` | `false` | new checkouts let the planner merge its own PR when every auto-merge condition holds; `-AutoMerge` / `-NoAutoMerge` change it per checkout or queue |
 

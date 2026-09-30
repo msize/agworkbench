@@ -57,11 +57,10 @@ Six jobs, one loop, one process per issue, running in its own visible agwinterm 
    never types anything but the mail pointer, and never answers a prompt.
 
 6. **Finished helpers (#84).** Every `--limit-interval` seconds, on every loop (autonomous or not,
-   watching or draining), it closes each `#N revmux rK` and `#N suite <label>` session that is proven
-   done and untouched - the autonomous close's evidence - once the result mail its completion marker
-   names has been read, and `helperCloseSeconds` (config, default 120) have passed since all of that
-   first held. The human's revdiff (`#N your review`) stays. Reports and logs in `.workbench/review/`
-   stay; each close is logged in `.workbench/state/relay-close.log`. `closeHelpers: false` turns it off.
+   watching or draining), it closes each `#N revmux rK` and `#N suite <label>` session whose
+   completion marker names a result mail that has been read - whatever its pane shows. The human's
+   revdiff (`#N your review`) stays. Reports and logs in `.workbench/review/` stay; each close is
+   logged in `.workbench/state/relay-close.log`. `closeHelpers: false` turns it off.
 
 Nothing here polls on behalf of an agent: agents are woken by the relay and otherwise idle. The
 relay itself polls the mailbox directory, the GitHub API, the two agent panes (for limits and
@@ -107,7 +106,6 @@ ALERT_EVERY = 300.0
 TERMINAL_DRAIN_TIMEOUT = 30 * 60.0
 LIMIT_READS = 2          # consecutive reads that start (or end) a usage-limit episode
 STALL_MINUTES = 15.0     # the default stall period (#45); `stallMinutes` in ~/.agworkbench.json, 0 = off
-HELPER_CLOSE_SECONDS = 120.0   # a finished helper's grace before it closes (#84); `helperCloseSeconds`
 LIMIT_RETRY_MINUTES = 30.0   # between probes of an agent waiting out its limit (#77); `limitRetryMinutes`
 PROBE_TEXT = ("the usage limit may have reset; continue where you left off "
               "(git status, .workbench, unread mail)")
@@ -331,22 +329,15 @@ def stall_setting() -> float:
     return float(value)
 
 
-def close_helpers_setting() -> tuple[bool, float]:
-    """(`closeHelpers`, `helperCloseSeconds`) from ~/.agworkbench.json (#84): on by default, grace
-    HELPER_CLOSE_SECONDS. The launcher refuses an invalid value; one that slips through here turns
-    closing off (a flag we cannot read never closes anything) or reads as the default grace."""
+def close_helpers_setting() -> bool:
+    """`closeHelpers` from ~/.agworkbench.json (#84): on by default. The launcher refuses an invalid
+    value; one that slips through here turns closing off - a flag we cannot read closes nothing."""
     path = Path(os.environ.get("AGWORKBENCH_CONFIG") or (Path.home() / ".agworkbench.json"))
     try:
         config = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
-        config = {}
-    if not isinstance(config, dict):
-        config = {}
-    enabled = config.get("closeHelpers", True)
-    grace = config.get("helperCloseSeconds", HELPER_CLOSE_SECONDS)
-    if isinstance(grace, bool) or not isinstance(grace, (int, float)) or grace < 0:
-        grace = HELPER_CLOSE_SECONDS
-    return enabled is True, float(grace)
+        return True
+    return (config.get("closeHelpers", True) if isinstance(config, dict) else True) is True
 
 
 def limit_retry_setting() -> float:
@@ -728,7 +719,7 @@ class Relay:
         self.limit_baseline: dict[str, set[str]] = {}
         # True once the PR is finished: limit checks stop, so no limit may hold the final notices.
         self.draining = False
-        # The finished-helper sweep (#84): built on its first use, kept so its evidence persists.
+        # The finished-helper sweep (#84): built on its first use, kept so it logs each decision once.
         self.sweeper: closer.Closer | None = None
         self.sweep_note: str | None = None
         self.dry_run = dry_run
@@ -1087,8 +1078,7 @@ class Relay:
     def sweep_helpers(self) -> None:
         """One look for finished helpers to close (closer.step_finished_helpers). Never raises for a
         setting, a queue membership or a terminal it cannot read: it says so once and tries again."""
-        enabled, grace = close_helpers_setting()
-        if not enabled:
+        if not close_helpers_setting():
             self.sweep_note_once('helper close off (closeHelpers: false)')
             return
         if self.sweeper is None:
@@ -1099,7 +1089,7 @@ class Relay:
                 return
         import agw
         try:
-            self.sweeper.step_finished_helpers(grace)
+            self.sweeper.step_finished_helpers()
         except (agw.CtlError, OSError) as err:
             self.sweep_note_once(f'helper close skipped: terminal unreadable ({err})')
             return
