@@ -3198,7 +3198,7 @@ class Timestamps(unittest.TestCase):
         panes = [str(uuid.uuid4()), str(uuid.uuid4())]
         with patch.object(relay, "Relay", Relay), patch.object(relay, "stall_setting", return_value=None), \
                 patch.object(relay.tslog, "install", wraps=relay.tslog.install) as install, \
-                contextlib.redirect_stdout(out):
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):     # neither may leak
             self.assertEqual(0, relay.main(["--hub", "h", "--claude-pane", panes[0], "--codex-pane", panes[1],
                                             "--repo", "o/r", "--branch", "issue-8-x"]))
         install.assert_called_once()

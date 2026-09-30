@@ -1411,7 +1411,7 @@ class QueueEntry(LauncherFixtures):
         self.entry_lib = self.temp / 'queue entry'
         self.entry_lib.mkdir()
         for name in ['github-workbench.ps1', 'conductor.py', 'agw.py', 'hub.py', 'closer.py', 'limits.py', 'triage.py',
-                     'labelquery.py']:
+                     'labelquery.py', 'tslog.py']:
             shutil.copyfile(LIB / name, self.entry_lib / name)
         self.overrides = (
             "\nfunction Get-IssueInfo { return @{title='fix-x';state='OPEN'} }\n"

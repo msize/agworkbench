@@ -918,7 +918,8 @@ class Timestamps(unittest.TestCase):
     def main(self, argv):
         out = io.StringIO()
         with patch.object(t, 'Triage', self.Triage), patch.object(t, 'load_config', return_value={}), \
-                patch.object(t.tslog, 'install', wraps=tslog.install) as install, contextlib.redirect_stdout(out):
+                patch.object(t.tslog, 'install', wraps=tslog.install) as install, contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(io.StringIO()):     # install wraps both; neither may leak
             self.assertEqual(0, t.main(argv))
         return out.getvalue(), install
 
