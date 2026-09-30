@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """relay - the workbench's doorbell and its eye on GitHub.
 
-Five jobs, one loop, one process per issue, running in its own visible agwinterm session:
+Six jobs, one loop, one process per issue, running in its own visible agwinterm session:
 
 1. **Mail.** Agents never type into each other's panes. They write a message file into the
    workbench mailbox (`agmsg send`, no `--nudge`), and the relay types a one-line pointer into the
@@ -56,6 +56,13 @@ Five jobs, one loop, one process per issue, running in its own visible agwinterm
    loop.json in queue mode). Progress - a commit, mail, a helper, a loop report - resets it. It
    never types anything but the mail pointer, and never answers a prompt.
 
+6. **Finished helpers (#84).** Every `--limit-interval` seconds, on every loop (autonomous or not,
+   watching or draining), it closes each `#N revmux rK` and `#N suite <label>` session that is proven
+   done and untouched - the autonomous close's evidence - once the result mail its completion marker
+   names has been read, and `helperCloseSeconds` (config, default 120) have passed since all of that
+   first held. The human's revdiff (`#N your review`) stays. Reports and logs in `.workbench/review/`
+   stay; each close is logged in `.workbench/state/relay-close.log`. `closeHelpers: false` turns it off.
+
 Nothing here polls on behalf of an agent: agents are woken by the relay and otherwise idle. The
 relay itself polls the mailbox directory, the GitHub API, the two agent panes (for limits and
 stalls), and for stalls also the terminal's session tree and `git rev-parse HEAD`, none of which
@@ -100,6 +107,7 @@ ALERT_EVERY = 300.0
 TERMINAL_DRAIN_TIMEOUT = 30 * 60.0
 LIMIT_READS = 2          # consecutive reads that start (or end) a usage-limit episode
 STALL_MINUTES = 15.0     # the default stall period (#45); `stallMinutes` in ~/.agworkbench.json, 0 = off
+HELPER_CLOSE_SECONDS = 120.0   # a finished helper's grace before it closes (#84); `helperCloseSeconds`
 LIMIT_RETRY_MINUTES = 30.0   # between probes of an agent waiting out its limit (#77); `limitRetryMinutes`
 PROBE_TEXT = ("the usage limit may have reset; continue where you left off "
               "(git status, .workbench, unread mail)")
@@ -321,6 +329,24 @@ def stall_setting() -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
         return STALL_MINUTES
     return float(value)
+
+
+def close_helpers_setting() -> tuple[bool, float]:
+    """(`closeHelpers`, `helperCloseSeconds`) from ~/.agworkbench.json (#84): on by default, grace
+    HELPER_CLOSE_SECONDS. The launcher refuses an invalid value; one that slips through here turns
+    closing off (a flag we cannot read never closes anything) or reads as the default grace."""
+    path = Path(os.environ.get("AGWORKBENCH_CONFIG") or (Path.home() / ".agworkbench.json"))
+    try:
+        config = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        config = {}
+    if not isinstance(config, dict):
+        config = {}
+    enabled = config.get("closeHelpers", True)
+    grace = config.get("helperCloseSeconds", HELPER_CLOSE_SECONDS)
+    if isinstance(grace, bool) or not isinstance(grace, (int, float)) or grace < 0:
+        grace = HELPER_CLOSE_SECONDS
+    return enabled is True, float(grace)
 
 
 def limit_retry_setting() -> float:
@@ -702,6 +728,9 @@ class Relay:
         self.limit_baseline: dict[str, set[str]] = {}
         # True once the PR is finished: limit checks stop, so no limit may hold the final notices.
         self.draining = False
+        # The finished-helper sweep (#84): built on its first use, kept so its evidence persists.
+        self.sweeper: closer.Closer | None = None
+        self.sweep_note: str | None = None
         self.dry_run = dry_run
         self.state_file = hub_dir / "state" / "relay.json"
         self.stop_file = hub_dir / "state" / "relay.stop"
@@ -1048,6 +1077,33 @@ class Relay:
                            f"{reason}. The pane is not an idle agent composer (a shell, a dialog or a draft); "
                            "the human has been notified. The relay keeps trying."])
         self.alert_limit(peer, subject, body, reason)
+
+    # finished helpers (#84) ---------------------------------------------------------------------
+    def sweep_note_once(self, text: str) -> None:
+        if self.sweep_note != text:
+            self.sweep_note = text
+            self.log(text)
+
+    def sweep_helpers(self) -> None:
+        """One look for finished helpers to close (closer.step_finished_helpers). Never raises for a
+        setting, a queue membership or a terminal it cannot read: it says so once and tries again."""
+        enabled, grace = close_helpers_setting()
+        if not enabled:
+            self.sweep_note_once('helper close off (closeHelpers: false)')
+            return
+        if self.sweeper is None:
+            try:
+                self.sweeper = self.closer()
+            except ValueError as err:
+                self.sweep_note_once(f'helper close skipped: {err}')
+                return
+        import agw
+        try:
+            self.sweeper.step_finished_helpers(grace)
+        except (agw.CtlError, OSError) as err:
+            self.sweep_note_once(f'helper close skipped: terminal unreadable ({err})')
+            return
+        self.sweep_note = None
 
     # the autonomous close (#27) ------------------------------------------------------------------
     def closer(self) -> "closer.Closer":
@@ -1706,6 +1762,7 @@ class Relay:
             if pending == closer.NO_PR and over:
                 return 0
         next_limit = 0.0
+        next_sweep = 0.0
         next_no_pr = 0.0
         while True:
             if self.stop_file.exists():
@@ -1721,6 +1778,13 @@ class Relay:
                     self.stall.tick(texts)
                 except Exception as err:  # noqa: BLE001 - a watchdog bug must never stop the doorbell
                     self.log(f"stall watch failed: {type(err).__name__}: {err}")
+            if now() >= next_sweep:
+                # Watching and draining alike (#84); the autonomous close does its own helpers.
+                next_sweep = now() + self.limit_interval
+                try:
+                    self.sweep_helpers()
+                except Exception as err:  # noqa: BLE001 - a sweep bug must never stop the doorbell
+                    self.log(f"helper close failed: {type(err).__name__}: {err}")
             self.deliver_mail()
             if drain_deadline is not None:
                 pending = self.pending_terminal_mail()

@@ -3322,7 +3322,11 @@ class AutoMergeLaunch(LauncherFixtures):
                                ('limitRetryMinutes', '30', False), ('limitRetryMinutes', True, False),
                                ('reviewOnLimit', 'wait', True), ('reviewOnLimit', 'fallback', True),
                                ('reviewOnLimit', 'Wait', False), ('reviewOnLimit', 'failover', False),
-                               ('reviewOnLimit', 1, False)):
+                               ('reviewOnLimit', 1, False), ('closeHelpers', False, True),
+                               ('closeHelpers', 'false', False), ('closeHelpers', 0, False),
+                               ('helperCloseSeconds', 0, True), ('helperCloseSeconds', 7.5, True),
+                               ('helperCloseSeconds', -1, False), ('helperCloseSeconds', '120', False),
+                               ('helperCloseSeconds', True, False)):
             with self.subTest(key=key, value=value):
                 self.config_path.write_text(json.dumps({'checkoutRoot': str(self.temp), key: value}), encoding='utf-8')
                 result = ps('. ./lib/Workbench.ps1; Get-WorkbenchConfig | Out-Null; "loaded"', env=self.env)
