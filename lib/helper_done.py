@@ -9,6 +9,11 @@ the pane has not been touched since (see closer.helper_untouched):
 
 The marker is keyed by the helper's own pane id, which is also the session id of a one-pane helper.
 A helper that is killed writes none, and stays open.
+
+It also names the mail that carries the helper's result (#84): `mail` (the message id) and `to` (the
+box it went to). The relay closes a finished helper early only once that mail has been read, so a
+marker without them - a helper from before #84, a revmux round that failed or whose review run was a tool error (its pane holds the error; the planner is sent
+to the session), or one whose post failed - keeps its session open.
 """
 
 from __future__ import annotations
@@ -27,7 +32,7 @@ import closer  # noqa: E402
 
 
 def write_marker(hub: str | Path, kind: str, *, round: int | None = None, exit: int | None = None,
-                 failures: int | None = None) -> Path | None:
+                 failures: int | None = None, mail: str | None = None, to: str | None = None) -> Path | None:
     """Write this pane's completion marker; the caller's very last act. None outside agwinterm.
     run_helper.py (#45) calls it in-process, after its last line is printed and flushed."""
     pane = os.environ.get("AGWINTERM_PANE_ID") or os.environ.get("AGWINTERM_SESSION_ID")
@@ -43,6 +48,8 @@ def write_marker(hub: str | Path, kind: str, *, round: int | None = None, exit: 
     marker = {"kind": kind, "round": round, "exit": exit, "pane": pane, "at": time.time(), "rows": rows}
     if failures is not None:
         marker["failures"] = failures
+    if mail and to:
+        marker["mail"], marker["to"] = mail, to
     directory = Path(hub) / "state" / "helpers"
     directory.mkdir(parents=True, exist_ok=True)
     temporary = directory / f".{pane}.tmp"
@@ -59,8 +66,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--round", type=int)
     parser.add_argument("--exit", type=int)
     parser.add_argument("--failures", type=int)
+    parser.add_argument("--mail", help="the id of the mail that carries the result (#84)")
+    parser.add_argument("--to", help="the box that mail went to")
     args = parser.parse_args(argv)
-    write_marker(args.hub, args.kind, round=args.round, exit=args.exit, failures=args.failures)
+    write_marker(args.hub, args.kind, round=args.round, exit=args.exit, failures=args.failures,
+                 mail=args.mail, to=args.to)
     return 0
 
 

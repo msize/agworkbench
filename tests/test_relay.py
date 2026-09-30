@@ -178,6 +178,9 @@ class DeliveryFixture(unittest.TestCase):
         self.send = self.enterContext(patch.object(peerchat, 'send', return_value='submitted'))
         self.gh = self.enterContext(patch.object(relay.subprocess, 'run',
                                                 side_effect=AssertionError('real GitHub request')))
+        # #84 r3: the helper sweep is HelperSweep's and HelperSweepInRun's to test; here it would read
+        # the developer's config and trip the terminal guard, which run() would swallow.
+        self.enterContext(patch.object(relay.Relay, 'sweep_helpers'))
 
     def tick(self, instant):
         self.t = instant
@@ -2323,7 +2326,8 @@ class AutonomousClose(unittest.TestCase):
         self.state.mkdir(parents=True)
         self.addCleanup(shutil.rmtree, self.folder)
         self.addCleanup(hub.reload_paths)
-        self.enterContext(patch.dict(os.environ))
+        # No config file (#84): the helper sweep in run() is on by default, not the developer's setting.
+        self.enterContext(patch.dict(os.environ, {'AGWORKBENCH_CONFIG': str(self.folder / 'no-config.json')}))
         self.write('implementer.json', {'tool': 'claude', 'autonomous': True})
         self.write('loop-done.json', {'pr': 7, 'sha': 'abc', 'followUps': []})
         peers = [relay.Peer('claude', 'claude', self.PLANNER), relay.Peer('codex', 'claude', self.IMPLEMENTER)]
@@ -3136,6 +3140,261 @@ class AutonomousClose(unittest.TestCase):
         self.assertIn('could not start the checkout cleanup: no python', self.log())
 
 
+class HelperSweep(unittest.TestCase):
+    """#84: on every loop the relay closes a finished revmux or suite helper on the first look after its
+    result mail has been read, whatever its pane shows - never the human's revdiff, never another
+    workspace's."""
+    PLANNER = '11111111-1111-4111-8111-111111111111'
+    IMPLEMENTER = '22222222-2222-4222-8222-222222222222'
+    SUITE, REVMUX, REVIEW, OTHER = 's1', 'a1', 'a2', 'a3'
+    SUITE_ROWS = ['suite abc1234: passed (exit 0, 0 failures)', 'result mailed to claude (m-suite)']
+    REVMUX_ROWS = ['revmux exit 1 (findings reported). Report posted to Claude.']
+
+    def setUp(self):
+        self.folder = Path(__file__).resolve().parent.parent / ('test relay sweep ' + uuid.uuid4().hex)
+        self.hub_dir = self.folder / '.workbench'
+        self.state = self.hub_dir / 'state'
+        self.state.mkdir(parents=True)
+        self.addCleanup(shutil.rmtree, self.folder)
+        self.addCleanup(hub.reload_paths)
+        self.enterContext(patch.dict(os.environ, {'AGWORKBENCH_CONFIG': str(self.folder / 'config.json')}))
+        self.config({})
+        # Not autonomous: the early close does not depend on it.
+        (self.state / 'implementer.json').write_text(json.dumps({'tool': 'claude', 'autonomous': False}), encoding='utf-8')
+        peers = [relay.Peer('claude', 'claude', self.PLANNER), relay.Peer('codex', 'claude', self.IMPLEMENTER)]
+        self.r = relay.Relay(self.hub_dir, peers, 'o/repo', 'issue-7-fix', 5, 60)
+        self.logs = []
+        self.r.log = self.logs.append
+        self.t = 0.0
+        self.enterContext(patch.object(relay, 'now', lambda: self.t))
+        self.text = {self.SUITE: '\n'.join(self.SUITE_ROWS), self.REVMUX: '\n'.join(self.REVMUX_ROWS),
+                     self.REVIEW: 'revdiff: 3 annotations', self.OTHER: '\n'.join(self.REVMUX_ROWS)}
+        self.tree = {'workspaces': [
+            {'name': 'repo', 'sessions': [{'id': self.PLANNER, 'name': '#7 fix', 'paneIds': [self.PLANNER, self.IMPLEMENTER]},
+                                          {'id': self.SUITE, 'name': '#7 suite abc1234'},
+                                          {'id': self.REVMUX, 'name': '#7 revmux r1'},
+                                          {'id': self.REVIEW, 'name': '#7 your review'}]},
+            {'name': 'other', 'sessions': [{'id': self.OTHER, 'name': '#7 revmux r1'}]}]}
+        self.actions = []
+        self.enterContext(patch.object(agw, 'pane_text', side_effect=lambda pane: self.text[pane]))
+        self.enterContext(patch.object(agw, 'tree', side_effect=lambda: self.tree))
+        self.enterContext(patch.object(agw, 'close_session', side_effect=self.closed))
+        self.enterContext(patch.object(agw, 'clear_restore', side_effect=lambda pane: self.actions.append(('unpin', pane))))
+        self.enterContext(patch.object(agw, 'request', side_effect=AssertionError('unexpected terminal request')))
+        self.marker(self.SUITE, 'suite', self.SUITE_ROWS, mail='m-suite', to='claude')
+        self.marker(self.REVMUX, 'revmux', self.REVMUX_ROWS, mail='m-revmux', to='claude')
+        self.marker(self.REVIEW, 'review', ['revdiff: 3 annotations'])
+        self.marker(self.OTHER, 'revmux', self.REVMUX_ROWS, mail='m-revmux', to='claude')
+        self.mail('claude', 'm-suite', 'read')
+        self.mail('claude', 'm-revmux', 'read')
+        log = self.hub_dir / 'review' / 'suite-abc1234.log'
+        log.parent.mkdir(parents=True)
+        log.write_text('OK\n', encoding='utf-8')
+
+    def closed(self, session_id):
+        self.actions.append(('close', session_id))
+        for workspace in self.tree['workspaces']:
+            workspace['sessions'] = [s for s in workspace['sessions'] if s['id'] != session_id]
+
+    def config(self, data):
+        (self.folder / 'config.json').write_text(json.dumps(data), encoding='utf-8')
+
+    def marker(self, pane, kind, rows, **fields):
+        directory = self.state / 'helpers'
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f'{pane}.done').write_text(json.dumps({'kind': kind, 'round': 1, 'exit': 0, 'pane': pane,
+                                                            'rows': rows, **fields}), encoding='utf-8')
+
+    def mail(self, box, mid, folder=''):
+        for place in ('', 'read', 'archive'):
+            (self.hub_dir / 'inbox' / box / place / f'{mid}.md').unlink(missing_ok=True)
+        path = self.hub_dir / 'inbox' / box / folder / f'{mid}.md'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('---\nid: x\n---\nbody\n', encoding='utf-8')
+
+    def sweep(self, *instants):
+        for instant in instants:
+            self.t = instant
+            self.r.sweep_helpers()
+
+    def closes(self):
+        return [target for action, target in self.actions if action == 'close']
+
+    def close_log(self):
+        path = self.state / 'relay-close.log'
+        return path.read_text(encoding='utf-8') if path.exists() else ''
+
+    def test_mail_read_closes_on_the_next_sweep(self):
+        self.sweep(0)                                       # no grace, no settle wait
+        self.assertEqual([self.SUITE, self.REVMUX], self.closes())
+        self.assertIn(('unpin', self.SUITE), self.actions)
+        self.assertFalse((self.state / 'helpers' / f'{self.SUITE}.done').exists())
+        self.assertFalse((self.state / 'helpers' / f'{self.REVMUX}.done').exists())
+        self.assertTrue((self.hub_dir / 'review' / 'suite-abc1234.log').exists())       # logs survive
+        self.assertIn('closing finished helper #7 suite abc1234 (s1): result mail m-suite read', self.close_log())
+        self.assertIn('close: closing finished helper #7 revmux r1 (a1): result mail m-revmux read', self.logs)
+
+    def test_busy_or_changed_pane_still_closes_once_mail_is_read(self):
+        # The owner's rule: once the result is read the session goes, whatever the pane shows.
+        self.tree['workspaces'][0]['sessions'][1]['foregroundShell'] = 'pwsh'
+        self.text[self.SUITE] += '\nPS C:\\repo> still printing'
+        with patch.object(agw, 'pane_text', side_effect=AssertionError('the pane is not read')):
+            self.sweep(0)
+        self.assertEqual([self.SUITE, self.REVMUX], self.closes())
+
+    def test_a_split_helper_session_is_kept(self):
+        self.tree['workspaces'][0]['sessions'][1]['paneIds'] = [self.SUITE, 'human-pane']
+        self.sweep(0, 4000)
+        self.assertNotIn(self.SUITE, self.closes())
+        self.assertIn('#7 suite abc1234 (s1) stays open: not a single-pane helper', self.close_log())
+
+    def test_an_unread_result_mail_keeps_the_helper_until_it_is_read(self):
+        self.mail('claude', 'm-suite')
+        self.sweep(0, 30, 200, 400)
+        self.assertNotIn(self.SUITE, self.closes())
+        self.assertIn('#7 suite abc1234 (s1) stays open: its result mail m-suite is unread in claude', self.close_log())
+        self.assertEqual(1, self.close_log().count('its result mail m-suite is unread'))    # said once
+        self.mail('claude', 'm-suite', 'archive')           # archived counts as read
+        self.sweep(430)
+        self.assertIn(self.SUITE, self.closes())
+
+    def test_an_implementer_suite_is_judged_in_the_implementers_box(self):
+        # The suite an implementer starts mails `codex` (wb.py suite --to $AI_BOX).
+        self.marker(self.SUITE, 'suite', self.SUITE_ROWS, mail='m-codex', to='codex')
+        self.mail('codex', 'm-codex')
+        self.sweep(0, 30, 200)
+        self.assertNotIn(self.SUITE, self.closes())
+        self.assertIn('its result mail m-codex is unread in codex', self.close_log())
+        self.mail('codex', 'm-codex', 'read')
+        self.sweep(230)
+        self.assertIn(self.SUITE, self.closes())
+
+    def test_a_running_helper_without_a_marker_is_never_closed(self):
+        (self.state / 'helpers' / f'{self.SUITE}.done').unlink()
+        self.sweep(0, 30, 200, 4000)
+        self.assertNotIn(self.SUITE, self.closes())
+        self.assertIn('#7 suite abc1234 (s1) stays open: no completion marker', self.close_log())
+
+    def test_the_humans_revdiff_is_kept(self):
+        self.mail('claude', 'm-review', 'read')
+        self.marker(self.REVIEW, 'review', ['revdiff: 3 annotations'], mail='m-review', to='claude')
+        self.sweep(0, 30, 200, 4000)
+        self.assertNotIn(self.REVIEW, self.closes())
+        self.assertIn("#7 your review (a2) stays open: the human's revdiff", self.close_log())
+
+    def test_a_review_marker_under_another_name_is_kept(self):
+        self.marker(self.SUITE, 'review', self.SUITE_ROWS, mail='m-suite', to='claude')
+        self.sweep(0, 30, 4000)
+        self.assertNotIn(self.SUITE, self.closes())
+
+    def test_close_helpers_false_keeps_them_all(self):
+        self.config({'closeHelpers': False})
+        self.sweep(0, 30, 200, 4000)
+        self.assertEqual([], self.closes())
+        self.assertEqual(['helper close off (closeHelpers: false)'], self.logs)
+        self.assertEqual('', self.close_log())
+
+    def test_an_unreadable_close_helpers_value_closes_nothing(self):
+        self.config({'closeHelpers': 'yes'})
+        self.sweep(0, 30, 4000)
+        self.assertEqual([], self.closes())
+        self.assertEqual(['helper close off (closeHelpers: "yes")'], self.logs)
+
+    def test_an_unreadable_config_closes_nothing(self):
+        # #84 r1 m1: fail closed - a config with // comments (PowerShell reads it, json does not),
+        # half-written, or not an object may hold `closeHelpers: false`.
+        for text in ('{\n  // mine\n  "closeHelpers": false\n}', '{"closeHelpers": fal', '[]'):
+            with self.subTest(text=text):
+                (self.folder / 'config.json').write_text(text, encoding='utf-8')
+                self.logs.clear()
+                self.r.sweep_note = None
+                self.sweep(0, 30)
+                self.assertEqual([], self.closes())
+                self.assertEqual(1, len(self.logs), self.logs)
+                self.assertTrue(self.logs[0].startswith('helper close off (config '), self.logs)
+
+    def test_close_helpers_is_matched_in_any_case(self):
+        # #84 r3 m1: the launcher reads `CloseHelpers` as closeHelpers; so does the relay.
+        for config, enabled in (({'CloseHelpers': False}, False), ({'CLOSEHELPERS': True}, True),
+                                ({'closeHelpers': True, 'CloseHelpers': False}, False),
+                                ({'closeHelpers': None, 'closehelpers': 'no'}, False)):
+            with self.subTest(config=config):
+                self.config(config)
+                self.assertEqual(enabled, relay.close_helpers_setting()[0])
+        self.config({'CloseHelpers': False})
+        self.sweep(0)
+        self.assertEqual([], self.closes())
+        self.assertEqual(['helper close off (CloseHelpers: false)'], self.logs)
+
+    def test_a_missing_config_or_a_null_value_is_the_default_on(self):
+        # #84 r1 i1: the launcher skips a null value, so null means the default here too.
+        self.config({'closeHelpers': None})
+        self.sweep(0)
+        self.assertEqual([self.SUITE, self.REVMUX], self.closes())
+        self.assertEqual((True, ''), relay.close_helpers_setting())
+        (self.folder / 'config.json').unlink()
+        self.assertEqual((True, ''), relay.close_helpers_setting())
+
+    def test_a_marker_that_names_no_mail_is_kept(self):
+        self.marker(self.SUITE, 'suite', self.SUITE_ROWS)                                  # before #84, or post failed
+        self.marker(self.REVMUX, 'revmux', self.REVMUX_ROWS, mail='m-revmux', to='../claude')   # not a box
+        self.sweep(0, 30, 4000)
+        self.assertEqual([], self.closes())
+        self.assertIn('#7 suite abc1234 (s1) stays open: its marker names no result mail', self.close_log())
+        self.assertIn('#7 revmux r1 (a1) stays open: its marker names no valid mailbox', self.close_log())
+
+    def test_a_mail_found_nowhere_keeps_the_helper(self):
+        (self.hub_dir / 'inbox' / 'claude' / 'read' / 'm-suite.md').unlink()
+        self.sweep(0, 30, 4000)
+        self.assertNotIn(self.SUITE, self.closes())
+        self.assertIn('its result mail m-suite is not in the claude mailbox', self.close_log())
+
+    def test_another_workspaces_helper_is_untouched(self):
+        self.sweep(0, 30, 4000)
+        self.assertNotIn(self.OTHER, [target for _, target in self.actions])
+        self.assertTrue((self.state / 'helpers' / f'{self.OTHER}.done').exists())
+
+    def test_an_unreadable_queue_membership_is_logged_once_and_retried(self):
+        membership = self.state / 'queue-member.json'
+        membership.write_text('{', encoding='utf-8')
+        self.sweep(0, 30)
+        self.assertEqual([], self.closes())
+        self.assertEqual(1, sum('helper close skipped: unreadable queue membership' in line for line in self.logs))
+        membership.unlink()
+        self.sweep(60)
+        self.assertEqual([self.SUITE, self.REVMUX], self.closes())
+
+    def test_dry_run_closes_nothing_and_says_so_once(self):
+        self.r.dry_run = True
+        self.sweep(0, 30, 200, 400)
+        self.assertEqual([], self.closes())
+        self.assertEqual(1, sum(line == 'close: [dry-run] would close finished helper #7 suite abc1234 (s1)'
+                                for line in self.logs))
+        self.assertTrue((self.state / 'helpers' / f'{self.SUITE}.done').exists())
+
+
+class HelperSweepInRun(DeliveryFixture):
+    """#84: run() sweeps finished helpers on its own timer, watching and draining alike, and a sweep
+    that fails never stops the doorbell."""
+
+    def run_once(self):
+        self.r.sweep_helpers = Mock(side_effect=RuntimeError('boom'))
+        self.r.stop_file = SimpleNamespace(exists=lambda: self.r.sweep_helpers.call_count > 0)
+        self.r.fetch_pr = Mock(return_value=None)
+        with patch.object(relay, 'pause'):
+            self.assertEqual(0, self.r.run())
+        self.r.sweep_helpers.assert_called_once()
+        self.assertIn('helper close failed: RuntimeError: boom', self.logs)
+
+    def test_a_watching_relay_sweeps(self):
+        self.run_once()
+
+    def test_a_draining_relay_sweeps(self):
+        self.r.state['pr'] = with_(OPEN, number=7, state='MERGED', headRefName='issue-6')
+        self.run_once()
+        self.assertTrue(any('resuming final notice drain' in line for line in self.logs))
+
+
 class HelperMarkers(unittest.TestCase):
     """#33: a helper proves it finished, and the close proves nobody touched its pane since."""
     DONE = ['revmux exit 1 (findings reported).', 'Report posted to Claude.']
@@ -3164,6 +3423,20 @@ class HelperMarkers(unittest.TestCase):
         marker = json.loads((folder / 'state' / 'helpers' / 'p-1.done').read_text(encoding='utf-8'))
         self.assertEqual(('revmux', 2, 1, 'p-1', ['report', 'posted']),
                          (marker['kind'], marker['round'], marker['exit'], marker['pane'], marker['rows']))
+
+    def test_helper_done_records_the_result_mail(self):
+        # #84: the mail id and its box, both or neither.
+        import helper_done
+        folder = Path(__file__).resolve().parent.parent / ('test helper done ' + uuid.uuid4().hex)
+        folder.mkdir()
+        self.addCleanup(shutil.rmtree, folder)
+        with patch.dict(os.environ, {'AGWINTERM_PANE_ID': 'p-3'}), patch.object(agw, 'pane_text', return_value='x\n'):
+            helper_done.main(['--hub', str(folder), '--kind', 'revmux', '--mail', 'm-1', '--to', 'claude'])
+            marker = json.loads((folder / 'state' / 'helpers' / 'p-3.done').read_text(encoding='utf-8'))
+            self.assertEqual(('m-1', 'claude'), (marker['mail'], marker['to']))
+            helper_done.main(['--hub', str(folder), '--kind', 'revmux', '--mail', 'm-1'])
+            marker = json.loads((folder / 'state' / 'helpers' / 'p-3.done').read_text(encoding='utf-8'))
+            self.assertNotIn('mail', marker)
 
     def test_an_unreadable_pane_still_marks_done_but_proves_nothing(self):
         import helper_done

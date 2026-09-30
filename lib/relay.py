@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """relay - the workbench's doorbell and its eye on GitHub.
 
-Five jobs, one loop, one process per issue, running in its own visible agwinterm session:
+Six jobs, one loop, one process per issue, running in its own visible agwinterm session:
 
 1. **Mail.** Agents never type into each other's panes. They write a message file into the
    workbench mailbox (`agmsg send`, no `--nudge`), and the relay types a one-line pointer into the
@@ -55,6 +55,12 @@ Five jobs, one loop, one process per issue, running in its own visible agwinterm
    periods with no progress it reports the loop blocked (blocked status and sound, waiting.json, and
    loop.json in queue mode). Progress - a commit, mail, a helper, a loop report - resets it. It
    never types anything but the mail pointer, and never answers a prompt.
+
+6. **Finished helpers (#84).** Every `--limit-interval` seconds, on every loop (autonomous or not,
+   watching or draining), it closes each `#N revmux rK` and `#N suite <label>` session whose
+   completion marker names a result mail that has been read - whatever its pane shows. The human's
+   revdiff (`#N your review`) stays. Reports and logs in `.workbench/review/` stay; each close is
+   logged in `.workbench/state/relay-close.log`. `closeHelpers: false` turns it off.
 
 Nothing here polls on behalf of an agent: agents are woken by the relay and otherwise idle. The
 relay itself polls the mailbox directory, the GitHub API, the two agent panes (for limits and
@@ -321,6 +327,27 @@ def stall_setting() -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
         return STALL_MINUTES
     return float(value)
+
+
+def close_helpers_setting() -> tuple[bool, str]:
+    """(`closeHelpers` from ~/.agworkbench.json, why it is off) (#84). On when the file or the key is
+    missing, or the key is null (the launcher skips null too). Fails closed: a config it cannot read or
+    parse (locked, half-written, `//` comments), or a value that is not true or false, closes nothing.
+    The key is matched in any case, as PowerShell's launcher reads it: any spelling set to anything but
+    true or null turns closing off, so `"CloseHelpers": false` or two spellings that disagree keep all."""
+    path = Path(os.environ.get("AGWORKBENCH_CONFIG") or (Path.home() / ".agworkbench.json"))
+    try:
+        config = json.loads(path.read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        return True, ''
+    except (OSError, ValueError) as err:
+        return False, f'config {path} unreadable: {err}'
+    if not isinstance(config, dict):
+        return False, f'config {path} is not a JSON object'
+    for key, value in config.items():
+        if key.casefold() == "closehelpers" and value is not None and value is not True:
+            return False, f'{key}: {json.dumps(value)}'
+    return True, ''
 
 
 def limit_retry_setting() -> float:
@@ -702,6 +729,9 @@ class Relay:
         self.limit_baseline: dict[str, set[str]] = {}
         # True once the PR is finished: limit checks stop, so no limit may hold the final notices.
         self.draining = False
+        # The finished-helper sweep (#84): built on its first use, kept so it logs each decision once.
+        self.sweeper: closer.Closer | None = None
+        self.sweep_note: str | None = None
         self.dry_run = dry_run
         self.state_file = hub_dir / "state" / "relay.json"
         self.stop_file = hub_dir / "state" / "relay.stop"
@@ -1048,6 +1078,33 @@ class Relay:
                            f"{reason}. The pane is not an idle agent composer (a shell, a dialog or a draft); "
                            "the human has been notified. The relay keeps trying."])
         self.alert_limit(peer, subject, body, reason)
+
+    # finished helpers (#84) ---------------------------------------------------------------------
+    def sweep_note_once(self, text: str) -> None:
+        if self.sweep_note != text:
+            self.sweep_note = text
+            self.log(text)
+
+    def sweep_helpers(self) -> None:
+        """One look for finished helpers to close (closer.step_finished_helpers). Never raises for a
+        setting, a queue membership or a terminal it cannot read: it says so once and tries again."""
+        enabled, why = close_helpers_setting()
+        if not enabled:
+            self.sweep_note_once(f'helper close off ({why})')
+            return
+        if self.sweeper is None:
+            try:
+                self.sweeper = self.closer()
+            except ValueError as err:
+                self.sweep_note_once(f'helper close skipped: {err}')
+                return
+        import agw
+        try:
+            self.sweeper.step_finished_helpers()
+        except (agw.CtlError, OSError) as err:
+            self.sweep_note_once(f'helper close skipped: terminal unreadable ({err})')
+            return
+        self.sweep_note = None
 
     # the autonomous close (#27) ------------------------------------------------------------------
     def closer(self) -> "closer.Closer":
@@ -1706,6 +1763,7 @@ class Relay:
             if pending == closer.NO_PR and over:
                 return 0
         next_limit = 0.0
+        next_sweep = 0.0
         next_no_pr = 0.0
         while True:
             if self.stop_file.exists():
@@ -1721,6 +1779,13 @@ class Relay:
                     self.stall.tick(texts)
                 except Exception as err:  # noqa: BLE001 - a watchdog bug must never stop the doorbell
                     self.log(f"stall watch failed: {type(err).__name__}: {err}")
+            if now() >= next_sweep:
+                # Watching and draining alike (#84); the autonomous close does its own helpers.
+                next_sweep = now() + self.limit_interval
+                try:
+                    self.sweep_helpers()
+                except Exception as err:  # noqa: BLE001 - a sweep bug must never stop the doorbell
+                    self.log(f"helper close failed: {type(err).__name__}: {err}")
             self.deliver_mail()
             if drain_deadline is not None:
                 pending = self.pending_terminal_mail()
