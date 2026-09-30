@@ -601,6 +601,7 @@ def kimi_answer(priority='P2', suitable=True, reason='one crate, fixtures in tes
 class KimiLabel(TriageCase):
     """#77: with "kimiLabel": true triage also judges whether an issue suits Kimi and sets or clears the
     `kimi` label; P0/P1 never suits; a human's kimi label wins; --kimi-only judges nothing else."""
+    follow_up = Decisions.follow_up
 
     def setUp(self):
         super().setUp()
@@ -698,8 +699,23 @@ class KimiLabel(TriageCase):
         # #100 is a bug an open spec bug references: P0 without the model.
         self.assertEqual(0, self.triage().run_once(numbers=[100]))
         self.assertEqual([], [n for n, *_ in self.model_calls])
-        self.assertIn(f'kimi: no (p0-p1) - {t.DETERMINISTIC_NOT_KIMI}', self.log_for(100)[0])
+        self.assertIn(f'kimi: no (spec-reference) - {t.DETERMINISTIC_NOT_KIMI}', self.log_for(100)[0])
         self.assertIsNone(self.kimi_change(100))
+
+    def test_a_capped_deterministic_path_names_the_spec_reference_not_p0_p1(self):
+        # #82 r1: a minor follow-up an open spec bug references is capped at P2; the rule that decided
+        # kimi is still the spec reference, in a full run and in --kimi-only.
+        self.follow_up(100)
+        self.answers[100] = kimi_answer('P0')
+        self.assertEqual(0, self.triage().run_once(numbers=[100]))
+        self.assertIn('priority:P2', self.labels_written()[100])
+        self.assertIn(f'kimi: no (spec-reference) - {t.DETERMINISTIC_NOT_KIMI}', self.log_for(100)[0])
+        self.assertNotIn('makes it P0', self.log_for(100)[0])
+        self.product[-1]['labels'].append({'name': 'priority:P2'})
+        self.model_calls.clear()
+        self.assertEqual(0, self.triage().run_once(numbers=[100], kimi_only=True))
+        self.assertEqual([], self.model_calls)
+        self.assertIn(f'#100: kimi: no (spec-reference) - {t.DETERMINISTIC_NOT_KIMI}', self.out)
 
     def test_a_human_kimi_label_wins(self):
         # Set by hand (triage never recorded it): left alone although the model says unsuitable.
@@ -1004,8 +1020,9 @@ class KimiRules(unittest.TestCase):
         text = t.COMMAND.read_text(encoding='utf-8')
         for rule in (*t.KIMI_ALLOWED, *t.KIMI_EXCLUDED):
             self.assertIn(f'`{rule}`:', text)
-        self.assertNotIn(t.KIMI_NOT_P2_P3, text)
-        self.assertNotIn(t.KIMI_NOT_P2_P3, t.KIMI_PROPERTIES['kimiRule']['enum'])
+        for rule in (t.KIMI_NOT_P2_P3, t.KIMI_SPEC_REF):
+            self.assertNotIn(rule, text)
+            self.assertNotIn(rule, t.KIMI_PROPERTIES['kimiRule']['enum'])
         example = next(block for block in re.findall(r'```json\n(.*?)```', text, re.S) if 'kimiSuitable' in block)
         self.assertIn('"kimiRule"', example)
         self.assertIn('{"kimiSuitable": ..., "kimiRule": "...", "kimiReason": "..."}', text)

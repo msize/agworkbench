@@ -43,7 +43,9 @@ issues: no priority change and no public comment; it ends with a one-line count 
 
 Every kimi verdict names the rule that decided it (#82): the model picks `kimiRule` from KIMI_ALLOWED or
 KIMI_EXCLUDED (a schema enum), and an answer whose rule contradicts its verdict is not suitable - never
-label on doubt. The log line reads `kimi: yes (<rule>) - <reason>`.
+label on doubt. The log line reads `kimi: yes (<rule>) - <reason>`. Two ids are the tool's own, never the
+model's: `spec-reference` (the deterministic spec-reference path) and `not-p2-p3` (the issue lost its P2/P3
+label before the kimi write).
 """
 
 from __future__ import annotations
@@ -124,12 +126,13 @@ KIMI_ALLOWED = ('narrow-fix', 'leftovers-one-area', 'harness-two-crates', 'ui-si
 KIMI_EXCLUDED = ('p0-p1', 'save-path', 'outside-format', 'umbrella-batch', 'new-subsystem', 'multi-crate',
                  'no-oracle', 'not-narrow')
 KIMI_NOT_P2_P3 = 'not-p2-p3'          # tool-only: the issue lost its P2/P3 label before the kimi write
+KIMI_SPEC_REF = 'spec-reference'      # tool-only: the deterministic spec-reference path, whatever its priority
 KIMI_PROPERTIES = {'kimiSuitable': {'type': 'boolean'},
                    'kimiRule': {'type': 'string', 'enum': [*KIMI_ALLOWED, *KIMI_EXCLUDED]},
                    'kimiReason': {'type': 'string', 'maxLength': 1000}}
 KIMI_PRIORITIES = ('P2', 'P3')
 PENDING_SLACK = 300     # seconds of clock skew between this machine and GitHub's event times
-DETERMINISTIC_NOT_KIMI = 'an open spec issue references it and makes it P0: spec work waits on it, never Kimi work'
+DETERMINISTIC_NOT_KIMI = 'an open spec issue references it: spec work waits on it, never Kimi work'
 
 
 def event_time(event: dict) -> float | None:
@@ -604,7 +607,7 @@ class Triage:
                                           f'(severity {severity or "unknown"}, no data loss/crash/open-save/security); capped at P2')
                     decision.priority, decision.capped = 'P2', True
             if self.config.get('kimiLabel'):
-                decision.kimi, decision.kimiRule, decision.kimiReason = False, 'p0-p1', DETERMINISTIC_NOT_KIMI
+                decision.kimi, decision.kimiRule, decision.kimiReason = False, KIMI_SPEC_REF, DETERMINISTIC_NOT_KIMI
             return decision
         floor = 'P1' if refs else None
         answer = self.ask_model(issue, refs, floor)
@@ -892,7 +895,7 @@ class Triage:
         refs = self.referencing(issue['number'])
         is_bug = any(name.casefold() == self.config['bugLabel'].casefold() for name in label_names(issue))
         if refs and (is_bug or any(r['bugMirror'] for r in refs)):
-            return False, 'p0-p1', DETERMINISTIC_NOT_KIMI
+            return False, KIMI_SPEC_REF, DETERMINISTIC_NOT_KIMI
         answer = self.ask_model(issue, refs, 'P1' if refs else None, kimi_only=True)
         return answer['kimiSuitable'], answer['kimiRule'], answer['kimiReason']
 

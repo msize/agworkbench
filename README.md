@@ -381,7 +381,8 @@ fixtures, an oracle file or sibling code), `leftovers-one-area` (a `Leftovers fr
 all sit in one crate or area, none on a save path), `harness-two-crates` (uiharness verbs or one
 app's control surface on at most 2 crates, the second only the verb's thin host side) and
 `ui-single-view` (a small UI/UX fix in one view). triage.py enforces the P0/P1 rule and the
-deterministic P0 path itself, and an answer whose rule contradicts its verdict is not suitable.
+deterministic P0 path itself (`spec-reference`; `not-p2-p3` when an issue lost its P2/P3 label before
+the write: two ids only the tool gives), and an answer whose rule contradicts its verdict is not suitable.
 Suitable adds `kimi`, unsuitable removes it, and the reason goes to the private log only
 (`kimi: yes (leftovers-one-area) - ...`). A `kimi` label you set or removed by hand wins: triage
 keeps the ids of the label events it caused, so any other `kimi` event on the issue makes it leave
