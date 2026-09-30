@@ -626,10 +626,12 @@ def relay_limited(m):
     return any(isinstance(e, dict) and e.get('announced') for e in episodes.values())
 
 
-def limit_wait(m):
+def limit_wait(m, now):
     """The usage limit a member waits out (#77): {tool, since, retryAt, source} from its relay's wait
-    episode (relay.json) or a review round's reviewer limit (review-limit.json); None when it waits for
-    nothing. Times are epoch seconds, None when unreadable."""
+    episode (relay.json) or a review round's reviewer limit (review-limit.json) until its retryAt; None
+    when it waits for nothing. Times are epoch seconds, None when unreadable. A relay episode ends only
+    when the pane clears; a review wait past its retryAt is over - the rerun holds its own slot, and a
+    file nobody cleaned up must not pin the queue."""
     directory = Path(m['checkout']) / '.workbench/state'
     path = directory / 'relay.json'
     if path.exists():
@@ -643,13 +645,19 @@ def limit_wait(m):
         record = read_json(path)
         if isinstance(record, dict):
             since, retry = record.get('since'), record.get('retryAt')
+            if type(retry) in (int, float) and retry <= now:
+                return None
             return dict(tool=str(record.get('tool') or '?'), since=since if type(since) in (int, float) else None,
                         retryAt=retry if type(retry) in (int, float) else None, source='review')
     return None
 
 
 def local_clock(epoch_value):
-    return time.strftime('%H:%M', time.localtime(epoch_value)) if epoch_value is not None else '?'
+    """HH:MM local time, '?' for a time that is missing or out of range (a display never fails a tick)."""
+    try:
+        return time.strftime('%H:%M', time.localtime(epoch_value)) if epoch_value is not None else '?'
+    except (OSError, ValueError, OverflowError):
+        return '?'
 
 
 def wait_text(m):
@@ -1926,7 +1934,7 @@ class Worker:
             if m['state'] in LIVE_STATES and m['checkoutEstablished']:
                 key = f'limit wait #{m["number"]}'
                 try:
-                    found = limit_wait(m)
+                    found = limit_wait(m, self.clock())
                     self.errors.pop(key, None)
                 except (OSError, ValueError, AttributeError) as err:
                     self.error(key, err)
@@ -2120,8 +2128,8 @@ class Worker:
             display = (m['state'], m.get('prState'), m.get('reason'))
             shown = display + (bool(m.get('limitWait')),)
             if self.last_display.get(m['number']) != shown:
-                waiting = ' waiting-limit' if m.get('limitWait') else ''
-                print(f'{self.tag}#{m["number"]}: {display[0]}{waiting} {display[1] or ""} {display[2] or ""}', flush=True)
+                suffix = ' waiting-limit' if m.get('limitWait') else ''
+                print(f'{self.tag}#{m["number"]}: {display[0]}{suffix} {display[1] or ""} {display[2] or ""}', flush=True)
                 # Only a change of state or reason notifies: a limit wait coming or going does not.
                 if m['state'] in {'blocked', 'failed'} and (self.last_display.get(m['number']) or ())[:3] != display:
                     self.notify(f'#{m["number"]}: {m["state"]}: {m.get("reason") or ""}')

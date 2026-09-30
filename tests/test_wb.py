@@ -1844,12 +1844,15 @@ class ReviewLimit(unittest.TestCase):
         self.assertIsNone(self.review_limit())
         self.assertEqual((0, ['ok']), self.merge_check())
 
-    def test_a_decision_for_another_round_keeps_the_wait(self):
+    def test_a_decision_for_an_earlier_round_keeps_the_wait_a_later_one_ends_it(self):
         self.on_limit()
         self.run_dir(2, self.RATE_LIMITED)
         self.decision(2, self.LIMITED)
         self.decision(1, revmux_report([('Major', 1)]))
         self.assertEqual(2, self.review_limit()['round'])
+        # FIX r1 M3: a round-K wait is over once round K+1 is recorded.
+        self.decision(3, revmux_report([('Minor', 1)]))
+        self.assertIsNone(self.review_limit())
 
 
 class RevmuxRerun(unittest.TestCase):
@@ -1881,6 +1884,37 @@ class RevmuxRerun(unittest.TestCase):
             self.assertIn(part, command)
         self.assertNotIn('-After', command)
         self.assertTrue((review / 'revmux-r2-limited-2.md').exists())
+
+    def limited_round(self):
+        review = self.folder / '.workbench/review'
+        review.mkdir()
+        (review / 'revmux-r2.md').write_text('limited', encoding='utf-8')
+        (review / 'revmux-r2.json').write_text(json.dumps({'run': 'r2', 'dir': 'x', 'scope': str(self.folder / 'scope.md')}),
+                                               encoding='utf-8')
+        return review
+
+    def test_a_session_that_does_not_start_leaves_the_files_as_they_were(self):
+        # FIX r1 M1: the limited report is set aside only when the session starts.
+        review = self.limited_round()
+        self.opened.side_effect = agw.CtlError('no pipe')
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(1, self.revmux('--rerun', '--after', '30'))
+        self.assertEqual(['revmux-r2.json', 'revmux-r2.md'], sorted(p.name for p in review.iterdir()))
+        with self.assertRaises(SystemExit):
+            self.revmux('--rerun', '--scope', 'missing.md')
+        self.assertEqual(['revmux-r2.json', 'revmux-r2.md'], sorted(p.name for p in review.iterdir()))
+
+    def test_a_rerun_that_died_before_its_report_is_rerun_under_a_new_name(self):
+        # FIX r1 M1: rerun 1 started, wrote its run record, and never produced a report.
+        review = self.limited_round()
+        self.assertEqual(0, self.revmux('--rerun'))
+        (review / 'revmux-r2.json').write_text(json.dumps({'run': 'r2-1', 'dir': 'y'}), encoding='utf-8')
+        self.assertEqual(0, self.revmux('--rerun'))
+        command = self.opened.call_args.args[2]
+        for part in ('-Run r2-2', '-Attempt 2', f'-ScopeFile "{self.folder / "scope.md"}"'):
+            self.assertIn(part, command)
+        self.assertEqual(['revmux-r2-limited-1.json', 'revmux-r2-limited-1.md', 'revmux-r2.json'],
+                         sorted(p.name for p in review.iterdir()))
 
     def test_rerun_refusals(self):
         with self.assertRaises(SystemExit) as caught:
@@ -2471,6 +2505,23 @@ class PlanCheck(unittest.TestCase):
         plan = KIMI_PLAN.replace('## Oracle', '## Background') + '\nSTOP AND REPORT: the MPX layout is not in the repo.\n'
         self.assertEqual((0, 'plan-check: ok (STOP AND REPORT)\n'), self.check(plan))
 
+    def test_the_stop_rule_restated_is_not_a_stop_verdict(self):
+        # FIX r1 M2: the skill asks for the rules where they apply; restating one is not STOP.
+        no_oracle = KIMI_PLAN.replace('## Oracle', '## Background')
+        plan = no_oracle.replace('- the save path is shared with the chart writer.',
+                                 '- field offsets cite a source in the repo. Without one, the plan says `STOP AND REPORT`.')
+        code, out = self.check(plan)
+        self.assertEqual(1, code)
+        self.assertIn('no Oracle section naming at least one path, and no STOP AND REPORT line', out)
+        for verdict in ('- **STOP AND REPORT**: the MPX layout is not in the repo.',
+                        '`STOP AND REPORT` - no sample .mpx in the repo'):
+            with self.subTest(verdict=verdict):
+                self.assertEqual((0, 'plan-check: ok (STOP AND REPORT)\n'), self.check(no_oracle + '\n' + verdict + '\n'))
+        oracle_stop = KIMI_PLAN.replace(
+            "- `tests/fixtures/macro-sheet.xlsm` and `crates/xlsx/tests/roundtrip.rs` (sibling code to mirror).",
+            'None in the repo: STOP AND REPORT.')
+        self.assertEqual((0, 'plan-check: ok (STOP AND REPORT)\n'), self.check(oracle_stop))
+
     def test_bold_and_numbered_headings_count(self):
         plan = KIMI_PLAN.replace('## Exact edits', '**Exact edits**').replace('## Pitfalls', '### 4. Pitfalls:')
         self.assertEqual(0, self.check(plan)[0])
@@ -2503,7 +2554,9 @@ class KimiPlanProse(unittest.TestCase):
                        'must fail on the current code', '**side effect**', '**Pitfalls**', '**Done means**',
                        '**every skipped test by name**', 'runs the real-file oracle (the corpus) when one exists',
                        'is lenient: an unknown value falls back to the old behaviour, never to a new hard error',
-                       'cites its source in the repo', 'wb.py" plan-check', 'never implemented as a guess']:
+                       'cites its source in the repo', 'wb.py" plan-check', 'never implemented as a guess',
+                       '**The verdict is a line of its own that starts with `STOP AND REPORT`**',
+                       'is not a verdict']:
             self.assertIn(needle, kimi)
         self.assertLess(kimi.index('plan-check'), kimi.index('Send it as `plan v1`'))
         phase4 = text.split('## Phase 4')[1].split('## Phase 5')[0]
@@ -2527,7 +2580,8 @@ class KimiPlanProse(unittest.TestCase):
         text = self.text('kimi/AGENTS.md')
         for needle in ["**Follow the plan's Exact edits literally**", 'never touch anything under Must not change',
                        '**Never invent a file format, a field id, an offset or a sample.**', '`STOP AND REPORT`',
-                       'implement nothing on a guess', '**every skipped test by name**']:
+                       'implement nothing on a guess', '**every skipped test by name**',
+                       'starts with `STOP AND REPORT`; the phrase inside a restated rule is not a verdict']:
             self.assertIn(needle, text)
 
     def test_the_readme_describes_the_slow_queue(self):

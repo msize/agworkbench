@@ -2239,6 +2239,7 @@ class WaitOnLimit(UsageLimitFixture):
         self.check()
         self.assertEqual(self.clock, self.episode()['probeAt'])
         self.assertNotIn('escalated', self.episode())
+        self.status.assert_called_with('idle', pane_id='codex-pane')       # FIX r1: blocked is over
 
     def test_the_planner_waits_too_and_mail_to_it_is_held_quietly(self):
         self.peer = relay.Peer('claude', 'claude', 'claude-pane')

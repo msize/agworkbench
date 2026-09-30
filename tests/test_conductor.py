@@ -2375,6 +2375,20 @@ class LimitWait(unittest.TestCase):
         self.assertEqual('review', self.member(1)['limitWait']['source'])
         self.assertIn('#1 kimi reviewer usage limit since', self.out())
 
+    def test_a_review_wait_past_its_retry_time_no_longer_gates(self):
+        # FIX r1 M3: a review-limit.json nobody cleaned up must not pin the queue for days.
+        self.report(1, 'blocked', reason='waiting on the human', cause='environment')
+        q.atomic_json(self.state_dir(1) / 'review-limit.json',
+                      {'tool': 'kimi', 'since': self.now - 3600, 'retryAt': self.now + 60, 'round': 2})
+        self.report(2, 'pr-open')
+        self.w.tick(); self.w.tick()
+        self.assertEqual([1, 2], self.launched())
+        self.assertIn('limitWait', self.member(1))
+        self.now += 61
+        self.w.tick(); self.w.tick()
+        self.assertNotIn('limitWait', self.member(1))
+        self.assertEqual([1, 2, 3], self.launched())
+
     def test_a_dead_member_cannot_pin_the_queue(self):
         self.relay_wait(1)
         self.report(2, 'pr-open')

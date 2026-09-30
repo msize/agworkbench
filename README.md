@@ -361,7 +361,9 @@ also re-judges the labelled ones and replaces their label.
 applying the new cap to existing issues without repeatedly taking the oldest 20 open issues.
 `-Watch` opens a visible
 `#triage owner/repo` session that re-scans every 5 minutes; nothing that goes wrong in one scan
-ends it.
+ends it. An issue that keeps failing there is retried with a growing delay, then left alone after
+3 failures, with one notification. Only the watch counts failures: a manual or queue run always
+tries again.
 
 **The `kimi` label** (#77), for a product whose entry has `"kimiLabel": true` (the label must exist on
 the repo): the model also judges whether the issue suits Kimi Code, by fixed rules from the owner's
@@ -375,9 +377,7 @@ unsuitable removes it, and the reason goes to the private log only (`kimi: yes -
 label you set or removed by hand wins: triage keeps the ids of the label events it caused, so
 any other `kimi` event on the issue makes it leave the label alone (`kimi: human override`).
 `-Triage -Retriage -KimiOnly -Repo owner/repo` re-judges only the label, on open P2/P3 issues, with
-no priority change and no public comment. An issue that keeps failing there is retried with a growing delay, then left alone after
-3 failures, with one notification. Only the watch counts failures: a manual or queue run always
-tries again.
+no priority change and no public comment.
 
 **The queue.** Pending members are admitted P0, then P1, then untriaged, then P2, then P3, oldest
 issue first within each. The conductor reads the labels for the whole repo on each refresh, and

@@ -1025,7 +1025,12 @@ class Relay:
             return
         episode.update(probeAt=wall(), misses=0)
         episode.pop('probeRefusedSince', None)
-        episode.pop('escalated', None)
+        if episode.pop('escalated', None):
+            # The pane can take the probe again: the blocked status the escalation set is over.
+            try:
+                agw.set_status('idle', pane_id=peer.pane)
+            except (agw.CtlError, OSError) as err:
+                self.log(f"could not clear blocked status for {peer.box}: {err}")
         self.log(f"usage limit: probed {peer.box} (probe {episode.get('probes', 0) + 1}) [{outcome}]")
 
     def escalate_wait(self, peer: Peer, episode: dict, reason: str) -> None:

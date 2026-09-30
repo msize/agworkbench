@@ -115,20 +115,34 @@ def cmd_revmux(args: argparse.Namespace) -> int:
         raise SystemExit("wb: revmux --after must be 1 or more minutes")
     params = {}
     scope_arg = args.scope
+    renames: list[tuple[Path, Path]] = []
     if args.rerun:
         # A round a reviewer's usage limit stopped (#77): same K, a new revmux run name - revmux refuses a
-        # round that has already run - and the limited report kept beside it.
+        # round that has already run - and the limited report kept beside it. The attempt counts every
+        # limited file, so a rerun that died before its report still gets a fresh run name.
         review = root / ".workbench" / "review"
         report = review / f"revmux-r{args.round}.md"
-        if not report.is_file():
+        earlier = [int(match[1]) for path in review.glob(f"revmux-r{args.round}-limited-*")
+                   if (match := re.fullmatch(rf"revmux-r{args.round}-limited-(\d+)\.(?:md|json)", path.name))]
+        if not report.is_file() and not earlier:
             raise SystemExit(f"wb: revmux --rerun: no report to rerun: {report}")
-        attempt = 1 + sum(1 for _ in review.glob(f"revmux-r{args.round}-limited-*.md"))
-        record = read_run_record(root, args.round)
-        if scope_arg is None and record and isinstance(record.get("scope"), str):
-            scope_arg = record["scope"]
-        report.rename(review / f"revmux-r{args.round}-limited-{attempt}.md")
-        if run_record_path(root, args.round).exists():
-            run_record_path(root, args.round).rename(review / f"revmux-r{args.round}-limited-{attempt}.json")
+        attempt = max(earlier, default=0) + 1
+        # The scope: this round's run record, else the newest limited one (a rerun that died early).
+        records = [read_run_record(root, args.round)]
+        if earlier:
+            try:
+                records.append(json.loads((review / f"revmux-r{args.round}-limited-{max(earlier)}.json")
+                                          .read_text(encoding="utf-8-sig")))
+            except (OSError, ValueError):
+                pass
+        if scope_arg is None:
+            scope_arg = next((record["scope"] for record in records
+                              if isinstance(record, dict) and isinstance(record.get("scope"), str)), None)
+        if report.is_file():
+            renames.append((report, review / f"revmux-r{args.round}-limited-{attempt}.md"))
+            if run_record_path(root, args.round).exists():
+                renames.append((run_record_path(root, args.round),
+                                review / f"revmux-r{args.round}-limited-{attempt}.json"))
         params.update(Run=f"r{args.round}-{attempt}", Attempt=str(attempt))
         if args.after is not None:
             params["After"] = str(args.after)
@@ -139,7 +153,17 @@ def cmd_revmux(args: argparse.Namespace) -> int:
         raise SystemExit(f"wb: scope file not found: {scope}")
     command = pane_command("run-revmux.ps1", Checkout=str(root), ScopeFile=str(scope),
                            Round=str(args.round), Profile=args.profile or revmux_profile(root), **params)
-    sid = open_session(f"#{issue_number(root)} revmux r{args.round}", root, command, select=False)
+    # The limited report is set aside last, and put back when the session does not start.
+    done: list[tuple[Path, Path]] = []
+    try:
+        for source, target in renames:
+            source.rename(target)
+            done.append((source, target))
+        sid = open_session(f"#{issue_number(root)} revmux r{args.round}", root, command, select=False)
+    except BaseException:
+        for source, target in reversed(done):
+            target.rename(source)
+        raise
     wait = f" after a {args.after}-minute wait for the reviewer's usage limit" if args.after else ""
     print(f"revmux round {args.round} running in session {sid}{wait}; the report will arrive as mail")
     return 0
@@ -864,6 +888,9 @@ KIMI_PLAN_SECTIONS = ("Exact edits", "Must not change", "Tests first", "Pitfalls
 STOP_LINE = "STOP AND REPORT"
 PLAN_HEADING = re.compile(r"^\s*(?:#{1,6}\s+(?P<hash>.+?)|\*\*(?P<bold>[^*]+?)\*\*[\s:.-]*)\s*$")
 PLAN_PATH = re.compile(r"(?<![\w/\\])[\w.@-]+(?:[/\\][\w.@-]+)+")
+# A STOP verdict opens its line (after a list bullet, bold or backticks): a plan that restates the rule
+# ("without one, the plan says STOP AND REPORT") in Pitfalls has not said STOP.
+STOP_VERDICT = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)?[*_`]*STOP AND REPORT\b")
 
 
 def plan_sections(text: str) -> dict[str, list[str]]:
@@ -882,6 +909,15 @@ def plan_sections(text: str) -> dict[str, list[str]]:
     return sections
 
 
+def plan_says_stop(text: str) -> bool:
+    """The plan's verdict is STOP: a line opening with the marker, or the Oracle section's first line
+    carrying it ("none in the repo - STOP AND REPORT")."""
+    if any(STOP_VERDICT.match(line) for line in text.splitlines()):
+        return True
+    oracle = next((lines for title, lines in plan_sections(text).items() if title.startswith("oracle")), [])
+    return STOP_LINE in next((line for line in oracle if line.strip()), "")
+
+
 def plan_problems(text: str) -> list[str]:
     sections = plan_sections(text)
 
@@ -895,7 +931,7 @@ def plan_problems(text: str) -> list[str]:
     if done is not None and not re.search(r"\bskipped\b", "\n".join(done), re.I):
         problems.append("Done means does not ask for skipped tests by name")
     oracle = find("Oracle")
-    stop = any(STOP_LINE in line for line in text.splitlines())
+    stop = plan_says_stop(text)
     if not stop and not (oracle and any(PLAN_PATH.search(line) for line in oracle)):
         problems.append(f"no Oracle section naming at least one path, and no {STOP_LINE} line")
     return problems
@@ -920,7 +956,7 @@ def cmd_plan_check(args: argparse.Namespace) -> int:
     if problems:
         print(f"plan-check: {path.name} is not a Kimi-grade plan (start-github-issue.md, Phase 2)")
         return 1
-    print("plan-check: ok" + (f" ({STOP_LINE})" if STOP_LINE in text else ""))
+    print("plan-check: ok" + (f" ({STOP_LINE})" if plan_says_stop(text) else ""))
     return 0
 
 
@@ -1010,7 +1046,7 @@ def review_limit(root: Path, round_: int, agents: list[str]) -> int:
 
 
 def clear_review_limit(root: Path, round_: int) -> None:
-    """A recorded decision other than `limit` for the round a review-limit.json waits on ends that wait."""
+    """A recorded decision other than `limit` for round K ends a wait on round K or an earlier one."""
     path = review_limit_path(root)
     try:
         record = json.loads(path.read_text(encoding="utf-8-sig"))
@@ -1018,7 +1054,8 @@ def clear_review_limit(root: Path, round_: int) -> None:
         return
     except (OSError, ValueError):
         record = None
-    if not isinstance(record, dict) or record.get("round") == round_:
+    waited = record.get("round") if isinstance(record, dict) else None
+    if type(waited) is not int or waited <= round_:
         path.unlink(missing_ok=True)
 
 

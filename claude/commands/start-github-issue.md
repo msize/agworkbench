@@ -350,7 +350,9 @@ headed exactly so:
 - **Must not change** - what the edits must leave alone, listed explicitly.
 - **Oracle** - the fixture, reference file or sibling code that defines correct behaviour, **by
   path**. If the repo has none, the plan says `STOP AND REPORT` and why, instead of an oracle: Kimi
-  must never invent a format or a sample.
+  must never invent a format or a sample. **The verdict is a line of its own that starts with
+  `STOP AND REPORT`** (a list bullet or bold around it is fine), or the Oracle section's first line.
+  The marker inside a sentence, such as a rule restated in Pitfalls, is not a verdict.
 - **Tests first** - named tests to write before the fix. Each must fail on the current code, and at
   least one tests a **side effect** ("an edit to a macro sheet survives save").
 - **Pitfalls** - the known traps in the area: save paths, undo grouping, unit conversions, shared code
