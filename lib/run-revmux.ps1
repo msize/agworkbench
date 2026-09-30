@@ -101,8 +101,10 @@ if ($postExit -eq 0) {
     $doneArgs = @((Join-Path $script:Lib 'helper_done.py'), '--hub', $hubDir, '--kind', 'revmux', '--round', "$Round")
     if ($null -ne $code) { $doneArgs += @('--exit', "$code") }
     # The mail that carries the result (#84): the relay closes this session once Claude has read it.
-    # Only a posted report is a result; a failed round keeps its session, the only record of the error.
-    if ($posted -and $mail) { $doneArgs += @('--mail', $mail, '--to', 'claude') }
+    # Only a posted report of a review that ran (exit 0 clean, 1 findings) is a result. A round that
+    # failed, or whose review run was a tool error, keeps its session: its pane holds revmux's stderr,
+    # the only record of the error. The tool-error mail is still posted; it is just not a result.
+    if ($posted -and $mail -and ($code -eq 0 -or $code -eq 1)) { $doneArgs += @('--mail', $mail, '--to', 'claude') }
     & python @doneArgs
 }
 if (-not $posted) { exit 1 }

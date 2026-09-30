@@ -56,8 +56,9 @@ class HelperScripts(unittest.TestCase):
         self.assertEqual(('helper', 'note'), (mail['from'], mail['kind']))
         self.assertEqual('revmux round 2: ended without a report (it did not finish)', mail['subject'])
 
-    def stub_revmux(self):
-        """A revmux that records its argv, answers `new` with its paths and a round with a clean report."""
+    def stub_revmux(self, review_exit=0):
+        """A revmux that records its argv, answers `new` with its paths and a round with a clean report
+        (and exit `review_exit`)."""
         stub = self.bin / 'revmux_stub.py'
         stub.write_text(
             'import json, sys, pathlib\n'
@@ -68,7 +69,8 @@ class HelperScripts(unittest.TestCase):
             '    d = root / "tasks" / run; (d / "input").mkdir(parents=True, exist_ok=True)\n'
             '    print(json.dumps({"round_dir": str(d), "scope": str(d / "input" / "scope.md")}))\n'
             'else:\n'
-            '    print("# Review\\n\\nNo findings.\\n\\n## Sources\\n\\n| agent | status |\\n| --- | --- |\\n| a | ok |")\n',
+            '    print("# Review\\n\\nNo findings.\\n\\n## Sources\\n\\n| agent | status |\\n| --- | --- |\\n| a | ok |")\n'
+            f'    sys.exit({review_exit})\n',
             encoding='utf-8')
         (self.bin / 'revmux.cmd').write_text(f'@"{sys.executable}" "{stub}" %*\r\n', encoding='utf-8')
 
@@ -115,6 +117,21 @@ class HelperScripts(unittest.TestCase):
         marker = self.marker('p-rev')
         self.assertEqual(('revmux', 2, mid, 'claude'), (marker['kind'], marker['round'], marker['mail'], marker['to']))
         self.assertIn(f'posted {mid}.md -> claude', done.stdout)            # still echoed to the pane
+
+    def test_a_tool_errors_marker_names_no_mail(self):
+        # #84 r2: `revmux new` worked but the review run exited 2 - the tool-error mail is posted, but it
+        # is not a result, and revmux's stderr lives only in the pane.
+        self.stub_revmux(review_exit=2)
+        scope = self.checkout / 'scope.md'
+        scope.write_text('scope', encoding='utf-8')
+        done = self.run_script('run-revmux.ps1', '-ScopeFile', str(scope), '-Round', '2', pane='p-tool')
+        self.assertEqual(0, done.returncode, done.stdout + done.stderr)
+        [mail] = self.mails()
+        self.assertEqual('revmux round 2: tool error (exit 2)', mail['subject'])
+        marker = self.marker('p-tool')
+        self.assertEqual(2, marker['exit'])
+        self.assertNotIn('mail', marker)
+        self.assertNotIn('to', marker)
 
     def test_a_failed_rounds_marker_names_no_mail(self):
         # #84 r1: the fallback note is not a result - it sends the planner to this session - so the
