@@ -3354,6 +3354,23 @@ class IdleNotice(unittest.TestCase):
         self.rescan(worker)                               # the scan works: the queue really is empty
         self.assertEqual(1, len(self.idle_lines()))
 
+    def test_a_failed_rescan_does_not_repeat_the_idle_line(self):
+        # #82 r1: announced, then a passing 502, then a working scan: still one line, not one per error.
+        self.start(self.SPEC, repo='o/r', gh=self.gh, watch=True)
+        with self.store.transaction() as data:
+            data['members'] = []
+        self.pages = [[]]
+        worker = self.worker()
+        worker.tick()
+        self.assertEqual(1, len(self.idle_lines()))
+        self.scan_error = 'HTTP 502'
+        self.rescan(worker)
+        self.assertIn('label scan', worker.errors)
+        self.scan_error = None
+        self.rescan(worker)
+        self.assertNotIn('label scan', worker.errors)
+        self.assertEqual(1, len(self.idle_lines()))
+
 
 class Specs(unittest.TestCase):
     def test_lists_and_repositories(self):
