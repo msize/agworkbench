@@ -370,18 +370,25 @@ ends it. An issue that keeps failing there is retried with a growing delay, then
 tries again.
 
 **The `kimi` label** (#77), for a product whose entry has `"kimiLabel": true` (the label must exist on
-the repo): the model also judges whether the issue suits Kimi Code, by fixed rules from the owner's
-evaluation. It is suitable only when it is P2 or P3, self-contained (one crate or a small area),
-checkable against something already in the repo (tests, fixtures, an oracle file, sibling code), a
-narrow fix or a small feature, and without data-loss risk on save or open. It is not suitable when
-it depends on an outside file-format spec or real samples the repo lacks, touches save or serialise
-paths, spans several crates or the UI and the harness together, is an umbrella or a batch, or is P0
-or P1. triage.py enforces the P0/P1 rule and the deterministic P0 path itself. Suitable adds `kimi`,
-unsuitable removes it, and the reason goes to the private log only (`kimi: yes - ...`). A `kimi`
-label you set or removed by hand wins: triage keeps the ids of the label events it caused, so
-any other `kimi` event on the issue makes it leave the label alone (`kimi: human override`).
-`-Triage -Retriage -KimiOnly -Repo owner/repo` re-judges only the label, on open P2/P3 issues, with
-no priority change and no public comment.
+the repo): the model also judges whether the issue suits Kimi Code, by named rules from the owner's
+evaluation (#82), and answers with the one that decided it (`kimiRule`). Excluded, checked first:
+`p0-p1`, `save-path` (save, serialise or data-loss paths), `outside-format` (outside file-format or
+interop work without an in-repo oracle), `umbrella-batch` (umbrellas, batches, and a leftovers list
+that spans more than one area), `new-subsystem` (new subsystems, large features such as a whole new
+editor), `multi-crate`, `no-oracle`, and `not-narrow` (no allowed rule fits). Allowed, for a P2 or
+P3 issue no exclusion holds for: `narrow-fix` (one crate or a small area, checkable against tests,
+fixtures, an oracle file or sibling code), `leftovers-one-area` (a `Leftovers from #N` list whose items
+all sit in one crate or area, none on a save path), `harness-two-crates` (uiharness verbs or one
+app's control surface on at most 2 crates, the second only the verb's thin host side) and
+`ui-single-view` (a small UI/UX fix in one view). triage.py enforces the P0/P1 rule and the
+deterministic P0 path itself, and an answer whose rule contradicts its verdict is not suitable.
+Suitable adds `kimi`, unsuitable removes it, and the reason goes to the private log only
+(`kimi: yes (leftovers-one-area) - ...`). A `kimi` label you set or removed by hand wins: triage
+keeps the ids of the label events it caused, so any other `kimi` event on the issue makes it leave
+the label alone (`kimi: human override`). `-Triage -Retriage -KimiOnly -Repo owner/repo` re-judges
+only the label, on open P2/P3 issues, with no priority change and no public comment, and ends with
+`kimi: N labelled, M cleared, K kept (human)` (`, U unchanged` and `, F failed` when there are any;
+a dry run says `kimi (dry run): N would be yes, M would be no`).
 
 **The queue.** Pending members are admitted P0, then P1, then untriaged, then P2, then P3, oldest
 issue first within each. The conductor reads the labels for the whole repo on each refresh, and
