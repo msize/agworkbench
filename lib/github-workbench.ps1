@@ -28,6 +28,7 @@
   github-workbench 7 -AutoMerge           # the planner merges its own PR when every condition holds
   github-workbench 7 -Failover            # the planner, on a usage-limit mail: switch the implementer tool
   github-workbench 7 -Autonomous          # merge, file follow-ups and close the sessions without the human
+  github-workbench 7 -BigReview           # a big issue: up to review.maxRoundsBig (10) revmux rounds (#75)
 .EXAMPLE
   github-workbench -Queue 'yeroo/agworkbench#7,10' -Parallel 2
 .EXAMPLE
@@ -80,6 +81,8 @@ param(
     [switch] $Failover,
     [switch] $Autonomous,
     [switch] $NoAutonomous,
+    [switch] $BigReview,
+    [switch] $NoBigReview,
     [switch] $Triage,
     [switch] $Retriage,
     [switch] $FollowUps,
@@ -227,6 +230,14 @@ if ($AutoMerge -and $NoAutoMerge) {
 $autoMergeChoice = $null
 if ($AutoMerge) { $autoMergeChoice = $true }
 if ($NoAutoMerge) { $autoMergeChoice = $false }
+if ($BigReview -and $NoBigReview) {
+    Write-Host '-BigReview and -NoBigReview cannot be combined.' -ForegroundColor Yellow
+    exit 2
+}
+# $null leaves the checkout's saved choice alone (#75).
+$bigReviewChoice = $null
+if ($BigReview) { $bigReviewChoice = $true }
+if ($NoBigReview) { $bigReviewChoice = $false }
 
 if ($PSBoundParameters.ContainsKey('Queue')) {
     if ($FollowUps -or ($Prune -and -not $Watch)) {
@@ -257,6 +268,8 @@ if ($PSBoundParameters.ContainsKey('Queue')) {
     if ($NoAutoMerge) { $queueArgs += '--no-auto-merge' }
     if ($Autonomous) { $queueArgs += '--autonomous' }
     if ($NoAutonomous) { $queueArgs += '--no-autonomous' }
+    if ($BigReview) { $queueArgs += '--big-review' }
+    if ($NoBigReview) { $queueArgs += '--no-big-review' }
     if ($Triage) { $queueArgs += '--triage' }
     if ($Retriage -or $PSBoundParameters.ContainsKey('Limit')) {
         Write-Host '-Retriage and -Limit belong to -Triage without -Queue; a queue triages each untriaged member once.' -ForegroundColor Yellow
@@ -274,7 +287,7 @@ if ($PSBoundParameters.ContainsKey('Queue')) {
 if ($Triage -or $Retriage) {
     # Issue triage (#34): lib/triage.py labels the repo's open issues priority:P0..P3.
     if (-not $Repo -or $Issue -or $NewSession -or $NoRelay -or $QueueMember -or $Retry -or $Implementer -or
-        $PSBoundParameters.ContainsKey('Parallel') -or $AutoMerge -or $NoAutoMerge -or $Autonomous -or $NoAutonomous -or
+        $PSBoundParameters.ContainsKey('Parallel') -or $AutoMerge -or $NoAutoMerge -or $Autonomous -or $NoAutonomous -or $BigReview -or $NoBigReview -or
         $Failover -or $Prune -or ($FollowUps -and $Watch) -or
         ($PSBoundParameters.ContainsKey('Limit') -and $Limit -lt 1) -or ($Watch -and ($Retriage -or $DryRun))) {
         Write-Host 'usage: github-workbench -Triage|-Retriage -Repo owner/name [-Limit N] [-DryRun] [-FollowUps] | -Triage -Repo owner/name -Watch' -ForegroundColor Yellow
@@ -301,10 +314,10 @@ if ($PSBoundParameters.ContainsKey('Parallel') -or $Watch -or $Retry -or $Prune 
 }
 
 if (-not $Issue) {
-    Write-Host "usage: github-workbench <issue> [-Repo owner/name] [-DryRun] [-Yes] [-NewSession] [-Implementer codex|claude|kimi] [-AutoMerge|-NoAutoMerge] [-Autonomous|-NoAutonomous] [-Failover]" -ForegroundColor Yellow
+    Write-Host "usage: github-workbench <issue> [-Repo owner/name] [-DryRun] [-Yes] [-NewSession] [-Implementer codex|claude|kimi] [-AutoMerge|-NoAutoMerge] [-Autonomous|-NoAutonomous] [-BigReview|-NoBigReview] [-Failover]" -ForegroundColor Yellow
     Write-Host "       github-workbench -Version"
     Write-Host "       (<spec> is a list like 3,4,5, label:<name>, bugs = label:<bugLabel>, or where: <label query>)"
-    Write-Host "       github-workbench -Queue <spec> [-Repo owner/name] [-Parallel 1..8] [-Watch] [-Prune] [-Retry] [-Yes] [-DryRun] [-Implementer codex|claude|kimi] [-ClearLimit codex|claude|kimi] [-AutoMerge|-NoAutoMerge] [-Autonomous|-NoAutonomous] [-Triage] [-RevmuxProfile <profile>] [-QueueName <name> [-Workspace <ws>]]"
+    Write-Host "       github-workbench -Queue <spec> [-Repo owner/name] [-Parallel 1..8] [-Watch] [-Prune] [-Retry] [-Yes] [-DryRun] [-Implementer codex|claude|kimi] [-ClearLimit codex|claude|kimi] [-AutoMerge|-NoAutoMerge] [-Autonomous|-NoAutonomous] [-BigReview|-NoBigReview] [-Triage] [-RevmuxProfile <profile>] [-QueueName <name> [-Workspace <ws>]]"
     Write-Host "       github-workbench -Triage|-Retriage -Repo owner/name [-Limit N] [-DryRun] [-FollowUps] [-Watch]"
     Write-Host "       github-workbench -Cleanup [-Repo owner/name] [-DryRun] [-BuildOnly]"
     Write-Host "  <issue> is 123, owner/repo#123, or https://github.com/owner/repo/issues/123"
@@ -341,7 +354,7 @@ if ($QueueMember) {
         Enable-LaunchLog
         $ok = Invoke-LaunchSafely {
             Invoke-LauncherBody -Issue $Issue -Repo $Repo -Yes:$Yes -NewSession -Implementer $Implementer -AutoMerge $autoMergeChoice `
-                -Autonomous $autonomousChoice -RevmuxProfile $RevmuxProfile
+                -Autonomous $autonomousChoice -RevmuxProfile $RevmuxProfile -BigReview $bigReviewChoice
         }
         $outcome = 'ok'
         if (-not $ok) { $outcome = 'failed' }
@@ -399,7 +412,8 @@ if ($QueueMember) {
 if ($DryRun) { Disable-LaunchLog } else { Enable-LaunchLog }
 if (-not (Invoke-LaunchSafely {
     Invoke-LauncherBody -Issue $Issue -Repo $Repo -DryRun:$DryRun -Yes:$Yes -NoRelay:$NoRelay -NewSession:$NewSession `
-        -Implementer $Implementer -AutoMerge $autoMergeChoice -Failover:$Failover -Autonomous $autonomousChoice
+        -Implementer $Implementer -AutoMerge $autoMergeChoice -Failover:$Failover -Autonomous $autonomousChoice `
+        -BigReview $bigReviewChoice
 })) { exit $script:Launch.ExitCode }
 if ($script:Launch.ClaudeHerePending -and -not $DryRun) {
     Invoke-ClaudeHere -Checkout $script:Launch.Checkout -Issue $script:Launch.IssueRef

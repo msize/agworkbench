@@ -1103,10 +1103,12 @@ function Resolve-Implementer {
        explicit -AutoMerge / -NoAutoMerge ($RequestedAutoMerge true/false) changes it, with no pane check.
        Autonomy (#27) is policy too, and implies auto-merge: an autonomous checkout cannot be told
        -NoAutoMerge (use -NoAutonomous); -NoAutonomous alone leaves auto-merge as saved.
-       Returns @{ Tool; RevmuxProfile; AutoMerge; Autonomous; Conflict }, Conflict being a refusal
+       Big review (#75) is policy as well: off unless saved, and -BigReview / -NoBigReview
+       ($RequestedBigReview true/false) changes it.
+       Returns @{ Tool; RevmuxProfile; AutoMerge; Autonomous; BigReview; Conflict }, Conflict being a refusal
        message or $null. #>
     param([string] $Checkout, [string] $Requested, $Config, $Tree, [switch] $NoProbe, $RequestedAutoMerge = $null,
-          $RequestedAutonomous = $null, [string] $RequestedRevmuxProfile)
+          $RequestedAutonomous = $null, [string] $RequestedRevmuxProfile, $RequestedBigReview = $null)
     if ($Requested -and -not (Test-ImplementerTool $Requested)) { throw [ImplementerConflict]::new("-Implementer must be codex, claude or kimi (got '$Requested')") }
     $saved = Get-SavedImplementerTool $Checkout
     $tool = $Config.implementer
@@ -1140,11 +1142,15 @@ function Resolve-Implementer {
         }
         $autoMerge = $true
     }
+    $bigReview = $false
+    $savedBigReview = Get-SavedSetting $Checkout 'bigReview'
+    if ($null -ne $savedBigReview) { $bigReview = $savedBigReview }
+    if ($null -ne $RequestedBigReview) { $bigReview = [bool]$RequestedBigReview }
     # A queue's explicit profile (#66) wins over the config's; it comes with a conductor launch only.
     $chosenProfile = $Config.revmuxProfile
     if ($RequestedRevmuxProfile) { $chosenProfile = $RequestedRevmuxProfile }
     return @{ Tool = $tool; RevmuxProfile = (Get-RevmuxProfile $tool $chosenProfile); AutoMerge = $autoMerge;
-              Autonomous = $autonomous; Cleanup = [string]$Config.cleanup; Conflict = $conflict }
+              Autonomous = $autonomous; BigReview = $bigReview; Cleanup = [string]$Config.cleanup; Conflict = $conflict }
 }
 
 function Get-SavedSetting([string] $Checkout, [string] $Name) {
@@ -1159,13 +1165,13 @@ function Get-SavedSetting([string] $Checkout, [string] $Name) {
 
 function Save-Implementer([string] $Checkout, $Resolved) {
     # state\implementer.json is the checkout's settings record: the implementer tool (#20), its
-    # revmux profile, and auto-merge (#23). wb.py reads it for the planner. `cleanup` (#41) is the
+    # revmux profile, auto-merge (#23) and big review (#75). wb.py reads it for the planner. `cleanup` (#41) is the
     # config's, recorded at each launch: the relay runs in its own session and never sees the config.
     $path = Get-ImplementerStatePath $Checkout
     $cleanup = 'merged'
     if ($Resolved.Cleanup) { $cleanup = [string]$Resolved.Cleanup }
     $record = [pscustomobject]@{ tool = $Resolved.Tool; revmuxProfile = $Resolved.RevmuxProfile; autoMerge = [bool]$Resolved.AutoMerge;
-                                 autonomous = [bool]$Resolved.Autonomous; cleanup = $cleanup }
+                                 autonomous = [bool]$Resolved.Autonomous; bigReview = [bool]$Resolved.BigReview; cleanup = $cleanup }
     if (Test-Path -LiteralPath $path) {
         try {
             $current = Get-Content -Raw -LiteralPath $path -Encoding UTF8 | ConvertFrom-Json
@@ -1174,11 +1180,12 @@ function Save-Implementer([string] $Checkout, $Resolved) {
             if ($current.tool -ceq $record.tool -and $current.revmuxProfile -ceq $record.revmuxProfile -and
                 $current.autoMerge -is [bool] -and $current.autoMerge -eq $record.autoMerge -and
                 $current.autonomous -is [bool] -and $current.autonomous -eq $record.autonomous -and
+                $current.bigReview -is [bool] -and $current.bigReview -eq $record.bigReview -and
                 $current.cleanup -ceq $record.cleanup) { return }
         } catch { Write-LaunchLog implementer "replacing unreadable '$path': $_" }
     }
     Write-AtomicJson $path $record
-    Write-Step "implementer: $($record.tool) (revmux profile $($record.revmuxProfile)); auto-merge $(Format-AutoMerge $record.autoMerge); autonomous $(Format-AutoMerge $record.autonomous)"
+    Write-Step "implementer: $($record.tool) (revmux profile $($record.revmuxProfile)); auto-merge $(Format-AutoMerge $record.autoMerge); autonomous $(Format-AutoMerge $record.autonomous); big review $(Format-AutoMerge $record.bigReview)"
 }
 
 function Format-AutoMerge([bool] $Value) {
@@ -2181,7 +2188,8 @@ function Format-AdoptedBlock([string] $Checkout, [string] $Issue) {
 
 function Invoke-LauncherBody {
     param([string] $Issue, [string] $Repo, [switch] $DryRun, [switch] $Yes, [switch] $NoRelay, [switch] $NewSession,
-          [string] $Implementer, $AutoMerge = $null, [switch] $Failover, $Autonomous = $null, [string] $RevmuxProfile)
+          [string] $Implementer, $AutoMerge = $null, [switch] $Failover, $Autonomous = $null, [string] $RevmuxProfile,
+          $BigReview = $null)
     $script:Launch.ClaudeHerePending = $false
     $script:Launch.ExitCode = 0
     $script:Launch.NewSession = [bool]$NewSession
@@ -2271,7 +2279,7 @@ function Invoke-LauncherBody {
     }
     if ($DryRun) {
         $resolved = Resolve-Implementer -Checkout $co.Dir -Requested $Implementer -Config $config -NoProbe -RequestedAutoMerge $AutoMerge -RequestedAutonomous $Autonomous `
-            -RequestedRevmuxProfile $RevmuxProfile
+            -RequestedRevmuxProfile $RevmuxProfile -RequestedBigReview $BigReview
         $codexLaunch = (& $implementerLines $resolved.Tool).Launch
         if ($adoptionPlan) {
             Write-Step "would $($adoptionPlan.Mode) session '$($adoptionPlan.Session.id)' as '#$($ref.Number) $slug' in workspace '$workspaceName'"
@@ -2281,7 +2289,7 @@ function Invoke-LauncherBody {
             Write-Step "would open session '#$($ref.Number) $slug' in workspace '$workspaceName'"
             Write-Step "left pane:  $claudeLaunch"
         }
-        Write-Step "implementer: $($resolved.Tool) (revmux profile $($resolved.RevmuxProfile)); auto-merge $(Format-AutoMerge $resolved.AutoMerge); autonomous $(Format-AutoMerge $resolved.Autonomous)"
+        Write-Step "implementer: $($resolved.Tool) (revmux profile $($resolved.RevmuxProfile)); auto-merge $(Format-AutoMerge $resolved.AutoMerge); autonomous $(Format-AutoMerge $resolved.Autonomous); big review $(Format-AutoMerge $resolved.BigReview)"
         if ($resolved.Conflict) { Write-Step "would refuse unless the right pane is a shell: $($resolved.Conflict)" }
         if ($Failover) {
             $choice = Get-FailoverTarget -Checkout $co.Dir -Config $config -Saved $resolved.Tool -NoProbe
@@ -2325,7 +2333,7 @@ function Invoke-LauncherBody {
             Set-LaunchStage implementer
         }
         $resolved = Resolve-Implementer -Checkout $co.Dir -Requested $Implementer -Config $config -Tree (Get-Tree) -RequestedAutoMerge $AutoMerge -RequestedAutonomous $Autonomous `
-            -RequestedRevmuxProfile $RevmuxProfile
+            -RequestedRevmuxProfile $RevmuxProfile -RequestedBigReview $BigReview
         if ($resolved.Conflict) { throw [ImplementerConflict]::new($resolved.Conflict) }
         # Kimi is checked before anything is recorded, so a refusal changes nothing (#65). A failover
         # to kimi checked it before it stopped the limited agent.
