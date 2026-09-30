@@ -236,7 +236,7 @@ def cmd_settings(args: argparse.Namespace) -> int:
         review_line = (f"stopWhenNoMajor={'true' if review['stopWhenNoMajor'] else 'false'} "
                        f"minRounds={review['minRounds']}")
         # Seeing an issue big here is a moment it is judged big (#75): latching only ever raises the cap.
-        cap = review_cap(checkout(), review, latch=True)
+        cap = review_cap(checkout(), review)
         cap_line = f"reviewCap={cap['cap']}" + (f" (big: {cap['reason']})" if cap["big"] else "")
     except followup.SettingsError:
         review_line = "stopWhenNoMajor=invalid minRounds=invalid"    # review-round refuses with the reason
@@ -685,13 +685,13 @@ def latched_big(root: Path) -> str | None:
     return str(record.get("reason") or "judged big earlier")
 
 
-def review_cap(root: Path, settings: dict, *, latch: bool) -> dict:
-    """{"cap", "big", "reason"}. With latch, a big verdict is recorded once and stays: a diff that
+def review_cap(root: Path, settings: dict) -> dict:
+    """{"cap", "big", "reason"}. A big verdict is recorded once and stays: a diff that
     shrinks later, a label removed or -NoBigReview does not lower the cap of an issue judged big."""
     reason = latched_big(root)
     if reason is None:
         reason = judge_big(root, settings)
-        if reason is not None and latch:
+        if reason is not None:
             from conductor import atomic_json
             atomic_json(review_big_path(root), {"big": True, "reason": reason, "at": time.time()})
     big = reason is not None
@@ -773,7 +773,7 @@ def cmd_review_round(args: argparse.Namespace) -> int:
     except followup.SettingsError as err:
         print(f"wb: review-round: {err}", file=sys.stderr)
         return 2
-    cap = review_cap(root, settings, latch=True)
+    cap = review_cap(root, settings)
     settings = {**settings, "cap": cap["cap"]}
     report = Path(args.report or f".workbench/review/revmux-r{args.round}.md")
     report = report if report.is_absolute() else root / report

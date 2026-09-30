@@ -735,8 +735,9 @@ round's fix is the last, its Minor findings are fixed if cheap and otherwise go 
 The review cap is `review.maxRounds` (5), or `review.maxRoundsBig` (10) for a big issue (#75): its title
 starts with `Batch:`, it has a `batch` or `big` label, its diff against the base passes
 `review.bigDiffLines` (1500 lines added + deleted) when a round is recorded, or its checkout was launched
-with `-BigReview` (`-Queue <spec> -BigReview` for every member; `-NoBigReview` turns it off). An issue
-judged big stays big; `wb.py settings` prints `reviewCap=<n>` and why, e.g.
+with `-BigReview` (`-Queue <spec> -BigReview` for every member). An issue judged big stays big, by the flag
+too: `-NoBigReview` clears the flag for later launches, but once `wb.py settings` or `review-round` has
+seen the issue big it keeps the big cap. `wb.py settings` prints `reviewCap=<n>` and why, e.g.
 `reviewCap=10 (big: diff 1623 lines > 1500 vs origin/main)`.
 A degraded round never stops review. The planner files a stop's deferred minors right after it
 opens the PR, whether or not auto-merge is on. `wb.py review-round --summary` prints the line the PR body and

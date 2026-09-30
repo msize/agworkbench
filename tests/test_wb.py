@@ -1782,6 +1782,11 @@ class ReviewCapSources(unittest.TestCase):
         self.assertEqual((5, 'origin/trunk'), wb.diff_lines(self.folder))
 
     def test_diff_lines_reads_only_the_checkouts_own_git(self):
+        # the enclosing repo is measurable, so without --git-dir git would find it and count its diff
+        self.commit({'a.txt': 'one\n'}, 'base')
+        git(self.folder, 'update-ref', 'refs/remotes/origin/main', 'HEAD')
+        self.commit({'a.txt': 'one\ntwo\n'}, 'work')
+        self.assertEqual((1, 'origin/main'), wb.diff_lines(self.folder))
         inner = self.folder / 'not a checkout'
         inner.mkdir()
         self.assertIsNone(wb.diff_lines(inner))
