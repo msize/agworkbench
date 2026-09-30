@@ -1,6 +1,7 @@
 """Triage (#34) with a fake gh, git and model at the process boundary. Nothing calls GitHub or a model."""
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -57,6 +58,9 @@ class TriageCase(unittest.TestCase):
         self.answers = {}                   # number -> a model answer (dict), or a CompletedProcess
         self.calls, self.model_calls, self.git_calls, self.out = [], [], [], []
         self.failing = {}                      # a gh call prefix -> the CompletedProcess it returns
+        self.events = {}                       # issue number -> pages of its issue events (#77)
+        self.unlisted = {}                     # issue number -> event ids the next events read leaves out
+        self.next_event = 1000
 
     # --- fakes ----------------------------------------------------------------------------------
     def gh(self, *args, timeout=None):
@@ -76,6 +80,12 @@ class TriageCase(unittest.TestCase):
             return done()
         if args[0] == 'api':
             path = args[1]
+            events = re.fullmatch(rf'repos/{PRODUCT}/issues/(\d+)/events\?per_page=100', path)
+            if events:
+                self.assertEqual(('--paginate', '--slurp'), args[2:4])
+                listed = self.events.get(int(events[1]), [[]])
+                hidden = self.unlisted.pop(int(events[1]), set())    # GitHub lists a new event late
+                return done(0, json.dumps([[e for e in page if e['id'] not in hidden] for page in listed]))
             for repo, issues in [(PRODUCT, self.product), *self.spec.items()]:
                 if path.startswith(f'repos/{repo}/issues?'):
                     return done(0, json.dumps([issues]))
@@ -84,9 +94,32 @@ class TriageCase(unittest.TestCase):
                     return done(0, json.dumps(next(i for i in issues if i['number'] == n)))
         if args[:2] == ('issue', 'create'):
             return done(0, f'https://github.com/{args[args.index("--repo") + 1]}/issues/99\n')
+        if args[:2] == ('issue', 'edit') and args[args.index('--repo') + 1] == PRODUCT:
+            # GitHub records a labeled/unlabeled event per label change; the kimi ones matter (#77).
+            number = int(args[2])
+            target = next(i for i in self.product if i['number'] == number)
+            for flag, kind in (('--add-label', 'labeled'), ('--remove-label', 'unlabeled')):
+                for i, arg in enumerate(args):
+                    if arg == flag and args[i + 1] == 'kimi':
+                        self.event(number, kind)
+                        if kind == 'labeled':
+                            target['labels'].append({'name': 'kimi'})
+                        else:
+                            target['labels'] = [l for l in target['labels'] if l['name'] != 'kimi']
+            return done()
         if args[:2] in (('issue', 'edit'), ('issue', 'comment')):
             return done()
         raise AssertionError(f'unexpected gh call {args}')
+
+    def event(self, number, kind, label='kimi'):
+        """An issue event on the last page; a new page after every 30 (GitHub's default page size)."""
+        pages = self.events.setdefault(number, [[]])
+        if len(pages[-1]) >= 30:
+            pages.append([])
+        self.next_event += 1
+        pages[-1].append({'id': self.next_event, 'event': kind, 'label': {'name': label},
+                          'created_at': '1970-01-01T00:16:40Z'})            # the triage clock's 1000.0
+        return self.next_event
 
     def git(self, *args, timeout=None):
         self.git_calls.append(args)
@@ -129,7 +162,10 @@ class Config(TriageCase):
 
     def test_a_valid_entry_is_found_by_repo_name_in_any_case(self):
         path = self.write({'bugLabel': 'defect', 'triage': {'Yeroo/Docxy': {'specRepos': [PROJECT], 'model': 'sonnet'}}})
-        self.assertEqual(dict(specRepos=[PROJECT], model='sonnet', bugLabel='defect'), t.load_config(path, PRODUCT))
+        self.assertEqual(dict(specRepos=[PROJECT], model='sonnet', bugLabel='defect', kimiLabel=False),
+                         t.load_config(path, PRODUCT))
+        path = self.write({'triage': {PRODUCT: {'specRepos': [PROJECT], 'kimiLabel': True}}})
+        self.assertIs(True, t.load_config(path, PRODUCT)['kimiLabel'])
 
     def test_invalid_entries_are_refused(self):
         for value in ({}, {'triage': []}, {'triage': {'o/other': {'specRepos': [PROJECT]}}},
@@ -137,7 +173,9 @@ class Config(TriageCase):
                       {'triage': {PRODUCT: {'specRepos': ['not a repo']}}},
                       {'triage': {PRODUCT: {'specRepos': [PROJECT, PROJECT.upper()]}}},
                       {'triage': {PRODUCT: {'specRepos': [PROJECT], 'model': 'x; rm'}}},
-                      {'bugLabel': 'bug,regression', 'triage': {PRODUCT: {'specRepos': [PROJECT]}}}):
+                      {'bugLabel': 'bug,regression', 'triage': {PRODUCT: {'specRepos': [PROJECT]}}},
+                      {'triage': {PRODUCT: {'specRepos': [PROJECT], 'kimiLabel': 'yes'}}},
+                      {'triage': {PRODUCT: {'specRepos': [PROJECT], 'kimiLabel': 1}}}):
             with self.subTest(value=value), self.assertRaises(t.ConfigError):
                 t.load_config(self.write(value), PRODUCT)
 
@@ -552,6 +590,165 @@ class Writing(TriageCase):
         self.assertFalse((self.folder / 'state' / 'yeroo' / 'docxy.json').exists())
 
 
+def kimi_answer(priority='P2', suitable=True, reason='one crate, fixtures in tests/', **kwargs):
+    return dict(answer(priority, **kwargs), kimiSuitable=suitable, kimiReason=reason)
+
+
+class KimiLabel(TriageCase):
+    """#77: with "kimiLabel": true triage also judges whether an issue suits Kimi and sets or clears the
+    `kimi` label; P0/P1 never suits; a human's kimi label wins; --kimi-only judges nothing else."""
+
+    def setUp(self):
+        super().setUp()
+        self.config['kimiLabel'] = True
+        self.product.append(issue(30, 'Unreferenced', created='2026-01-06'))     # no spec floor
+        self.answers = {n: kimi_answer() for n in (7, 10, 12, 20, 30, 100)}
+
+    def kimi_change(self, number):
+        for args, _ in self.public():
+            if args[:2] == ('issue', 'edit') and int(args[2]) == number and 'kimi' in args:
+                return args[args.index('kimi') - 1]
+        return None
+
+    def log_for(self, number):
+        return [body for args, body in self.private() if args[:2] == ('issue', 'comment') and f'{PRODUCT}#{number} ' in body]
+
+    def test_the_schema_and_prompt_ask_for_kimi_only_when_on(self):
+        self.triage().run_once(numbers=[12])
+        argv, facts = self.model_calls[-1][1], self.model_calls[-1][3]
+        schema = json.loads(argv[argv.index('--json-schema') + 1])
+        self.assertEqual([*t.SCHEMA['required'], 'kimiSuitable', 'kimiReason'], schema['required'])
+        self.assertEqual((True, False), (facts['kimiLabel'], facts['kimiOnly']))
+        self.config['kimiLabel'] = False
+        self.answers[12] = answer()
+        self.triage().run_once(numbers=[12], retriage=True)
+        argv, facts = self.model_calls[-1][1], self.model_calls[-1][3]
+        self.assertEqual(t.SCHEMA, json.loads(argv[argv.index('--json-schema') + 1]))
+        self.assertFalse(facts['kimiLabel'])
+        self.assertIsNone(self.kimi_change(12))
+
+    def test_an_answer_without_the_kimi_fields_fails_the_issue(self):
+        self.answers[12] = answer('P2')
+        self.assertEqual(1, self.triage().run_once(numbers=[12]))
+        self.assertEqual([], self.public())
+
+    def test_suitable_adds_kimi_and_the_reason_stays_private(self):
+        self.answers[30] = kimi_answer('P2', reason='PRIVATE RATIONALE: one crate')
+        self.assertEqual(0, self.triage().run_once(numbers=[30]))
+        self.assertEqual('--add-label', self.kimi_change(30))
+        [log] = self.log_for(30)
+        self.assertIn('kimi: yes - PRIVATE RATIONALE: one crate', log)
+        for args, body in self.public():
+            self.assertNotIn('PRIVATE RATIONALE', ' '.join(args) + (body or ''))
+            if args[:2] == ('issue', 'comment'):
+                self.assertIn(body, t.PUBLIC_COMMENTS)
+        self.assertEqual({'30': [1001]}, json.loads((self.folder / 'state/yeroo/docxy.kimi.json').read_text())['issues'])
+
+    def test_unsuitable_removes_a_kimi_label_triage_set(self):
+        self.triage().run_once(numbers=[30])                             # triage sets it
+        self.calls.clear()
+        self.answers[30] = kimi_answer('P3', suitable=False, reason='touches the save path')
+        self.assertEqual(0, self.triage().run_once(numbers=[30], retriage=True))
+        self.assertEqual('--remove-label', self.kimi_change(30))
+        self.assertIn('kimi: no - touches the save path', self.log_for(30)[0])
+        self.assertEqual([1001, 1002], json.loads((self.folder / 'state/yeroo/docxy.kimi.json').read_text())['issues']['30'])
+
+    def test_an_own_event_github_lists_late_is_still_ours(self):
+        real = self.event
+
+        def late(number, kind, label='kimi'):
+            made = real(number, kind, label)
+            if label == 'kimi':
+                self.unlisted[number] = {made}          # missing from the read-back right after the edit
+            return made
+        self.event = late
+        self.triage().run_once(numbers=[30])
+        self.assertEqual('--add-label', self.kimi_change(30))
+        self.assertIn('#30: kimi label labeled; its event is not listed yet, recorded as pending', self.out)
+        state = json.loads((self.folder / 'state/yeroo/docxy.kimi.json').read_text())
+        self.assertEqual({'30': [{'action': 'labeled', 'at': 1000.0}]}, state['pending'])
+        self.event = real
+        self.calls.clear()
+        self.answers[30] = kimi_answer('P3', suitable=False, reason='touches the save path')
+        self.assertEqual(0, self.triage().run_once(numbers=[30], retriage=True))
+        self.assertEqual('--remove-label', self.kimi_change(30))          # ours, not a human's
+        state = json.loads((self.folder / 'state/yeroo/docxy.kimi.json').read_text())
+        self.assertEqual(({'30': [1001, 1002]}, {}), (state['issues'], state['pending']))
+
+    def test_p0_and_p1_are_never_suitable_whatever_the_model_says(self):
+        self.product[4]['labels'].append({'name': 'kimi'})               # #20 was kimi (set by triage)
+        self.events[20] = [[{'id': 1, 'event': 'labeled', 'label': {'name': 'kimi'}}]]
+        (self.folder / 'state/yeroo').mkdir(parents=True)
+        (self.folder / 'state/yeroo/docxy.kimi.json').write_text(json.dumps({'issues': {'20': [1]}}))
+        self.answers[20] = kimi_answer('P1', suitable=True)
+        self.assertEqual(0, self.triage().run_once(numbers=[20], retriage=True))
+        self.assertEqual('--remove-label', self.kimi_change(20))
+        self.assertIn('kimi: no - P1 is never Kimi work', self.log_for(20)[0])
+        self.answers[12] = kimi_answer('P0', suitable=True)
+        self.triage().run_once(numbers=[12])
+        self.assertIsNone(self.kimi_change(12))                           # not present: nothing to remove
+        self.assertIn('kimi: no - P0 is never Kimi work', self.log_for(12)[0])
+
+    def test_the_deterministic_path_is_never_suitable(self):
+        # #100 is a bug an open spec bug references: P0 without the model.
+        self.assertEqual(0, self.triage().run_once(numbers=[100]))
+        self.assertEqual([], [n for n, *_ in self.model_calls])
+        self.assertIn(f'kimi: no - {t.DETERMINISTIC_NOT_KIMI}', self.log_for(100)[0])
+        self.assertIsNone(self.kimi_change(100))
+
+    def test_a_human_kimi_label_wins(self):
+        # Set by hand (triage never recorded it): left alone although the model says unsuitable.
+        self.product[5]['labels'].append({'name': 'kimi'})
+        self.event(30, 'labeled')
+        self.answers[30] = kimi_answer('P2', suitable=False)
+        self.assertEqual(0, self.triage().run_once(numbers=[30]))
+        self.assertIsNone(self.kimi_change(30))
+        self.assertIn('kimi: human override (labeled by hand); left alone', self.log_for(30)[0])
+
+    def test_a_human_removal_wins_even_on_page_two(self):
+        # Triage set it, the human removed it later; 40 other events push the removal to the second page.
+        self.triage().run_once(numbers=[30])
+        for _ in range(40):
+            self.event(30, 'labeled', label='other')
+        self.event(30, 'unlabeled')
+        self.product[5]['labels'] = [l for l in self.product[5]['labels'] if l['name'] != 'kimi']
+        self.assertEqual(2, len(self.events[30]))
+        self.calls.clear()
+        self.assertEqual(0, self.triage().run_once(numbers=[30], retriage=True))
+        self.assertIsNone(self.kimi_change(30))
+        self.assertIn('kimi: human override (unlabeled by hand); left alone', self.log_for(30)[0])
+
+    def test_kimi_only_changes_no_priority_and_posts_no_public_comment(self):
+        self.product[1]['labels'].append({'name': 'priority:P2'})        # #12 P2, #20 P2, the rest untriaged
+        self.answers[12] = {'kimiSuitable': True, 'kimiReason': 'narrow fix'}
+        self.answers[20] = {'kimiSuitable': False, 'kimiReason': 'spans the UI and the harness'}
+        self.assertEqual(0, self.triage().run_once(kimi_only=True))
+        self.assertEqual([12, 20], sorted(n for n, *_ in self.model_calls))
+        argv = self.model_calls[0][1]
+        self.assertEqual(['kimiSuitable', 'kimiReason'], json.loads(argv[argv.index('--json-schema') + 1])['required'])
+        self.assertTrue(self.model_calls[0][3]['kimiOnly'])
+        public = self.public()
+        self.assertEqual([('issue', 'edit', '12', '--repo', PRODUCT, '--add-label', 'kimi')], [args for args, _ in public])
+        self.assertIn('#12: kimi: yes - narrow fix', self.out)
+        self.assertIn('#20: kimi: no - spans the UI and the harness', self.out)
+        self.assertIn('kimi: no - spans the UI and the harness', self.log_for(20)[0])
+
+    def test_kimi_only_refuses_a_product_without_the_label(self):
+        self.config['kimiLabel'] = False
+        with self.assertRaises(t.ConfigError):
+            self.triage().run_once(kimi_only=True)
+        path = self.folder / 'config.json'
+        path.write_text(json.dumps({'triage': {PRODUCT: {'specRepos': [PROJECT]}}}), encoding='utf-8')
+        with patch.dict(os.environ, {'AGWORKBENCH_CONFIG': str(path)}), patch('sys.stderr') as err:
+            self.assertEqual(2, t.main(['run', '--repo', PRODUCT, '--kimi-only']))
+        self.assertIn('kimiLabel', ''.join(str(c.args[0]) for c in err.write.call_args_list))
+
+    def test_dry_run_shows_the_kimi_verdict_and_writes_nothing(self):
+        self.assertEqual(0, self.triage(dry_run=True).run_once(numbers=[30]))
+        self.assertEqual([], self.writes())
+        self.assertTrue(any('[kimi: yes - one crate, fixtures in tests/]' in line for line in self.out), self.out)
+
+
 class Watch(TriageCase):
     def test_a_failing_issue_backs_off_and_is_given_up_after_three(self):
         notes = []
@@ -672,6 +869,19 @@ class Priorities(unittest.TestCase):
         self.assertEqual('P1', t.priority_of([{'name': 'bug'}, {'name': 'priority:P2'}, {'name': 'Priority:p1'}]))
         self.assertIsNone(t.priority_of([{'name': 'bug'}, {'name': 'priority:high'}]))
         self.assertEqual([0, 1, 2, 3, 4], [t.RANK[p] for p in ('P0', 'P1', None, 'P2', 'P3')])
+
+
+class KimiRules(unittest.TestCase):
+    def test_the_prompt_carries_the_owners_fixed_rules_and_the_fields(self):
+        # #77: the rules from the 2026-09-29/30 evaluation, word for word in substance.
+        text = ' '.join(t.COMMAND.read_text(encoding='utf-8').split())
+        for needle in ('`kimiLabel: true`', 'P2 or P3', 'one crate or a small area',
+                       'checked against something already in the repo', 'not a new subsystem',
+                       'no data-loss risk on save or open', 'outside file-format spec or real sample files',
+                       'save or serialise paths', 'several crates, or the UI and the test harness together',
+                       'an umbrella, a batch or a leftovers list', 'it is P0 or P1', '`kimiSuitable`',
+                       '`kimiReason`', '`kimiOnly: true`'):
+            self.assertIn(needle, text)
 
 
 class Command(unittest.TestCase):

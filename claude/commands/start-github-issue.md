@@ -119,6 +119,8 @@ the same. The differences:
   relay then holds its mail as for any dialog. Never answer it; tell the human (`wb.py status
   blocked --sound`). A Kimi pane idle with a draft in its composer, or on a question, is the human's
   to clear too.
+- **Kimi gets a Kimi-grade plan** (#77): see "When the implementer is Kimi" in Phase 2, and the diff
+  check before each revmux round in Phase 4.
 
 ## Usage limits (the relay's `usage limit:` mail)
 
@@ -126,6 +128,17 @@ The relay watches both panes for an agent's own usage-limit message. When it see
 consecutive reads, it mails you from `relay` with the subject `usage limit: <box> (<tool>) <kind>`.
 The mail carries the matched line and the pane's last rows. It also sets that pane blocked, with a
 desktop notification. It stops ringing a limited implementer: mail to it waits.
+
+**A checkout that waits out usage limits** (`wb.py settings` says `onLimit=wait`: launched with
+`-WaitOnLimit`, #77) is different. The subject ends in `waiting`, the mail says "Do nothing: no
+failover", and nobody is notified. **Never fail over and never report blocked** on a `... waiting`
+mail: keep your mail waiter and end your turn. The relay holds the limited agent's mail, and every
+`limitRetryMinutes` (default 30) it types one pointer into that agent's idle composer; when the limit
+has reset, the agent continues and the held mail is rung as usual. A queue admits no new member
+meanwhile. Only a `... waiting, cannot probe` mail means the human was notified: the pane is not an
+idle agent composer, which is theirs to clear. A Codex `warning` chooser is not waited out: it keeps
+the failover path below. When you are the limited one, you simply resume when the relay's pointer
+reaches you: read your unread mail and carry on.
 
 - **The implementer is `limited` or `warning`, and `wb.py settings` says `failover=true`** (the
   default). A `warning` is Codex's "Approaching rate limits" chooser, which Codex shows when it has
@@ -324,6 +337,52 @@ Write `.workbench/plan.md`:
 - **Out of scope** - what this deliberately does not do.
 - **Open questions** - anything you could not decide from the code and the issue.
 
+### When the implementer is Kimi
+
+When `wb.py settings` says `implementer=kimi`, you do the hard thinking and Kimi follows the plan
+literally (#77). The owner's evaluation found Kimi's gaps in exactly the places a plan leaves open:
+an edit that reached too far (#616 lost edits on save), an invented file format (#309), a wrong field
+decoded strictly while the real-file tests were skipped (#701). So the plan also has these sections,
+headed exactly so:
+
+- **Exact edits** - the files and functions to change, each with the **scope of the edit** ("guard
+  only the `splice_worksheet` call, not the rest of the per-sheet loop").
+- **Must not change** - what the edits must leave alone, listed explicitly.
+- **Oracle** - the fixture, reference file or sibling code that defines correct behaviour, **by
+  path**. The path must exist in the checkout: a URL or an outside spec is never an oracle (plan-check
+  counts only what exists). If the repo has none, the plan says `STOP AND REPORT` and why, instead of an oracle: Kimi
+  must never invent a format or a sample. **The verdict is a line of its own that starts with
+  `STOP AND REPORT`** (a list bullet or bold around it is fine), or the Oracle section's first line.
+  The marker inside a sentence, such as a rule restated in Pitfalls, is not a verdict: a restated rule
+  never opens its line with the marker, and `STOP AND REPORT when/if ...` is a condition, not a verdict.
+- **Tests first** - named tests to write before the fix. Each must fail on the current code, and at
+  least one tests a **side effect** ("an edit to a macro sheet survives save").
+- **Pitfalls** - the known traps in the area: save paths, undo grouping, unit conversions, shared code
+  other features use.
+- **Done means** - the exact commands (`cargo fmt`, `cargo clippy -p <crate> -- -D warnings`,
+  `cargo test -p <crate>`) and the report Kimi sends: `IMPLEMENTED <sha>` with the test names and
+  counts, and **every skipped test by name**.
+
+And these rules, which the plan states where they apply:
+- A fix in a reader or a writer runs the real-file oracle (the corpus) when one exists. If it cannot
+  run it, the work is not done.
+- Any new decoding of an outside binary format is lenient: an unknown value falls back to the old
+  behaviour, never to a new hard error.
+- Every field id and offset cites its source in the repo (a fixture, a spec or an oracle). Without
+  one, the plan says `STOP AND REPORT`.
+
+Before sending each plan version, check it:
+
+```bash
+python "$AGWORKBENCH/lib/wb.py" plan-check
+```
+
+Exit 1 names what is missing; fix the plan, do not send it. Kimi's critique round stays: it may point
+out errors in the plan. A plan that says `STOP AND REPORT` is never implemented as a guess: agree it
+as `AGREED: no-op` (see "Nothing to change") with the missing oracle as the evidence, or, when the
+human could supply it, report `loop-state blocked --reason "<what is missing>"` in queue mode and
+set `wb.py status blocked --sound`.
+
 Send it as `plan v1` (kind `review-request`), keep the background waiter, and end your turn.
 Codex answers with a critique. Revise
 into `plan v2`, `v3`: quote what Codex said before answering it, concede what is right, argue what
@@ -350,6 +409,12 @@ yourself before reviewing it: `git log --oneline origin/<default>..HEAD` and
 
 ## Phase 4 - review with revmux, then fix (repeat)
 
+0. **Kimi only** (`implementer=kimi`, #77): before each revmux round, compare the diff with the plan's
+   Exact edits and Must not change yourself. Judge the code, not Kimi's report: a green run and an
+   accurate list of commands have hidden real gaps before. Any edit beyond its stated scope, any
+   change to a must-not-change item, a test that skips instead of running the oracle, or a strict new
+   decode goes back as a fix round (`FIX r<K>` with the evidence) before revmux runs. Never merge on
+   Kimi's own report.
 1. Write `.workbench/review/scope-r<K>.md`: what the change is for (link the plan), the diff range
    `origin/<default>..HEAD`, the acceptance criteria, where to look hardest, and what is out of
    scope. Tell reviewers **not** to run interactive or GUI tests.
@@ -385,6 +450,15 @@ yourself before reviewing it: `git log --oneline origin/<default>..HEAD` and
    | `stop` | no verified Major+ (and at or past `minRounds`) | `FIX r<K> (final)`: no revmux round after it |
    | `clean` | no findings at all | review is done |
    | `cap` | a round at or past the review cap still has a Major+ or is degraded | `FIX r<K>`, then the human (with `stopWhenNoMajor: false`, today's rule: the fixes verified, as condition 1 says) |
+   | `limit` | `onLimit=wait` and a reviewer was degraded by its usage limit (#77) | no FIX: rerun the same round as the output says, then record it again |
+
+   **`limit`** is no review at all, so it is neither clean nor degraded and never counts toward the
+   cap. Send no findings from it. Run exactly the command it prints:
+   `wb.py revmux --round <K> --rerun --after <minutes>` (`reviewOnLimit: "wait"`, the default: the
+   `#N revmux r<K>` session counts down on screen, then reviews) or
+   `wb.py revmux --round <K> --rerun --profile claude-only` (`reviewOnLimit: "fallback"`). Keep your
+   waiter and end your turn; when the rerun's report arrives, run `review-round --round <K>` again.
+   merge-check refuses the loop until you do.
 
    **The review cap** is `review.maxRounds` (5), or `review.maxRoundsBig` (10) for a **big** issue: a
    title starting with `Batch:`, a `batch` or `big` label, a diff past `review.bigDiffLines` (1500

@@ -29,6 +29,7 @@
   github-workbench 7 -Failover            # the planner, on a usage-limit mail: switch the implementer tool
   github-workbench 7 -Autonomous          # merge, file follow-ups and close the sessions without the human
   github-workbench 7 -BigReview           # a big issue: up to review.maxRoundsBig (10) revmux rounds (#75)
+  github-workbench 7 -WaitOnLimit         # a usage limit is waited out, never failed over (#77)
 .EXAMPLE
   github-workbench -Queue 'yeroo/agworkbench#7,10' -Parallel 2
 .EXAMPLE
@@ -50,6 +51,7 @@
   github-workbench -Triage -Repo yeroo/docxy -Watch     # and keep doing it for new ones, in its own session
   github-workbench -Retriage -Repo yeroo/docxy -DryRun  # re-judge the labelled ones too; print, write nothing
   github-workbench -Triage -Retriage -FollowUps -Repo yeroo/docxy -Limit 200
+  github-workbench -Triage -Retriage -KimiOnly -Repo yeroo/docxy   # only the kimi label, on open P2/P3 (#77)
 .EXAMPLE
   github-workbench -Cleanup -DryRun                     # list finished checkouts and their sizes; delete nothing
   github-workbench -Cleanup -Repo yeroo/docxy           # delete docxy's finished checkouts that are safe to delete
@@ -83,9 +85,12 @@ param(
     [switch] $NoAutonomous,
     [switch] $BigReview,
     [switch] $NoBigReview,
+    [switch] $WaitOnLimit,
+    [switch] $NoWaitOnLimit,
     [switch] $Triage,
     [switch] $Retriage,
     [switch] $FollowUps,
+    [switch] $KimiOnly,
     [int] $Limit,
     [switch] $Cleanup,
     [switch] $BuildOnly,
@@ -238,6 +243,14 @@ if ($BigReview -and $NoBigReview) {
 $bigReviewChoice = $null
 if ($BigReview) { $bigReviewChoice = $true }
 if ($NoBigReview) { $bigReviewChoice = $false }
+if ($WaitOnLimit -and $NoWaitOnLimit) {
+    Write-Host '-WaitOnLimit and -NoWaitOnLimit cannot be combined.' -ForegroundColor Yellow
+    exit 2
+}
+# '' leaves the checkout's saved choice alone (#77).
+$onLimitChoice = ''
+if ($WaitOnLimit) { $onLimitChoice = 'wait' }
+if ($NoWaitOnLimit) { $onLimitChoice = 'failover' }
 
 if ($PSBoundParameters.ContainsKey('Queue')) {
     if ($FollowUps -or ($Prune -and -not $Watch)) {
@@ -270,9 +283,11 @@ if ($PSBoundParameters.ContainsKey('Queue')) {
     if ($NoAutonomous) { $queueArgs += '--no-autonomous' }
     if ($BigReview) { $queueArgs += '--big-review' }
     if ($NoBigReview) { $queueArgs += '--no-big-review' }
+    if ($WaitOnLimit) { $queueArgs += '--wait-on-limit' }
+    if ($NoWaitOnLimit) { $queueArgs += '--no-wait-on-limit' }
     if ($Triage) { $queueArgs += '--triage' }
-    if ($Retriage -or $PSBoundParameters.ContainsKey('Limit')) {
-        Write-Host '-Retriage and -Limit belong to -Triage without -Queue; a queue triages each untriaged member once.' -ForegroundColor Yellow
+    if ($Retriage -or $KimiOnly -or $PSBoundParameters.ContainsKey('Limit')) {
+        Write-Host '-Retriage, -KimiOnly and -Limit belong to -Triage without -Queue; a queue triages each untriaged member once.' -ForegroundColor Yellow
         exit 2
     }
     $env:AGWORKBENCH_QUEUE_SPEC = $Queue
@@ -288,9 +303,9 @@ if ($Triage -or $Retriage) {
     # Issue triage (#34): lib/triage.py labels the repo's open issues priority:P0..P3.
     if (-not $Repo -or $Issue -or $NewSession -or $NoRelay -or $QueueMember -or $Retry -or $Implementer -or
         $PSBoundParameters.ContainsKey('Parallel') -or $AutoMerge -or $NoAutoMerge -or $Autonomous -or $NoAutonomous -or $BigReview -or $NoBigReview -or
-        $Failover -or $Prune -or ($FollowUps -and $Watch) -or
-        ($PSBoundParameters.ContainsKey('Limit') -and $Limit -lt 1) -or ($Watch -and ($Retriage -or $DryRun))) {
-        Write-Host 'usage: github-workbench -Triage|-Retriage -Repo owner/name [-Limit N] [-DryRun] [-FollowUps] | -Triage -Repo owner/name -Watch' -ForegroundColor Yellow
+        $WaitOnLimit -or $NoWaitOnLimit -or $Failover -or $Prune -or ($FollowUps -and $Watch) -or
+        ($PSBoundParameters.ContainsKey('Limit') -and $Limit -lt 1) -or ($Watch -and ($Retriage -or $DryRun -or $KimiOnly))) {
+        Write-Host 'usage: github-workbench -Triage|-Retriage -Repo owner/name [-Limit N] [-DryRun] [-FollowUps] [-KimiOnly] | -Triage -Repo owner/name -Watch' -ForegroundColor Yellow
         exit 2
     }
     $triageArgs = @((Join-Path $script:Lib 'triage.py'))
@@ -301,24 +316,25 @@ if ($Triage -or $Retriage) {
         $triageArgs += @('run', '--repo', $Repo)
         if ($Retriage) { $triageArgs += '--retriage' }
         if ($FollowUps) { $triageArgs += '--follow-ups' }
+        if ($KimiOnly) { $triageArgs += '--kimi-only' }      # #77: implies --retriage in triage.py
         if ($DryRun) { $triageArgs += '--dry-run' }
     }
     if ($PSBoundParameters.ContainsKey('Limit')) { $triageArgs += @('--limit', "$Limit") }
     & python @triageArgs
     exit $LASTEXITCODE
 }
-if ($PSBoundParameters.ContainsKey('Parallel') -or $Watch -or $Retry -or $Prune -or $FollowUps -or $PSBoundParameters.ContainsKey('Limit') -or
+if ($PSBoundParameters.ContainsKey('Parallel') -or $Watch -or $Retry -or $Prune -or $FollowUps -or $KimiOnly -or $PSBoundParameters.ContainsKey('Limit') -or
     ((-not $QueueMember) -and ($QueueAttempt -or $QueueToken))) {
-    Write-Host 'Parallel/Retry require -Queue; -Prune requires -Queue -Watch; -FollowUps requires -Triage or -Retriage; Watch/Limit also go with Triage; QueueAttempt/QueueToken require QueueMember.'
+    Write-Host 'Parallel/Retry require -Queue; -Prune requires -Queue -Watch; -FollowUps and -KimiOnly require -Triage or -Retriage; Watch/Limit also go with Triage; QueueAttempt/QueueToken require QueueMember.'
     exit 2
 }
 
 if (-not $Issue) {
-    Write-Host "usage: github-workbench <issue> [-Repo owner/name] [-DryRun] [-Yes] [-NewSession] [-Implementer codex|claude|kimi] [-AutoMerge|-NoAutoMerge] [-Autonomous|-NoAutonomous] [-BigReview|-NoBigReview] [-Failover]" -ForegroundColor Yellow
+    Write-Host "usage: github-workbench <issue> [-Repo owner/name] [-DryRun] [-Yes] [-NewSession] [-Implementer codex|claude|kimi] [-AutoMerge|-NoAutoMerge] [-Autonomous|-NoAutonomous] [-BigReview|-NoBigReview] [-WaitOnLimit|-NoWaitOnLimit] [-Failover]" -ForegroundColor Yellow
     Write-Host "       github-workbench -Version"
     Write-Host "       (<spec> is a list like 3,4,5, label:<name>, bugs = label:<bugLabel>, or where: <label query>)"
-    Write-Host "       github-workbench -Queue <spec> [-Repo owner/name] [-Parallel 1..8] [-Watch] [-Prune] [-Retry] [-Yes] [-DryRun] [-Implementer codex|claude|kimi] [-ClearLimit codex|claude|kimi] [-AutoMerge|-NoAutoMerge] [-Autonomous|-NoAutonomous] [-BigReview|-NoBigReview] [-Triage] [-RevmuxProfile <profile>] [-QueueName <name> [-Workspace <ws>]]"
-    Write-Host "       github-workbench -Triage|-Retriage -Repo owner/name [-Limit N] [-DryRun] [-FollowUps] [-Watch]"
+    Write-Host "       github-workbench -Queue <spec> [-Repo owner/name] [-Parallel 1..8] [-Watch] [-Prune] [-Retry] [-Yes] [-DryRun] [-Implementer codex|claude|kimi] [-ClearLimit codex|claude|kimi] [-AutoMerge|-NoAutoMerge] [-Autonomous|-NoAutonomous] [-BigReview|-NoBigReview] [-WaitOnLimit|-NoWaitOnLimit] [-Triage] [-RevmuxProfile <profile>] [-QueueName <name> [-Workspace <ws>]]"
+    Write-Host "       github-workbench -Triage|-Retriage -Repo owner/name [-Limit N] [-DryRun] [-FollowUps] [-KimiOnly] [-Watch]"
     Write-Host "       github-workbench -Cleanup [-Repo owner/name] [-DryRun] [-BuildOnly]"
     Write-Host "  <issue> is 123, owner/repo#123, or https://github.com/owner/repo/issues/123"
     exit 2
@@ -354,7 +370,7 @@ if ($QueueMember) {
         Enable-LaunchLog
         $ok = Invoke-LaunchSafely {
             Invoke-LauncherBody -Issue $Issue -Repo $Repo -Yes:$Yes -NewSession -Implementer $Implementer -AutoMerge $autoMergeChoice `
-                -Autonomous $autonomousChoice -RevmuxProfile $RevmuxProfile -BigReview $bigReviewChoice
+                -Autonomous $autonomousChoice -RevmuxProfile $RevmuxProfile -BigReview $bigReviewChoice -OnLimit $onLimitChoice
         }
         $outcome = 'ok'
         if (-not $ok) { $outcome = 'failed' }
@@ -413,7 +429,7 @@ if ($DryRun) { Disable-LaunchLog } else { Enable-LaunchLog }
 if (-not (Invoke-LaunchSafely {
     Invoke-LauncherBody -Issue $Issue -Repo $Repo -DryRun:$DryRun -Yes:$Yes -NoRelay:$NoRelay -NewSession:$NewSession `
         -Implementer $Implementer -AutoMerge $autoMergeChoice -Failover:$Failover -Autonomous $autonomousChoice `
-        -BigReview $bigReviewChoice
+        -BigReview $bigReviewChoice -OnLimit $onLimitChoice
 })) { exit $script:Launch.ExitCode }
 if ($script:Launch.ClaudeHerePending -and -not $DryRun) {
     Invoke-ClaudeHere -Checkout $script:Launch.Checkout -Issue $script:Launch.IssueRef

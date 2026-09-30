@@ -365,6 +365,20 @@ ends it. An issue that keeps failing there is retried with a growing delay, then
 3 failures, with one notification. Only the watch counts failures: a manual or queue run always
 tries again.
 
+**The `kimi` label** (#77), for a product whose entry has `"kimiLabel": true` (the label must exist on
+the repo): the model also judges whether the issue suits Kimi Code, by fixed rules from the owner's
+evaluation. It is suitable only when it is P2 or P3, self-contained (one crate or a small area),
+checkable against something already in the repo (tests, fixtures, an oracle file, sibling code), a
+narrow fix or a small feature, and without data-loss risk on save or open. It is not suitable when
+it depends on an outside file-format spec or real samples the repo lacks, touches save or serialise
+paths, spans several crates or the UI and the harness together, is an umbrella or a batch, or is P0
+or P1. triage.py enforces the P0/P1 rule and the deterministic P0 path itself. Suitable adds `kimi`,
+unsuitable removes it, and the reason goes to the private log only (`kimi: yes - ...`). A `kimi`
+label you set or removed by hand wins: triage keeps the ids of the label events it caused, so
+any other `kimi` event on the issue makes it leave the label alone (`kimi: human override`).
+`-Triage -Retriage -KimiOnly -Repo owner/repo` re-judges only the label, on open P2/P3 issues, with
+no priority change and no public comment.
+
 **The queue.** Pending members are admitted P0, then P1, then untriaged, then P2, then P3, oldest
 issue first within each. The conductor reads the labels for the whole repo on each refresh, and
 active or PR-open members are never touched. With `-Queue ... -Triage`, an untriaged pending member
@@ -718,6 +732,48 @@ it is, and setting `-Implementer` never clears a limit. Records made before the 
 from then on, and `-DryRun` shows the record it would clear. The limit strings come from the installed binaries
 (`tests/fixtures/limits/`, with the command that extracted them).
 
+### A slow queue that waits out usage limits
+
+Kimi Code's plan has a rolling 5-hour usage limit: in the owner's evaluation it did 20-50 minutes of
+work per window, then answered `403 You've reached your 5-hour usage limit`, with no reset time. A
+queue that should run Kimi at its own pace, about five issues a day with nobody watching, neither
+fails over nor stops for you. `-WaitOnLimit` makes it wait:
+
+```powershell
+github-workbench -Queue 'where: kimi AND priority IN [P2, P3]' -Repo yeroo/docxy -QueueName kimi -Workspace docxy-kimi -Implementer kimi -WaitOnLimit -Autonomous -Watch
+```
+
+What waits (#77), for a member launched with `-WaitOnLimit` (saved as `onLimit: "wait"` in its
+`state/implementer.json`, like `-BigReview`; `-NoWaitOnLimit` goes back to failover):
+- **An agent at its limit** (the implementer or the planner) keeps the member's slot. The relay
+  mails the planner one `usage limit: ... waiting` note that asks for nothing, sets the pane idle,
+  and holds the agent's mail without ever alerting. Every `limitRetryMinutes` (default 30) it types
+  one pointer into the idle agent: "the usage limit may have reset; continue where you left off".
+  An idle pane does not change when the window resets, so asking is the only way to find out. A
+  limited agent answers with its limit again at no cost, and the wait goes on; otherwise it
+  continues, the limit row leaves the pane, and the held mail is rung.
+- **The queue** starts no new member while any member waits. The conductor prints
+  `(kimi) waiting: #N kimi usage limit since HH:MM, next try HH:MM` once and
+  `queue resumed: usage limit cleared` when it ends, and the queue's summary shows the member as
+  `waiting-limit (active)`. A member whose session is gone cannot hold the queue.
+- **A review round** a reviewer's limit degraded (Kimi in `kimi-mixed`, say) is neither accepted as
+  degraded nor counted toward the review cap. `wb.py review-round` decides `limit`, and the planner
+  reruns the same round after `limitRetryMinutes` in its visible `#N revmux r<K>` session, which counts
+  down on screen. With `"reviewOnLimit": "fallback"` it reruns at once with `claude-only` instead.
+
+What you see: nothing, unless something needs you. The one exception is a limited pane nobody can
+type into (a shell, a dialog, a draft in the composer). After `limitRetryMinutes` of that, the relay
+sets it blocked with a sound. A Codex "Approaching rate limits" chooser is not waited out, since
+nobody answers it; it fails over as above. `-WaitOnLimit` changes nothing else: without it, limits fail
+over exactly as before.
+
+The `kimi` label selects the issues. Triage sets it when a product's triage entry has
+`"kimiLabel": true` (see Issue triage), and `-Watch -Prune` drops a pending member that lost it. With
+Kimi as the implementer, the planner also writes a stricter, Kimi-grade plan (exact edits and what
+must not change, an oracle by path or `STOP AND REPORT`, tests first, pitfalls, and what done means,
+checked by `wb.py plan-check`). It compares Kimi's diff with that plan before each review round.
+Keep Claude reviewers in the roster (`kimi-mixed` does), and never merge on Kimi's own report.
+
 ### Auto-merge (opt-in)
 
 `github-workbench <issue> -AutoMerge`, `-Queue <spec> -AutoMerge`, or `"autoMerge": true` in
@@ -731,7 +787,9 @@ from then on, and `-DryRun` shows the record it would clear. The limit strings c
 Review stops once a verified revmux round has no Blocker, Critical or Major finding (#64): that
 round's fix is the last, its Minor findings are fixed if cheap and otherwise go to the PR's
 "Leftovers from #N" issue, and no further revmux round runs. The planner records each round with
-`wb.py review-round --round K`, which prints `continue`, `stop`, `clean` or `cap` (at or past the review cap).
+`wb.py review-round --round K`, which prints `continue`, `stop`, `clean`, `cap` (at or past the review cap), or
+`limit` (a `-WaitOnLimit` checkout whose reviewer hit its usage limit: the same round is rerun, and it never
+counts toward the cap; see A slow queue that waits out usage limits).
 The review cap is `review.maxRounds` (5), or `review.maxRoundsBig` (10) for a big issue (#75): its title
 starts with `Batch:`, it has a `batch` or `big` label, its diff against the base passes
 `review.bigDiffLines` (1500 lines added + deleted) when a round is recorded, or its checkout was launched
@@ -749,7 +807,8 @@ That check is read-only. It requires:
 - there is no unread mail from you (`human`) or from GitHub;
 - the relay has seen the PR open;
 - the PR head is the tested commit;
-- the newest revmux report has a recorded decision, and the last one is not `continue`, nor a `cap` (a
+- the newest revmux report has a recorded decision, and the last one is not `continue`, nor a `limit`
+  (rerun it and record it again), nor a `cap` (a
   Major or a degraded run at or past the review cap) unless `stopWhenNoMajor` was off; after any `stop`,
   every recorded follow-up is filed;
 - **no hold**: a label (`do-not-merge`, `hold`, `wip`), the title, or any unmarked description,
@@ -845,7 +904,7 @@ the autonomous close can close it. revmux and revdiff rounds that fail also mail
 | `kimiPath` | none | `kimi.exe` for the Kimi implementer; without it, `PATH`, then `%USERPROFILE%\.kimi-code\bin\kimi.exe` |
 | `kimiArgs` | `[]` | extra arguments for `kimi` (e.g. `["-m", "<model alias>"]`); approval-mode, session, agent and directory flags are refused in every spelling |
 | `bugLabel` | `"bug"` | the label `-Queue bugs` stands for (non-empty, no comma) |
-| `triage` | none | per product repo: `{"owner/repo": {"specRepos": [...], "model": "..."}}`, the private spec repos `-Triage` judges against (see Issue triage) |
+| `triage` | none | per product repo: `{"owner/repo": {"specRepos": [...], "model": "...", "kimiLabel": false}}`, the private spec repos `-Triage` judges against, and whether it also sets the `kimi` label (see Issue triage) |
 | `followUp` | `{"dedupe": true, "bumpAt": {"P2": 2, "P1": 3, "P0": 5}}` | `dedupe: false` skips duplicate matching: separate items keep #27's filing, leftovers still share one issue per PR (per item without `--pr`); `bumpAt` is the total number of reports that raises a matched issue to each priority |
 | `review` | `{"stopWhenNoMajor": true, "minRounds": 1, "maxRounds": 5, "maxRoundsBig": 10, "bigDiffLines": 1500}` | `stopWhenNoMajor: false` keeps reviewing until a round has no findings at all (up to the review cap); `minRounds` (1-5, at most `maxRounds`) is the first round that may stop review; `maxRounds` (1-20) is the review cap, `maxRoundsBig` (`maxRounds`-20, default the larger of 10 and `maxRounds`) the cap of a big issue, and `bigDiffLines` (1 or more) the diff size that makes an issue big |
 | `autonomous` | `false` | full autonomy: merge, file follow-up issues, close the sessions after the merge; implies `autoMerge` |
@@ -853,6 +912,8 @@ the autonomous close can close it. revmux and revdiff rounds that fail also mail
 | `minFreeGB` | `20` | the queue admits no member while the checkout drive has less free space (GiB); `0` turns the guard off |
 | `minFreeRamGB` | `3` | the queue admits no member while less memory is free (GiB); `0` turns the guard off |
 | `stallMinutes` | `15` | minutes a loop may sit idle with nothing to wake it before the relay mails the planner a stall pointer (see Stalls); `0` turns the watch off |
+| `limitRetryMinutes` | `30` | with `-WaitOnLimit`: minutes between the relay's probes of an agent waiting out its usage limit, and the wait before rerunning a review round a reviewer's limit stopped (more than 0; see A slow queue that waits out usage limits) |
+| `reviewOnLimit` | `"wait"` | with `-WaitOnLimit`, a review round a reviewer's usage limit degraded: `wait` reruns it after `limitRetryMinutes`, `fallback` reruns it at once with `claude-only` |
 | `autoMerge` | `false` | new checkouts let the planner merge its own PR when every auto-merge condition holds; `-AutoMerge` / `-NoAutoMerge` change it per checkout or queue |
 
 ## Layout

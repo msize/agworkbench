@@ -1461,6 +1461,13 @@ class QueueEntry(LauncherFixtures):
         self.assertIn('--autonomous', seen['args'])
         self.assertEqual('bugs', seen['spec'])
 
+    def test_wait_on_limit_reaches_the_conductor(self):
+        # #77
+        self.assertIn('--wait-on-limit', self.conductor_start('bugs', '-WaitOnLimit')['args'])
+        seen = self.conductor_start('bugs', '-NoWaitOnLimit')['args']
+        self.assertIn('--no-wait-on-limit', seen)
+        self.assertNotIn('--wait-on-limit', seen)
+
     def test_clear_limit_reaches_the_conductor_and_belongs_to_queue(self):
         # #61 r1 M1: clearing a queue's recorded limit is its own switch, not -Implementer.
         seen = self.conductor_start('bugs', '-ClearLimit', 'claude')
@@ -1606,6 +1613,8 @@ class QueueEntry(LauncherFixtures):
                                    (('-Triage', '-Repo', 'o/repo', '-Watch'), f'{triage} start-watch --repo o/repo'),
                                    (('-Triage', '-Retriage', '-FollowUps', '-Repo', 'o/repo'),
                                     f'{triage} run --repo o/repo --retriage --follow-ups'),
+                                   (('-Triage', '-Retriage', '-KimiOnly', '-Repo', 'o/repo'),
+                                    f'{triage} run --repo o/repo --retriage --kimi-only'),
                                    (('-Queue', 'bugs', '-Repo', 'o/repo', '-Watch', '-Prune'), '--watch --prune'),
                                    (('-Queue', 'bugs', '-Repo', 'o/repo', '-Triage'), '--triage')):
                 with self.subTest(shell=shell, args=args):
@@ -1646,6 +1655,8 @@ class QueueEntry(LauncherFixtures):
                      ('-Queue', 'bugs', '-Repo', 'o/repo', '-FollowUps'),
                      ('-Triage', '-Repo', 'o/repo', '-Watch', '-FollowUps'),
                      ('-Triage', '-Repo', 'o/repo', '-Prune'), ('-Prune',), ('-FollowUps',),
+                     ('-KimiOnly',), ('-Triage', '-Repo', 'o/repo', '-Watch', '-KimiOnly'),
+                     ('-Queue', 'bugs', '-Repo', 'o/repo', '-KimiOnly'), ('7', '-KimiOnly'),
                      ('7', '-Limit', '3')):
             with self.subTest(args=args):
                 result, seen = self.launcher(*args)
@@ -1654,6 +1665,8 @@ class QueueEntry(LauncherFixtures):
         for switch, hint in (('-Prune', '-Queue -Watch'), ('-FollowUps', '-Triage or -Retriage')):
             result, _ = self.launcher(switch)
             self.assertIn(hint, result.stdout + result.stderr)
+        result, _ = self.launcher('-Queue', 'bugs', '-Repo', 'o/repo', '-KimiOnly')      # #77 FIX r2 m4
+        self.assertIn('-Retriage, -KimiOnly and -Limit belong to -Triage without -Queue', result.stdout + result.stderr)
 
     def test_member_autonomous_switch_reaches_its_checkout(self):
         # #27: the conductor passes a queue's saved autonomy as -Autonomous / -NoAutonomous.
@@ -2869,7 +2882,7 @@ class ClaudeImplementer(LauncherFixtures):
         self.assertTrue(self.relay_line().endswith("--branch 'issue-7-fix-x'"))
         self.assertIn("pane-codex.ps1'", self.typed_right()[0])
         self.assertEqual('codex', self.state('agents.json')['agents']['codex']['tool'])
-        self.assertEqual({'tool': 'codex', 'revmuxProfile': 'comprehensive', 'autoMerge': False, 'autonomous': False, 'bigReview': False, 'cleanup': 'merged'}, self.state('implementer.json'))
+        self.assertEqual({'tool': 'codex', 'revmuxProfile': 'comprehensive', 'autoMerge': False, 'autonomous': False, 'bigReview': False, 'onLimit': 'failover', 'cleanup': 'merged'}, self.state('implementer.json'))
         self.assertFalse((self.checkout / '.workbench/state/implementer-claude.json').exists())
 
     def test_claude_composes_right_pane_relay_mailbox_identity_and_pin(self):
@@ -2883,7 +2896,7 @@ class ClaudeImplementer(LauncherFixtures):
         agents = self.state('agents.json')['agents']
         self.assertEqual(('claude', RIGHT_ID), (agents['codex']['tool'], agents['codex']['pane']))
         self.assertEqual('claude', agents['claude']['tool'])
-        self.assertEqual({'tool': 'claude', 'revmuxProfile': 'claude-only', 'autoMerge': False, 'autonomous': False, 'bigReview': False, 'cleanup': 'merged'}, self.state('implementer.json'))
+        self.assertEqual({'tool': 'claude', 'revmuxProfile': 'claude-only', 'autoMerge': False, 'autonomous': False, 'bigReview': False, 'onLimit': 'failover', 'cleanup': 'merged'}, self.state('implementer.json'))
         implementer = self.state('implementer-claude.json')
         planner = self.state('claude.json')
         self.assertEqual((RIGHT_ID, 'fresh', 'o/repo#7'), (implementer['pane'], implementer['origin'], implementer['issue']))
@@ -2898,7 +2911,7 @@ class ClaudeImplementer(LauncherFixtures):
     def test_config_selects_claude_and_revmux_profile_is_configurable(self):
         result = self.body(config={'implementer': 'claude', 'revmuxProfile': 'codex-final'})
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
-        self.assertEqual({'tool': 'claude', 'revmuxProfile': 'codex-final', 'autoMerge': False, 'autonomous': False, 'bigReview': False, 'cleanup': 'merged'}, self.state('implementer.json'))
+        self.assertEqual({'tool': 'claude', 'revmuxProfile': 'codex-final', 'autoMerge': False, 'autonomous': False, 'bigReview': False, 'onLimit': 'failover', 'cleanup': 'merged'}, self.state('implementer.json'))
         self.assertTrue(self.relay_line().endswith("--implementer-tool 'claude'"))
 
     def test_invalid_config_and_switch_values_are_refused(self):
@@ -2959,7 +2972,7 @@ class ClaudeImplementer(LauncherFixtures):
         self.assertIn('-Resume', self.typed_right()[-1])
         self.assertIn('pane-codex.ps1', self.pins()[RIGHT_ID])
         self.assertEqual('codex', self.state('agents.json')['agents']['codex']['tool'])
-        self.assertEqual({'tool': 'codex', 'revmuxProfile': 'comprehensive', 'autoMerge': False, 'autonomous': False, 'bigReview': False, 'cleanup': 'merged'}, self.state('implementer.json'))
+        self.assertEqual({'tool': 'codex', 'revmuxProfile': 'comprehensive', 'autoMerge': False, 'autonomous': False, 'bigReview': False, 'onLimit': 'failover', 'cleanup': 'merged'}, self.state('implementer.json'))
         # B2: the relay was asked to stop and was restarted without the Claude profile.
         self.assertTrue(json.loads(self.scenario_path.read_text(encoding='utf-8'))['stop_seen'])
         relay = [c[3] for c in self.calls() if c[:2] == ['session', 'type'] and c[-1] == RELAY_ID]
@@ -3303,7 +3316,13 @@ class AutoMergeLaunch(LauncherFixtures):
                                ('minFreeGB', 20.5, True), ('minFreeGB', -1, False), ('minFreeGB', '20', False),
                                ('minFreeGB', True, False), ('minFreeRamGB', 0, True), ('minFreeRamGB', 1.5, True),
                                ('minFreeRamGB', -1, False), ('minFreeRamGB', '3', False), ('stallMinutes', 0, True), ('stallMinutes', 7.5, True),
-                               ('stallMinutes', -1, False), ('stallMinutes', '15', False), ('stallMinutes', True, False)):
+                               ('stallMinutes', -1, False), ('stallMinutes', '15', False), ('stallMinutes', True, False),
+                               ('limitRetryMinutes', 30, True), ('limitRetryMinutes', 0.5, True),
+                               ('limitRetryMinutes', 0, False), ('limitRetryMinutes', -5, False),
+                               ('limitRetryMinutes', '30', False), ('limitRetryMinutes', True, False),
+                               ('reviewOnLimit', 'wait', True), ('reviewOnLimit', 'fallback', True),
+                               ('reviewOnLimit', 'Wait', False), ('reviewOnLimit', 'failover', False),
+                               ('reviewOnLimit', 1, False)):
             with self.subTest(key=key, value=value):
                 self.config_path.write_text(json.dumps({'checkoutRoot': str(self.temp), key: value}), encoding='utf-8')
                 result = ps('. ./lib/Workbench.ps1; Get-WorkbenchConfig | Out-Null; "loaded"', env=self.env)
@@ -3907,7 +3926,7 @@ class KimiImplementer(LauncherFixtures):
         agents = self.state('agents.json')['agents']
         self.assertEqual(('kimi', RIGHT_ID), (agents['codex']['tool'], agents['codex']['pane']))
         self.assertEqual({'tool': 'kimi', 'revmuxProfile': 'claude-only', 'autoMerge': False, 'autonomous': False, 'bigReview': False,
-                          'cleanup': 'merged'}, self.state('implementer.json'))
+                          'onLimit': 'failover', 'cleanup': 'merged'}, self.state('implementer.json'))
         self.assertIn('Kimi implementer starting in the right pane', result.stdout)
         self.assertFalse((self.checkout / '.workbench/state/implementer-claude.json').exists())
 
@@ -4298,6 +4317,49 @@ class BigReviewLaunch(LauncherFixtures):
                                 text=True, encoding='utf-8', errors='replace', timeout=20)
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
         self.assertIn('autonomous off; big review on', result.stdout)
+        self.assertFalse((self.checkout / '.workbench').exists())
+
+
+class WaitOnLimitLaunch(LauncherFixtures):
+    """#77: -WaitOnLimit is per-checkout policy like -BigReview; the relay and wb.py read it."""
+    body = ClaudeImplementer.body
+    state = ClaudeImplementer.state
+    reuse_scenario = ClaudeImplementer.reuse_scenario
+
+    def test_default_is_failover(self):
+        result = self.body()
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertEqual('failover', self.state('implementer.json')['onLimit'])
+        self.assertIn('on limit failover', result.stdout)
+
+    def test_wait_is_saved_a_rerun_keeps_it_and_no_wait_saves_failover(self):
+        on = self.body(extra=" -OnLimit 'wait'")
+        self.assertEqual(0, on.returncode, on.stdout + on.stderr)
+        self.assertEqual('wait', self.state('implementer.json')['onLimit'])
+        self.assertIn('on limit wait', on.stdout)
+        self.reuse_scenario('esc to interrupt')      # policy: a live agent does not block it
+        again = self.body()
+        self.assertEqual(0, again.returncode, again.stdout + again.stderr)
+        self.assertEqual('wait', self.state('implementer.json')['onLimit'])
+        off = self.body(extra=" -OnLimit 'failover'")
+        self.assertEqual(0, off.returncode, off.stdout + off.stderr)
+        self.assertEqual('failover', self.state('implementer.json')['onLimit'])
+
+    def test_entry_refuses_both_switches(self):
+        result = subprocess.run([PWSH, '-NoProfile', '-File', str(LIB / 'github-workbench.ps1'), 'o/repo#7',
+                                 '-WaitOnLimit', '-NoWaitOnLimit'], env=self.env, cwd=ROOT, capture_output=True, text=True,
+                                encoding='utf-8', errors='replace', timeout=20)
+        self.assertEqual(2, result.returncode, result.stdout + result.stderr)
+        self.assertIn('-WaitOnLimit and -NoWaitOnLimit cannot be combined', result.stdout)
+        self.assertFalse(self.calls())
+
+    def test_dry_run_prints_on_limit_and_writes_nothing(self):
+        self.cmd('gh', 'echo {"title":"fix-x","state":"OPEN"}\nexit /b 0')
+        result = subprocess.run([PWSH, '-NoProfile', '-File', str(LIB / 'github-workbench.ps1'), 'o/repo#7',
+                                 '-NewSession', '-DryRun', '-WaitOnLimit'], env=self.env, cwd=ROOT, capture_output=True,
+                                text=True, encoding='utf-8', errors='replace', timeout=20)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertIn('big review off; on limit wait', result.stdout)
         self.assertFalse((self.checkout / '.workbench').exists())
 
 

@@ -21,6 +21,13 @@ Five jobs, one loop, one process per issue, running in its own visible agwinterm
    consecutive reads is mailed to the planner once (sender `relay`), with a blocked status and a
    notification; mail to a limited implementer is held until the planner fails it over. Checks
    stop after a MERGED PR; a CLOSED unmerged PR leaves the relay watching.
+   A checkout launched with -WaitOnLimit (`onLimit: "wait"` in state/implementer.json, re-read on
+   every check, #77) waits a `limited` episode out instead: the planner gets one `... waiting` note
+   that asks for nothing, the pane's status goes idle, and mail is held silently. Every
+   `limitRetryMinutes` (config, default 30) the relay types one probe pointer into the idle agent: a
+   limit that has reset lets the agent continue and the row leaves the pane, which ends the episode;
+   one that has not answers with its limit again, and the wait goes on. Only a pane nobody can type
+   into for `limitRetryMinutes` reaches the human. A Codex warning chooser keeps the failover path.
 
 4. **The close after merge or a no-op issue (#27, #33, #53).** On an autonomous checkout, after a MERGED PR's final
    notices are delivered or a closed issue has a no-PR done record, it runs closer.py while it keeps delivering mail. Helper sessions close
@@ -42,7 +49,8 @@ Five jobs, one loop, one process per issue, running in its own visible agwinterm
 5. **Stalls (#45).** On the same reads it watches for a loop that sits idle with nothing to wake it:
    both agent panes provably idle, no unread mail, no running helper, and the loop not done, not
    waiting on the human (`state/waiting.json`, loop.json `blocked`/`pr-open`, a PR open for review),
-   not waiting on CI (an auto-merge PR with a check still running), and no usage-limit episode.
+   not waiting on CI (an auto-merge PR with a check still running), no usage-limit episode, and no
+   review round waiting out a reviewer's limit (`state/review-limit.json` before its retryAt, #77).
    After `stallMinutes` (config, default 15) it mails the planner one `stall` pointer; after two more
    periods with no progress it reports the loop blocked (blocked status and sound, waiting.json, and
    loop.json in queue mode). Progress - a commit, mail, a helper, a loop report - resets it. It
@@ -91,6 +99,9 @@ ALERT_EVERY = 300.0
 TERMINAL_DRAIN_TIMEOUT = 30 * 60.0
 LIMIT_READS = 2          # consecutive reads that start (or end) a usage-limit episode
 STALL_MINUTES = 15.0     # the default stall period (#45); `stallMinutes` in ~/.agworkbench.json, 0 = off
+LIMIT_RETRY_MINUTES = 30.0   # between probes of an agent waiting out its limit (#77); `limitRetryMinutes`
+PROBE_TEXT = ("the usage limit may have reset; continue where you left off "
+              "(git status, .workbench, unread mail)")
 LAST_WORDS_MAX = 300     # how much of the implementer's last line a stall pointer quotes
 
 
@@ -311,6 +322,24 @@ def stall_setting() -> float:
     return float(value)
 
 
+def limit_retry_setting() -> float:
+    """`limitRetryMinutes` from ~/.agworkbench.json (#77): a number > 0. The launcher refuses an invalid
+    value; one that slips through here reads as the default."""
+    path = Path(os.environ.get("AGWORKBENCH_CONFIG") or (Path.home() / ".agworkbench.json"))
+    try:
+        config = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return LIMIT_RETRY_MINUTES
+    value = config.get("limitRetryMinutes") if isinstance(config, dict) else None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        return LIMIT_RETRY_MINUTES
+    return float(value)
+
+
+def clock_text(epoch: float) -> str:
+    return time.strftime("%H:%M", time.localtime(epoch))
+
+
 def ci_pending(pr: dict[str, Any]) -> list[str]:
     """The PR's checks that are still running, from the snapshot's statusCheckRollup (#45 r1): a
     check run not COMPLETED, a commit status PENDING or EXPECTED."""
@@ -490,6 +519,15 @@ class StallWatch:
             reasons.append(f"helper running: {', '.join(live)}")
         if self.relay.state.get("limits"):
             reasons.append(f"usage-limit episode: {', '.join(sorted(self.relay.state['limits']))}")
+        review = self.read_json("review-limit.json")
+        if isinstance(review, dict):
+            # #77: a reviewer's limit stopped a revmux round; the planner waits for the rerun. Past its
+            # retryAt the rerun's own session is the helper that exempts the loop, or the loop is stalled.
+            retry = review.get("retryAt")
+            if isinstance(retry, bool) or not isinstance(retry, (int, float)):
+                reasons.append("review usage-limit wait (state/review-limit.json)")
+            elif wall() < retry:
+                reasons.append(f"review usage-limit wait until {clock_text(retry)}")
         return reasons
 
     def current_fingerprint(self, sessions: list[dict]) -> tuple:
@@ -736,7 +774,9 @@ class Relay:
 
     # mail -----------------------------------------------------------------------------------
     def hold(self, peer: Peer, mid: str, reason: str, *, failed: bool = False,
-             ambiguous_text: str | None = None) -> None:
+             ambiguous_text: str | None = None, quiet: bool = False) -> None:
+        """Hold one message for a recipient that is not ready. A quiet hold (a usage limit waited out,
+        #77) never alerts: the wait is the plan, not a problem for the human."""
         instant = now()
         entry = self.holds.setdefault((peer.box, mid), Hold(instant, reason))
         if entry.ambiguous_text != ambiguous_text:
@@ -751,7 +791,7 @@ class Relay:
             self.log(f"{peer.box} not ready ({reason}); holding {mid}")
         since = entry.condition_since if entry.condition_since is not None else entry.first_at
         threshold = AMBIGUOUS_ALERT_AFTER if ambiguous_text is not None else HOLD_ALERT_AFTER
-        if (failed or instant - since >= threshold) and (
+        if not quiet and (failed or instant - since >= threshold) and (
                 entry.last_alert_at is None or instant - entry.last_alert_at >= ALERT_EVERY):
             if not self.dry_run:
                 entry.last_alert_at = instant
@@ -854,14 +894,27 @@ class Relay:
                     if self.dry_run:
                         self.log(f"[dry-run] would announce usage limit: {peer.box} ({peer.tool}) {found.kind}")
                     else:
+                        # Only a hard limit is waited out (#77): nobody answers a warning chooser.
+                        if found.kind == 'limited' and self.on_limit() == 'wait':
+                            episode.update(wait=True, retryAt=wall() + self.retry_seconds(), probes=0, probeAt=None)
                         self.announce_limit(peer, episode, text)
                         episode['announced'] = True
+                elif episode.get('wait') and episode['announced'] and not self.dry_run:
+                    self.wait_limit(peer, episode)
                 changed = True
             elif episode:
-                episode['misses'] = episode.get('misses', 0) + 1
+                if episode.get('wait') and episode.get('probeAt') is not None and is_busy(text):
+                    # The agent took the probe and is working (#77): its limit row may yet come back.
+                    episode['misses'] = 0
+                else:
+                    episode['misses'] = episode.get('misses', 0) + 1
                 if episode['misses'] >= LIMIT_READS:
                     episodes.pop(peer.box)
-                    self.log(f"usage limit episode ended for {peer.box}")
+                    if episode.get('wait') and episode.get('probeAt') is not None:
+                        self.log(f"usage limit episode ended for {peer.box}: the limit reset "
+                                 f"(probe {episode.get('probes', 0) + 1})")
+                    else:
+                        self.log(f"usage limit episode ended for {peer.box}")
                 changed = True
         if changed:
             if episodes:
@@ -872,9 +925,11 @@ class Relay:
                 self._save()
 
     def announce_limit(self, peer: Peer, episode: dict, text: str) -> None:
-        import agw
-        subject = f"usage limit: {peer.box} ({peer.tool}) {episode['kind']}"
         rows = [row for row in text.splitlines() if row.strip()][-limits.WINDOW:]
+        if episode.get('wait'):
+            self.announce_wait(peer, episode, rows)
+            return
+        subject = f"usage limit: {peer.box} ({peer.tool}) {episode['kind']}"
         if peer.box == 'claude':
             step = ("The planner itself is limited, so nobody can act on this mail until it can: "
                     "the human has been notified. The loop waits.")
@@ -890,19 +945,108 @@ class Relay:
         body = "\n".join([f"Matched: {episode['line']}", f"Pane: {peer.box} ({peer.tool}) {peer.pane}",
                            f"First seen: {episode['firstSeen']}", "", "Next step: " + step, "",
                            "Last rows of the pane:", "", "```", *rows, "```"])
+        self.alert_limit(peer, subject, body, episode['line'])
+
+    def alert_limit(self, peer: Peer, subject: str, body: str, detail: str) -> None:
+        """A limit the human hears about: the planner's note, then the pane blocked with sound, and a
+        notification."""
+        import agw
         try:
             self.hub.write_message(to='claude', sender='relay', kind='note', subject=subject, body=body)
         except OSError as err:
             self.log(f"could not file usage-limit mail: {err}")
-        self.log(f"ALERT {subject}: {episode['line']}")
+        self.log(f"ALERT {subject}: {detail}")
         try:
             agw.set_status('blocked', sound=True, blink=True, pane_id=peer.pane)
         except (agw.CtlError, OSError) as err:
             self.log(f"could not set blocked status for {peer.box}: {err}")
         try:
-            agw.notify(peer.pane, f"{subject}: {episode['line']}", title='workbench relay')
+            agw.notify(peer.pane, f"{subject}: {detail}", title='workbench relay')
         except (agw.CtlError, OSError) as err:
             self.log(f"could not notify {peer.box}: {err}")
+
+    # waiting out a usage limit (#77) ------------------------------------------------------------
+    def on_limit(self) -> str:
+        """The checkout's `onLimit` (state/implementer.json), read on every check: 'wait' or 'failover'."""
+        try:
+            saved = json.loads((self.hub_dir / "state" / "implementer.json").read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            return 'failover'
+        return 'wait' if isinstance(saved, dict) and saved.get('onLimit') == 'wait' else 'failover'
+
+    def retry_seconds(self) -> float:
+        return limit_retry_setting() * 60
+
+    def announce_wait(self, peer: Peer, episode: dict, rows: list[str]) -> None:
+        """One note to the planner that asks for nothing, and an idle status: no sound, no notification."""
+        import agw
+        subject = f"usage limit: {peer.box} ({peer.tool}) waiting"
+        who = "the planner (you)" if peer.box == 'claude' else "the implementer"
+        step = (f"Do nothing: no failover. This checkout waits out usage limits (onLimit=wait): {who} is "
+                f"limited, the relay holds its mail and asks it to continue every "
+                f"{self.retry_seconds() / 60:g} min (next try {clock_text(episode['retryAt'])}), and the loop "
+                "resumes when the limit has reset. Keep your mail waiter and end your turn.")
+        body = "\n".join([f"Matched: {episode['line']}", f"Pane: {peer.box} ({peer.tool}) {peer.pane}",
+                           f"First seen: {episode['firstSeen']}", "", "Next step: " + step, "",
+                           "Last rows of the pane:", "", "```", *rows, "```"])
+        try:
+            self.hub.write_message(to='claude', sender='relay', kind='note', subject=subject, body=body)
+        except OSError as err:
+            self.log(f"could not file usage-limit mail: {err}")
+        self.log(f"{subject}: {episode['line']}; next try {clock_text(episode['retryAt'])}")
+        try:
+            agw.set_status('idle', pane_id=peer.pane)
+        except (agw.CtlError, OSError) as err:
+            self.log(f"could not set idle status for {peer.box}: {err}")
+
+    def wait_limit(self, peer: Peer, episode: dict) -> None:
+        """A limit row on screen during a wait episode: after a probe it means the limit has not reset;
+        at retryAt it is time to probe."""
+        if episode.get('probeAt') is not None:
+            episode.update(probes=episode.get('probes', 0) + 1, probeAt=None,
+                           retryAt=wall() + self.retry_seconds())
+            self.log(f"usage limit: {peer.box} still limited after probe {episode['probes']}; "
+                     f"next try {clock_text(episode['retryAt'])}")
+            return
+        if wall() >= episode.get('retryAt', 0):
+            self.probe(peer, episode)
+
+    def probe(self, peer: Peer, episode: dict) -> None:
+        """Type the one probe pointer into the limited agent's idle composer. A pane nobody can type into
+        is retried on every check; after limitRetryMinutes of that the human is told, once."""
+        import agw
+        import peerchat
+        try:
+            if peer.tool in ("claude", "kimi") and is_busy(agw.pane_text(peer.pane)):
+                raise peerchat.Refused('mid-turn; waiting for the agent to finish')
+            text = peerchat.compose_text("Chat from Workbench: ", PROBE_TEXT)
+            outcome = peerchat.send(peer.pane, peerchat.PROFILES[peer.tool], text, dry_run=False, retry=False)
+        except (peerchat.Refused, peerchat.Failed, agw.CtlError, OSError) as err:
+            since = episode.setdefault('probeRefusedSince', wall())
+            self.log(f"usage limit: cannot probe {peer.box}: {err}")
+            if wall() - since >= self.retry_seconds() and not episode.get('escalated'):
+                episode['escalated'] = True
+                self.escalate_wait(peer, episode, str(err))
+            return
+        episode.update(probeAt=wall(), misses=0)
+        episode.pop('probeRefusedSince', None)
+        if episode.pop('escalated', None):
+            # The pane can take the probe again: the blocked status the escalation set is over.
+            try:
+                agw.set_status('idle', pane_id=peer.pane)
+            except (agw.CtlError, OSError) as err:
+                self.log(f"could not clear blocked status for {peer.box}: {err}")
+        self.log(f"usage limit: probed {peer.box} (probe {episode.get('probes', 0) + 1}) [{outcome}]")
+
+    def escalate_wait(self, peer: Peer, episode: dict, reason: str) -> None:
+        """The only human-facing step of a wait: the probe could not be typed for limitRetryMinutes."""
+        subject = f"usage limit: {peer.box} ({peer.tool}) waiting, cannot probe"
+        body = "\n".join([f"Matched: {episode['line']}", f"Pane: {peer.box} ({peer.tool}) {peer.pane}",
+                           f"First seen: {episode['firstSeen']}", "",
+                           f"The relay could not type its probe pointer for {self.retry_seconds() / 60:g} min: "
+                           f"{reason}. The pane is not an idle agent composer (a shell, a dialog or a draft); "
+                           "the human has been notified. The relay keeps trying."])
+        self.alert_limit(peer, subject, body, reason)
 
     # the autonomous close (#27) ------------------------------------------------------------------
     def closer(self) -> "closer.Closer":
@@ -1216,7 +1360,10 @@ class Relay:
                 episode = self.state.get('limits', {}).get(peer.box)
                 if (episode and episode.get('kind') in ('limited', 'warning') and episode.get('announced')
                         and not self.draining):
-                    self.hold(peer, mid, 'usage limit')
+                    if episode.get('wait'):
+                        self.hold(peer, mid, 'usage limit, waiting it out', quiet=True)
+                    else:
+                        self.hold(peer, mid, 'usage limit')
                     continue
                 try:
                     # Claude and Kimi take Return, which would land in a running turn: ring between turns.

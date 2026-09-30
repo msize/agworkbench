@@ -1946,9 +1946,7 @@ def limit_frame(name):
     return (LIMIT_FIXTURES / f'{name}.txt').read_text(encoding='utf-8')
 
 
-class UsageLimits(DeliveryFixture):
-    """#24: the relay recognises a limited pane, tells the planner once, and holds its mail."""
-
+class UsageLimitFixture(DeliveryFixture):
     def setUp(self):
         super().setUp()
         self.r.hub.write_message = Mock(return_value=Path('limit.md'))
@@ -1967,6 +1965,10 @@ class UsageLimits(DeliveryFixture):
 
     def mails(self):
         return [c.kwargs for c in self.r.hub.write_message.call_args_list]
+
+
+class UsageLimits(UsageLimitFixture):
+    """#24: the relay recognises a limited pane, tells the planner once, and holds its mail."""
 
     def test_two_reads_announce_one_mail_status_and_notification(self):
         self.check()
@@ -2091,6 +2093,218 @@ class UsageLimits(DeliveryFixture):
         args = relay.build_parser().parse_args(['--hub', 'h', '--claude-pane', 'a', '--codex-pane', 'b', '--repo', 'o/r',
                                                 '--branch', 'x', '--limit-interval', '12'])
         self.assertEqual(12.0, args.limit_interval)
+
+
+def kimi_frame(name):
+    return (Path(__file__).resolve().parent / 'fixtures' / 'kimi' / f'{name}.txt').read_text(encoding='utf-8')
+
+
+class WaitOnLimit(UsageLimitFixture):
+    """#77: a checkout launched with -WaitOnLimit waits a usage limit out: no failover, nobody paged, a
+    probe pointer every limitRetryMinutes until the limit has reset."""
+
+    def setUp(self):
+        super().setUp()
+        self.use_disk_state()
+        self.peer = relay.Peer('codex', 'kimi', 'codex-pane')
+        self.r.peers = [self.peer]
+        self.config = self.r.hub_dir / 'config.json'
+        self.enterContext(patch.dict(os.environ, {'AGWORKBENCH_CONFIG': str(self.config)}))
+        self.on_limit('wait')
+        self.pane.return_value = limit_frame('kimi-limited-5hour')
+
+    def on_limit(self, value):
+        state = self.r.hub_dir / 'state'
+        state.mkdir(exist_ok=True)
+        (state / 'implementer.json').write_text(json.dumps({'tool': 'kimi', 'onLimit': value}), encoding='utf-8')
+
+    def episode(self):
+        return self.r.state.get('limits', {}).get(self.peer.box)
+
+    def probes_typed(self):
+        return [c for c in self.send.call_args_list if relay.PROBE_TEXT in c.args[2]]
+
+    def until_retry(self):
+        """Limit reads up to retryAt, and the one at it."""
+        while self.clock + 30 < self.episode()['retryAt']:
+            self.check()
+        self.check()
+
+    def paged(self):
+        return [c for c in self.status.call_args_list if c.args[:1] == ('blocked',)] + self.notify.call_args_list
+
+    def test_the_limit_is_announced_as_a_wait_that_asks_for_nothing_and_pages_nobody(self):
+        self.check(times=2)
+        mail = self.mails()
+        self.assertEqual(['usage limit: codex (kimi) waiting'], [m['subject'] for m in mail])
+        self.assertIn('Do nothing: no failover', mail[0]['body'])
+        self.assertIn("5-hour usage limit", mail[0]['body'])
+        self.assertNotIn('-Failover', mail[0]['body'])
+        self.status.assert_called_once_with('idle', pane_id='codex-pane')
+        self.assertEqual([], self.paged())
+        episode = self.episode()
+        self.assertEqual((True, 0, None, 'kimi'), (episode['wait'], episode['probes'], episode['probeAt'], episode['tool']))
+        self.assertEqual(self.clock + 30 * 60, episode['retryAt'])
+        saved = json.loads(self.r.state_file.read_text(encoding='utf-8'))['limits']['codex']
+        self.assertTrue(saved['wait'])                    # the conductor reads it from relay.json
+
+    def test_limit_retry_minutes_comes_from_the_config(self):
+        self.config.write_text(json.dumps({'limitRetryMinutes': 45}), encoding='utf-8')
+        self.check(times=2)
+        self.assertEqual(self.clock + 45 * 60, self.episode()['retryAt'])
+        for bad in (0, -1, '30', True):
+            with self.subTest(value=bad):
+                self.config.write_text(json.dumps({'limitRetryMinutes': bad}), encoding='utf-8')
+                self.assertEqual(30.0, relay.limit_retry_setting())
+
+    def test_held_mail_is_held_silently_however_long(self):
+        self.check(times=2)
+        self.status.reset_mock()
+        for instant in range(0, int(3 * relay.ALERT_EVERY), 5):
+            self.tick(instant)
+        self.send.assert_not_called()
+        self.assertEqual('usage limit, waiting it out', self.r.holds[('codex', 'm1')].reason)
+        self.assertEqual([], self.paged())
+        self.status.assert_not_called()
+
+    def test_nothing_is_typed_before_retry_at_and_one_probe_at_it(self):
+        self.check(times=2)
+        retry = self.episode()['retryAt']
+        while self.clock + 30 < retry:
+            self.check()
+            self.assertEqual([], self.probes_typed())
+        self.check()
+        self.assertEqual(1, len(self.probes_typed()))
+        self.assertEqual('Chat from Workbench: ' + relay.PROBE_TEXT, self.probes_typed()[0].args[2])
+        self.assertEqual(self.clock, self.episode()['probeAt'])
+
+    def test_a_probe_answered_by_the_limit_after_busy_reads_keeps_waiting(self):
+        self.check(times=2)
+        self.until_retry()
+        self.check('\n' + limit_frame('kimi-retrying'), times=3)       # busy reads are not misses
+        self.assertTrue(self.episode()['wait'])
+        self.check('kimi-limited-5hour')
+        episode = self.episode()
+        self.assertEqual((1, None), (episode['probes'], episode['probeAt']))
+        self.assertEqual(self.clock + 30 * 60, episode['retryAt'])
+        self.check(times=3)                                              # waiting again: no probe
+        self.assertEqual(1, len(self.probes_typed()))
+        self.assertEqual(['usage limit: codex (kimi) waiting'], [m['subject'] for m in self.mails()])
+        self.until_retry()
+        self.assertEqual(2, len(self.probes_typed()))
+        self.assertEqual([], self.paged())
+
+    def test_a_limit_that_reset_ends_the_episode_and_the_held_mail_rings(self):
+        self.check(times=2)
+        self.tick(0)
+        self.send.assert_not_called()
+        self.until_retry()
+        self.check('\n' + limit_frame('kimi-retrying'))
+        self.check('\n' + kimi_frame('idle-after-turn'), times=2)
+        self.assertIsNone(self.episode())
+        self.assertIn('usage limit episode ended for codex: the limit reset (probe 1)', self.logs)
+        self.tick(10)
+        self.assertEqual(2, self.send.call_count)                          # the probe, then the mail
+        self.assertIn('m1', self.send.call_args.args[2])
+        self.assertEqual(1, len(self.probes_typed()))
+        self.assertEqual([], self.paged())
+
+    def test_a_row_gone_before_retry_at_ends_the_episode_with_no_pointer(self):
+        # Only an interaction clears a positional limit row: somebody typed. The held mail wakes the agent.
+        self.check(times=2)
+        self.check('\n' + kimi_frame('idle-after-turn'), times=2)
+        self.assertIsNone(self.episode())
+        self.send.assert_not_called()
+        self.tick(0)
+        self.send.assert_called_once()
+        self.assertIn('m1', self.send.call_args.args[2])
+
+    def test_a_pane_nobody_can_type_into_is_retried_then_escalated_once(self):
+        self.send.side_effect = peerchat.Refused('composer not empty')
+        self.check(times=2)
+        self.until_retry()
+        self.assertEqual([], self.paged())
+        for _ in range(59):                                              # 30 more minutes of refusals
+            self.check()
+        self.assertEqual([], self.paged())
+        self.check()
+        self.status.assert_called_with('blocked', sound=True, blink=True, pane_id='codex-pane')
+        self.notify.assert_called_once()
+        self.assertEqual(['usage limit: codex (kimi) waiting', 'usage limit: codex (kimi) waiting, cannot probe'],
+                         [m['subject'] for m in self.mails()])
+        self.check(times=10)
+        self.notify.assert_called_once()
+        self.send.side_effect = None
+        self.send.return_value = 'submitted'
+        self.check()
+        self.assertEqual(self.clock, self.episode()['probeAt'])
+        self.assertNotIn('escalated', self.episode())
+        self.status.assert_called_with('idle', pane_id='codex-pane')       # FIX r1: blocked is over
+
+    def test_the_planner_waits_too_and_mail_to_it_is_held_quietly(self):
+        self.peer = relay.Peer('claude', 'claude', 'claude-pane')
+        self.r.peers = [self.peer]
+        self.r.limit_baseline['claude'] = set()
+        self.unread = {'claude': ['m1']}
+        self.check('claude-limited-idle', times=2)
+        mail = self.mails()[0]
+        self.assertEqual('usage limit: claude (claude) waiting', mail['subject'])
+        self.assertIn('the planner (you) is limited', mail['body'])
+        for instant in range(0, int(2 * relay.ALERT_EVERY), 5):
+            self.tick(instant)
+        self.send.assert_not_called()
+        self.assertEqual('usage limit, waiting it out', self.r.holds[('claude', 'm1')].reason)
+        self.assertEqual([], self.paged())
+        self.until_retry()
+        self.assertEqual(1, len(self.probes_typed()))
+        self.assertEqual('claude-pane', self.probes_typed()[0].args[0])
+
+    def test_a_codex_warning_chooser_keeps_the_failover_path(self):
+        self.peer = relay.Peer('codex', 'codex', 'codex-pane')
+        self.r.peers = [self.peer]
+        self.check('codex-warning-chooser', times=2)
+        mail = self.mails()[0]
+        self.assertEqual('usage limit: codex (codex) warning', mail['subject'])
+        self.assertIn('-Failover', mail['body'])
+        self.assertNotIn('wait', self.episode())
+        self.status.assert_called_with('blocked', sound=True, blink=True, pane_id='codex-pane')
+        self.tick(0)
+        self.assertEqual('usage limit', self.r.holds[('codex', 'm1')].reason)
+
+    def test_on_limit_failover_keeps_todays_path(self):
+        self.on_limit('failover')
+        self.check(times=2)
+        mail = self.mails()[0]
+        self.assertEqual('usage limit: codex (kimi) limited', mail['subject'])
+        self.assertIn('-Failover', mail['body'])
+        self.assertNotIn('wait', self.episode())
+        self.status.assert_called_with('blocked', sound=True, blink=True, pane_id='codex-pane')
+        self.notify.assert_called_once()
+        self.check(times=100)
+        self.assertEqual([], self.probes_typed())
+
+    def test_on_limit_is_read_on_every_check(self):
+        self.on_limit('failover')
+        self.check()
+        self.on_limit('wait')                                            # a relaunch saved -WaitOnLimit
+        self.check()
+        self.assertEqual(['usage limit: codex (kimi) waiting'], [m['subject'] for m in self.mails()])
+
+    def test_a_wait_episode_survives_a_restart(self):
+        self.check(times=2)
+        retry = self.episode()['retryAt']
+        self.restart_from_disk()
+        self.r.hub.write_message = Mock()
+        self.check(times=3)
+        self.r.hub.write_message.assert_not_called()
+        self.assertEqual((True, retry), (self.episode()['wait'], self.episode()['retryAt']))
+
+    def test_dry_run_types_no_probe(self):
+        self.check(times=2)
+        self.r.dry_run = True
+        self.clock = self.episode()['retryAt']
+        self.check(times=3)
+        self.assertEqual([], self.probes_typed())
 
 
 class AutonomousClose(unittest.TestCase):

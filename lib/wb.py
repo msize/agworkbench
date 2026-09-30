@@ -109,13 +109,68 @@ def revmux_profile(root: Path) -> str:
 
 def cmd_revmux(args: argparse.Namespace) -> int:
     root = checkout()
-    scope = (root / args.scope).resolve() if not Path(args.scope).is_absolute() else Path(args.scope)
+    if args.after is not None and not args.rerun:
+        raise SystemExit("wb: revmux --after goes with --rerun")
+    if args.after is not None and args.after < 1:
+        raise SystemExit("wb: revmux --after must be 1 or more minutes")
+    params = {}
+    scope_arg = args.scope
+    renames: list[tuple[Path, Path]] = []
+    if args.rerun:
+        # A round a reviewer's usage limit stopped (#77): same K, a new revmux run name - revmux refuses a
+        # round that has already run - and the limited report kept beside it. The attempt counts every
+        # limited file, so a rerun that died before its report still gets a fresh run name.
+        review = root / ".workbench" / "review"
+        report = review / f"revmux-r{args.round}.md"
+        earlier = [int(match[1]) for path in review.glob(f"revmux-r{args.round}-limited-*")
+                   if (match := re.fullmatch(rf"revmux-r{args.round}-limited-(\d+)\.(?:md|json)", path.name))]
+        if not report.is_file() and not earlier:
+            raise SystemExit(f"wb: revmux --rerun: no report to rerun: {report}")
+        # The current record's run counts too: a rerun that decided `limit` again left r<K>-<n> in it.
+        current = read_run_record(root, args.round) or {}
+        used = [current["attempt"]] if type(current.get("attempt")) is int else []
+        if match := re.fullmatch(rf"r{args.round}-(\d+)", str(current.get("run") or "")):
+            used.append(int(match[1]))
+        attempt = max(earlier + used, default=0) + 1
+        # The scope: this round's run record, else the newest limited one (a rerun that died early).
+        records = [read_run_record(root, args.round)]
+        if earlier:
+            try:
+                records.append(json.loads((review / f"revmux-r{args.round}-limited-{max(earlier)}.json")
+                                          .read_text(encoding="utf-8-sig")))
+            except (OSError, ValueError):
+                pass
+        if scope_arg is None:
+            scope_arg = next((record["scope"] for record in records
+                              if isinstance(record, dict) and isinstance(record.get("scope"), str)), None)
+        if report.is_file():
+            renames.append((report, review / f"revmux-r{args.round}-limited-{attempt}.md"))
+            if run_record_path(root, args.round).exists():
+                renames.append((run_record_path(root, args.round),
+                                review / f"revmux-r{args.round}-limited-{attempt}.json"))
+        params.update(Run=f"r{args.round}-{attempt}", Attempt=str(attempt))
+        if args.after is not None:
+            params["After"] = str(args.after)
+    if scope_arg is None:
+        raise SystemExit("wb: revmux needs --scope (a rerun reuses the limited run's scope when it was recorded)")
+    scope = (root / scope_arg).resolve() if not Path(scope_arg).is_absolute() else Path(scope_arg)
     if not scope.is_file():
         raise SystemExit(f"wb: scope file not found: {scope}")
     command = pane_command("run-revmux.ps1", Checkout=str(root), ScopeFile=str(scope),
-                           Round=str(args.round), Profile=args.profile or revmux_profile(root))
-    sid = open_session(f"#{issue_number(root)} revmux r{args.round}", root, command, select=False)
-    print(f"revmux round {args.round} running in session {sid}; the report will arrive as mail")
+                           Round=str(args.round), Profile=args.profile or revmux_profile(root), **params)
+    # The limited report is set aside last, and put back when the session does not start.
+    done: list[tuple[Path, Path]] = []
+    try:
+        for source, target in renames:
+            source.rename(target)
+            done.append((source, target))
+        sid = open_session(f"#{issue_number(root)} revmux r{args.round}", root, command, select=False)
+    except BaseException:
+        for source, target in reversed(done):
+            target.rename(source)
+        raise
+    wait = f" after a {args.after}-minute wait for the reviewer's usage limit" if args.after else ""
+    print(f"revmux round {args.round} running in session {sid}{wait}; the report will arrive as mail")
     return 0
 
 
@@ -216,7 +271,8 @@ def checkout_settings(root: Path) -> dict:
         # implementer.json is missing, so it stays claude-only, which every revmux has.
         profile = "comprehensive" if tool == "codex" else "claude-only"
     return {"implementer": tool, "revmuxProfile": profile, "autoMerge": saved.get("autoMerge") is True,
-            "autonomous": saved.get("autonomous") is True, "bigReview": saved.get("bigReview") is True}
+            "autonomous": saved.get("autonomous") is True, "bigReview": saved.get("bigReview") is True,
+            "onLimit": "wait" if saved.get("onLimit") == "wait" else "failover"}
 
 
 def failover_setting() -> bool:
@@ -244,7 +300,7 @@ def cmd_settings(args: argparse.Namespace) -> int:
     print(f"implementer={settings['implementer']} revmuxProfile={settings['revmuxProfile']} "
           f"autoMerge={'true' if settings['autoMerge'] else 'false'} "
           f"autonomous={'true' if settings['autonomous'] else 'false'} {review_line} {cap_line} "
-          f"failover={'true' if failover_setting() else 'false'}")
+          f"failover={'true' if failover_setting() else 'false'} onLimit={settings['onLimit']}")
     return 0
 
 
@@ -542,7 +598,10 @@ def merge_failures(pr: dict, inline: list[dict], head: str, root: Path, checks: 
 SEVERE_SECTIONS = ("blocker", "critical", "major")
 MINOR_SECTIONS = ("minor", "immaterial")
 APART_SECTIONS = ("pre-existing", "open questions")      # counted, but they decide nothing
-REVIEW_DECISIONS = ("continue", "stop", "clean", "cap")
+REVIEW_DECISIONS = ("continue", "stop", "clean", "cap", "limit")
+# `limit` (#77): in a checkout that waits out usage limits, a round a reviewer's usage limit degraded is
+# no review at all - it is rerun under the same K, so it never counts toward the cap.
+REVIEW_ON_LIMIT = ("wait", "fallback")
 
 
 class ReportError(ValueError):
@@ -733,6 +792,11 @@ def check_review(root: Path) -> list[str]:
     if not last:
         return []
     k, severe = last["round"], int(last.get("severe") or 0)
+    if last["decision"] == "limit":
+        # The rerun's report has the same K, so the newest-report test above cannot see it (#77).
+        return [f"review: round {k} hit a reviewer usage limit ({', '.join(last.get('limitedAgents') or ['?'])}); "
+                f"rerun it (wb.py revmux --round {k} --rerun), then run wb.py review-round --round {k} "
+                "on the rerun's report"]
     if last["decision"] == "continue":
         if last.get("degraded"):
             return [f"review: round {k} was degraded; another revmux round is due"]
@@ -796,18 +860,256 @@ def cmd_review_round(args: argparse.Namespace) -> int:
     # stopWhenNoMajor apply) instead of reading clean. One that did not reproduce at all errs the safe way.
     minor = sum(counts[name] for name in MINOR_SECTIONS) + max(revmux_severe - severe, 0)
     decision = review_decision(args.round, severe, minor, parsed["degraded"], settings)
+    limited = []
+    if parsed["degraded"] and checkout_settings(root)["onLimit"] == "wait":
+        limited = rate_limited_agents(root, args.round)
+        if limited:
+            decision = "limit"
     entry = {"round": args.round, "counts": counts, "revmuxSevere": revmux_severe, "severe": severe,
              "reason": (args.reason or "").strip() or None, "degraded": parsed["degraded"], "decision": decision,
              "stopWhenNoMajor": settings["stopWhenNoMajor"], "minRounds": settings["minRounds"],
              "cap": cap["cap"], "big": cap["big"], "bigReason": cap["reason"], "at": time.time()}
+    if limited:
+        entry["limitedAgents"] = limited
     entries = [e for e in load_review_rounds(root) if e["round"] != args.round] + [entry]
     save_review_rounds(root, sorted(entries, key=lambda e: e["round"]))
+    if decision == "limit":
+        return review_limit(root, args.round, limited)
+    clear_review_limit(root, args.round)
     print(f"review: {decision}{' (degraded)' if parsed['degraded'] else ''}")
     print(f"round {args.round}: {severe} Major+ (revmux {revmux_severe}), {minor} minor, "
           f"{counts['pre-existing']} pre-existing, {counts['open questions']} open question(s); "
           f"stopWhenNoMajor={'true' if settings['stopWhenNoMajor'] else 'false'} minRounds={settings['minRounds']} "
           f"cap={cap['cap']}" + (f" (big: {cap['reason']})" if cap["big"] else ""))
     return 0
+
+
+# --- a Kimi-grade plan (#77) ----------------------------------------------------------------------
+# When Kimi implements, the planner's plan must spell out what to edit and what not, what defines
+# correct, the tests to write first, the traps and what "done" means - or say STOP AND REPORT when
+# correctness rests on an outside spec or sample the repo does not have.
+
+KIMI_PLAN_SECTIONS = ("Exact edits", "Must not change", "Tests first", "Pitfalls", "Done means")
+STOP_LINE = "STOP AND REPORT"
+PLAN_HEADING = re.compile(r"^\s*(?:#{1,6}\s+(?P<hash>.+?)|\*\*(?P<bold>[^*]+?)\*\*[\s:.-]*)\s*$")
+PLAN_PATH = re.compile(r"(?<![\w/\\])[\w.@-]+(?:[/\\][\w.@-]+)+")
+PLAN_FILE = re.compile(r"\.\w{1,8}$")                     # a last segment with a file extension
+PLAN_URL = re.compile(r"\S+://\S+")
+PLAN_HOST = re.compile(r"^[\w-]+(?:\.[\w-]+)*\.[A-Za-z]{2,}$")   # example.org: a host, not a directory
+# A STOP verdict opens its line (after a list bullet, bold or backticks): a plan that restates the rule
+# ("without one, the plan says STOP AND REPORT") in Pitfalls has not said STOP, and neither has a line
+# that opens with the marker but states it as a condition ("STOP AND REPORT: if ...").
+STOP_OPEN = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)?[*_`]*STOP AND REPORT\b")
+STOP_AFTER = re.compile(r"^[\s*_`:,(\-–—]*(?:if|when|unless|whenever)\b", re.I)
+STOP_CONDITION = re.compile(r"\b(?:if|when|unless|whenever|without)\b", re.I)
+STOP_CLAUSE = re.compile(r"[;,:]|\s[-–—]\s")
+
+
+def plan_sections(text: str) -> dict[str, list[str]]:
+    """{casefolded heading: its lines} for `#`..`######` headings and lines that are only `**bold**`."""
+    sections: dict[str, list[str]] = {}
+    current = None
+    for line in text.splitlines():
+        match = PLAN_HEADING.match(line)
+        if match:
+            title = (match["hash"] or match["bold"]).strip().strip("*:").strip()
+            title = re.sub(r"^(?:\d+[.)]\s*)", "", title)          # "1. Exact edits"
+            current = title.casefold()
+            sections.setdefault(current, [])
+        elif current is not None:
+            sections[current].append(line)
+    return sections
+
+
+def plan_says_stop(text: str) -> bool:
+    """The plan's verdict is STOP: a line opening with the marker, or the Oracle section's first line
+    carrying it ("none in the repo - STOP AND REPORT"). Either way the words right after the marker
+    must not make it a condition ("STOP AND REPORT: if ..."), and on the Oracle line the clause right
+    before it must not either ("if the offsets are unsourced, STOP AND REPORT"); a reason elsewhere in
+    the line may use such words."""
+    def conditional(after: str) -> bool:
+        return bool(STOP_AFTER.match(after))
+
+    for line in text.splitlines():
+        match = STOP_OPEN.match(line)
+        if match and not conditional(line[match.end():]):
+            return True
+    oracle = next((lines for title, lines in plan_sections(text).items() if title.startswith("oracle")), [])
+    first = next((line for line in oracle if line.strip()), "")
+    if STOP_LINE not in first:
+        return False
+    before, after = first.split(STOP_LINE, 1)
+    return not STOP_CONDITION.search(STOP_CLAUSE.split(before)[-1]) and not conditional(after)
+
+
+def plan_paths(line: str, root: Path | None) -> list[str]:
+    """The path-looking tokens of a line that can be an oracle. With the checkout known, only what
+    exists there; without it (a direct call), a last segment with a file extension. Never a URL or a
+    host (an outside spec is what Kimi must not implement from, #309); `read/write`, `and/or` and
+    `I/O` are prose."""
+    tokens = [token for token in PLAN_PATH.findall(PLAN_URL.sub(" ", line))
+              if not PLAN_HOST.match(re.split(r"[/\\]", token)[0])]
+    if root is not None:
+        return [token for token in tokens if (root / token).exists()]
+    return [token for token in tokens if PLAN_FILE.search(token)]
+
+
+def plan_problems(text: str, root: Path | None = None) -> list[str]:
+    sections = plan_sections(text)
+
+    def find(name: str) -> list[str] | None:
+        key = name.casefold()
+        found = [lines for title, lines in sections.items() if title.startswith(key)]
+        return [line for lines in found for line in lines] if found else None
+
+    problems = [f"missing section: {name}" for name in KIMI_PLAN_SECTIONS if find(name) is None]
+    done = find("Done means")
+    if done is not None and not re.search(r"\bskipped\b", "\n".join(done), re.I):
+        problems.append("Done means does not ask for skipped tests by name")
+    oracle = find("Oracle")
+    stop = plan_says_stop(text)
+    if not stop and not (oracle and any(plan_paths(line, root) for line in oracle)):
+        problems.append(f"no Oracle section naming at least one path, and no {STOP_LINE} line")
+    return problems
+
+
+def cmd_plan_check(args: argparse.Namespace) -> int:
+    root = checkout()
+    tool = checkout_settings(root)["implementer"]
+    if tool != "kimi":
+        print(f"plan-check: not required (implementer={tool})")
+        return 0
+    path = Path(args.plan) if args.plan else root / ".workbench" / "plan.md"
+    path = path if path.is_absolute() else root / path
+    try:
+        text = path.read_text(encoding="utf-8-sig", errors="replace")
+    except OSError as err:
+        print(f"plan-check: cannot read {path}: {err}", file=sys.stderr)
+        return 2
+    problems = plan_problems(text, root)
+    for problem in problems:
+        print(f"plan-check: {problem}")
+    if problems:
+        print(f"plan-check: {path.name} is not a Kimi-grade plan (start-github-issue.md, Phase 2)")
+        return 1
+    print("plan-check: ok" + (f" ({STOP_LINE})" if plan_says_stop(text) else ""))
+    return 0
+
+
+# --- a reviewer's usage limit in a checkout that waits limits out (#77) ------------------------------
+
+def review_limit_path(root: Path) -> Path:
+    return root / ".workbench" / "state" / "review-limit.json"
+
+
+def run_record_path(root: Path, round_: int) -> Path:
+    return root / ".workbench" / "review" / f"revmux-r{round_}.json"
+
+
+def read_run_record(root: Path, round_: int) -> dict | None:
+    """run-revmux.ps1's record of the revmux run behind revmux-r<K>.md: {run, dir, profile, attempt, scope}."""
+    try:
+        record = json.loads(run_record_path(root, round_).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def rate_limited_agents(root: Path, round_: int) -> list[str]:
+    """The agents revmux degraded for a rate limit in round K's run, from its events.jsonl: the
+    `agent_degraded` events whose text says `rate limited` (revmux find.go's fault, every executor).
+    The markdown Sources table only says `degraded`. Empty when the run cannot be read."""
+    record = read_run_record(root, round_)
+    if not record or not isinstance(record.get("dir"), str) or not record["dir"]:
+        return []
+    try:
+        lines = (Path(record["dir"]) / "events.jsonl").read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    agents = []
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if (isinstance(event, dict) and event.get("kind") == "agent_degraded"
+                and "rate limited" in str(event.get("text") or "")):
+            agent = str(event.get("agent") or "?")
+            if agent not in agents:
+                agents.append(agent)
+    return agents
+
+
+def limited_tool(root: Path, round_: int, agents: list[str]) -> str:
+    """The tool behind the limited agents, for the queue's status line: kimi, codex or claude. An
+    agent is a lens group (`bugs+impl`), so its executor comes from the run's manifest.json; a guess
+    from the name only for what the manifest does not list (synthesis, verify) or when it is unreadable."""
+    executors: dict[str, str] = {}
+    record = read_run_record(root, round_)
+    if record and isinstance(record.get("dir"), str) and record["dir"]:
+        try:
+            manifest = json.loads((Path(record["dir"]) / "manifest.json").read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            manifest = None
+        listed = manifest.get("agents") if isinstance(manifest, dict) else None
+        for agent in listed if isinstance(listed, list) else []:
+            if isinstance(agent, dict) and isinstance(agent.get("name"), str) and isinstance(agent.get("executor"), str):
+                executors[agent["name"]] = agent["executor"]
+    tools = [executors[agent] for agent in agents if agent in executors]
+    for tool in ("kimi", "codex", "claude"):
+        if tool in tools:
+            return tool
+    for tool in ("kimi", "codex", "claude"):
+        if any(tool in agent.casefold() for agent in agents if agent not in executors):
+            return tool
+    return tools[0] if tools else agents[0] if agents else "?"
+
+
+def review_on_limit() -> str:
+    """`reviewOnLimit` from ~/.agworkbench.json: wait (default) or fallback. The launcher refuses others."""
+    try:
+        value = followup.read_config().get("reviewOnLimit")
+    except followup.SettingsError:
+        return "wait"
+    return value if value in REVIEW_ON_LIMIT else "wait"
+
+
+def limit_retry_minutes() -> float:
+    import relay
+    return relay.limit_retry_setting()
+
+
+def review_limit(root: Path, round_: int, agents: list[str]) -> int:
+    print(f"review: limit (reviewer usage limit: {', '.join(agents)})")
+    print(f"round {round_} is no review: it does not count toward the cap, and merge-check refuses it until "
+          f"it is rerun and recorded")
+    if review_on_limit() == "fallback":
+        clear_review_limit(root, round_)
+        print(f"next: rerun now with python \"$AGWORKBENCH/lib/wb.py\" revmux --round {round_} --rerun "
+              "--profile claude-only (reviewOnLimit=fallback)")
+        return 0
+    minutes = max(1, math.ceil(limit_retry_minutes()))      # revmux --after takes whole minutes
+    since = time.time()
+    from conductor import atomic_json
+    atomic_json(review_limit_path(root), {"tool": limited_tool(root, round_, agents), "agents": agents, "since": since,
+                                          "retryAt": since + minutes * 60, "round": round_})
+    print(f"next: rerun with python \"$AGWORKBENCH/lib/wb.py\" revmux --round {round_} --rerun --after {minutes} "
+          "(it waits on screen, then reviews); keep your waiter and end your turn")
+    return 0
+
+
+def clear_review_limit(root: Path, round_: int) -> None:
+    """A recorded decision other than `limit` for round K ends a wait on round K or an earlier one."""
+    path = review_limit_path(root)
+    try:
+        record = json.loads(path.read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError):
+        record = None
+    waited = record.get("round") if isinstance(record, dict) else None
+    if type(waited) is not int or waited <= round_:
+        path.unlink(missing_ok=True)
 
 
 def review_summary(root: Path) -> int:
@@ -819,6 +1121,9 @@ def review_summary(root: Path) -> int:
         print("wb: review-round --summary: no review round recorded", file=sys.stderr)
         return 2
     k, decision = last["round"], last["decision"]
+    if decision == "limit":
+        print(f"review: round {k} hit a reviewer usage limit; rerun it first - no summary yet")
+        return 1
     if decision not in ("stop", "clean") and not (decision == "cap" and last.get("stopWhenNoMajor") is False):
         print(f"review: round {k} decided {decision}; no summary yet")
         return 1
@@ -1972,9 +2277,18 @@ def main() -> int:
     p.set_defaults(func=cmd_loop_state)
     p = subs.add_parser("revmux", help="run a revmux round in its own visible session")
     p.add_argument("--round", type=int, required=True)
-    p.add_argument("--scope", required=True, help="scope file, relative to the clone or absolute")
+    p.add_argument("--scope", help="scope file, relative to the clone or absolute (required, except that a "
+                                   "--rerun reuses the recorded one)")
     p.add_argument("--profile", help="revmux profile (default: the one the launcher saved for this checkout)")
+    p.add_argument("--rerun", action="store_true",
+                   help="rerun round K that a reviewer's usage limit stopped (#77): the report is kept as "
+                        "revmux-r<K>-limited-<n>.md and revmux runs as r<K>-<n>")
+    p.add_argument("--after", type=int, metavar="MINUTES",
+                   help="with --rerun: wait this long on screen first, for the reviewer's limit to reset")
     p.set_defaults(func=cmd_revmux)
+    p = subs.add_parser("plan-check", help="with a Kimi implementer: is the plan Kimi-grade? (#77)")
+    p.add_argument("--plan", help="default .workbench/plan.md")
+    p.set_defaults(func=cmd_plan_check)
     p = subs.add_parser("settings", help="print this checkout's settings (implementer, revmux profile, auto-merge, review, failover)")
     p.set_defaults(func=cmd_settings)
     p = subs.add_parser("handover", help="facts for a HANDOVER mail to a new implementer (#24)")
@@ -1999,7 +2313,7 @@ def main() -> int:
     p.add_argument("--pr", required=True, help="PR number or URL")
     p.add_argument("--head", required=True, help="the full SHA the whole suite passed on")
     p.set_defaults(func=cmd_merge_check)
-    p = subs.add_parser("review-round", help="record a verified revmux round's decision: continue, stop, clean or cap (#64)")
+    p = subs.add_parser("review-round", help="record a verified revmux round's decision: continue, stop, clean, cap, or limit (#64, #77)")
     p.add_argument("--round", type=int)
     p.add_argument("--report", help="default .workbench/review/revmux-r<K>.md")
     p.add_argument("--severe", type=int, help="the verified Blocker+Critical+Major count, when it differs from revmux's")

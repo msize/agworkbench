@@ -131,16 +131,22 @@ function Get-WorkbenchConfig {
          minFreeRamGB   the queue admits no member while less memory is free (GiB; default 3, 0 turns
                         the guard off; #61)
          stallMinutes   the relay's stall watch (#45): minutes a loop may sit idle with nothing to wake
-                        it before the planner gets a stall pointer (default 15, 0 turns it off) #>
+                        it before the planner gets a stall pointer (default 15, 0 turns it off)
+         limitRetryMinutes  a checkout launched with -WaitOnLimit (#77): minutes between the relay's
+                        probes of an agent waiting out its usage limit, and the wait before a review
+                        round a reviewer's limit stopped is rerun (default 30, more than 0)
+         reviewOnLimit  a revmux round a reviewer's usage limit degraded, with -WaitOnLimit (#77): wait
+                        (default) reruns it after limitRetryMinutes, fallback reruns it now with
+                        claude-only #>
     $path = Join-Path $HOME '.agworkbench.json'
     if ($env:AGWORKBENCH_CONFIG) { $path = $env:AGWORKBENCH_CONFIG }   # tests point this elsewhere
     $config = @{ claudeArgs = @(); codexArgs = @(); checkoutRoot = (Join-Path $HOME 'source\workbench'); allowNetwork = $false;
                  implementer = 'codex'; revmuxProfile = $null; autoMerge = $false; failover = $true; autonomous = $false;
                  cleanup = 'merged'; minFreeGB = 20; minFreeRamGB = 3; stallMinutes = 15; kimiPath = $null; kimiArgs = @();
-                 failoverOrder = @('claude', 'codex', 'kimi') }
+                 failoverOrder = @('claude', 'codex', 'kimi'); limitRetryMinutes = 30; reviewOnLimit = 'wait' }
     if (Test-Path -LiteralPath $path) {
         $loaded = Get-Content -Raw -LiteralPath $path | ConvertFrom-Json
-        foreach ($key in @('claudeArgs', 'codexArgs', 'checkoutRoot', 'allowNetwork', 'implementer', 'revmuxProfile', 'autoMerge', 'failover', 'autonomous', 'cleanup', 'minFreeGB', 'minFreeRamGB', 'stallMinutes', 'kimiPath', 'kimiArgs', 'failoverOrder')) {
+        foreach ($key in @('claudeArgs', 'codexArgs', 'checkoutRoot', 'allowNetwork', 'implementer', 'revmuxProfile', 'autoMerge', 'failover', 'autonomous', 'cleanup', 'minFreeGB', 'minFreeRamGB', 'stallMinutes', 'kimiPath', 'kimiArgs', 'failoverOrder', 'limitRetryMinutes', 'reviewOnLimit')) {
             if ($null -ne $loaded.$key) { $config[$key] = $loaded.$key }
         }
     }
@@ -181,6 +187,14 @@ function Get-WorkbenchConfig {
     $stall = $config.stallMinutes
     if (-not ($stall -is [int] -or $stall -is [long] -or $stall -is [double] -or $stall -is [decimal]) -or $stall -lt 0) {
         throw "stallMinutes in '$path' must be a number >= 0 (got '$stall')"
+    }
+    # The relay and wb.py read these themselves (#77); a bad value fails here, at launch.
+    $retry = $config.limitRetryMinutes
+    if (-not ($retry -is [int] -or $retry -is [long] -or $retry -is [double] -or $retry -is [decimal]) -or $retry -le 0) {
+        throw "limitRetryMinutes in '$path' must be a number > 0 (got '$retry')"
+    }
+    if ($config.reviewOnLimit -isnot [string] -or $config.reviewOnLimit -cnotin @('wait', 'fallback')) {
+        throw "reviewOnLimit in '$path' must be wait or fallback (got '$($config.reviewOnLimit)')"
     }
     return $config
 }
@@ -1105,10 +1119,13 @@ function Resolve-Implementer {
        -NoAutoMerge (use -NoAutonomous); -NoAutonomous alone leaves auto-merge as saved.
        Big review (#75) is policy as well: off unless saved, and -BigReview / -NoBigReview
        ($RequestedBigReview true/false) changes it.
-       Returns @{ Tool; RevmuxProfile; AutoMerge; Autonomous; BigReview; Conflict }, Conflict being a refusal
+       Waiting out usage limits (#77) is policy too: failover unless saved, and -WaitOnLimit /
+       -NoWaitOnLimit ($RequestedOnLimit 'wait'/'failover') changes it.
+       Returns @{ Tool; RevmuxProfile; AutoMerge; Autonomous; BigReview; OnLimit; Conflict }, Conflict being a refusal
        message or $null. #>
     param([string] $Checkout, [string] $Requested, $Config, $Tree, [switch] $NoProbe, $RequestedAutoMerge = $null,
-          $RequestedAutonomous = $null, [string] $RequestedRevmuxProfile, $RequestedBigReview = $null)
+          $RequestedAutonomous = $null, [string] $RequestedRevmuxProfile, $RequestedBigReview = $null,
+          [string] $RequestedOnLimit)
     if ($Requested -and -not (Test-ImplementerTool $Requested)) { throw [ImplementerConflict]::new("-Implementer must be codex, claude or kimi (got '$Requested')") }
     $saved = Get-SavedImplementerTool $Checkout
     $tool = $Config.implementer
@@ -1146,11 +1163,15 @@ function Resolve-Implementer {
     $savedBigReview = Get-SavedSetting $Checkout 'bigReview'
     if ($null -ne $savedBigReview) { $bigReview = $savedBigReview }
     if ($null -ne $RequestedBigReview) { $bigReview = [bool]$RequestedBigReview }
+    $onLimit = 'failover'
+    $savedOnLimit = Get-SavedOnLimit $Checkout
+    if ($savedOnLimit) { $onLimit = $savedOnLimit }
+    if ($RequestedOnLimit) { $onLimit = $RequestedOnLimit }
     # A queue's explicit profile (#66) wins over the config's; it comes with a conductor launch only.
     $chosenProfile = $Config.revmuxProfile
     if ($RequestedRevmuxProfile) { $chosenProfile = $RequestedRevmuxProfile }
     return @{ Tool = $tool; RevmuxProfile = (Get-RevmuxProfile $tool $chosenProfile); AutoMerge = $autoMerge;
-              Autonomous = $autonomous; BigReview = $bigReview; Cleanup = [string]$Config.cleanup; Conflict = $conflict }
+              Autonomous = $autonomous; BigReview = $bigReview; OnLimit = $onLimit; Cleanup = [string]$Config.cleanup; Conflict = $conflict }
 }
 
 function Get-SavedSetting([string] $Checkout, [string] $Name) {
@@ -1163,15 +1184,26 @@ function Get-SavedSetting([string] $Checkout, [string] $Name) {
     return $null
 }
 
+function Get-SavedOnLimit([string] $Checkout) {
+    # 'wait' or 'failover' from the checkout's settings record (#77), or $null when it was never decided there.
+    $path = Get-ImplementerStatePath $Checkout
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    try { $data = Get-Content -Raw -LiteralPath $path -Encoding UTF8 | ConvertFrom-Json } catch { return $null }
+    if ($data.onLimit -is [string] -and $data.onLimit -cin @('wait', 'failover')) { return $data.onLimit }
+    return $null
+}
+
 function Save-Implementer([string] $Checkout, $Resolved) {
     # state\implementer.json is the checkout's settings record: the implementer tool (#20), its
-    # revmux profile, auto-merge (#23) and big review (#75). wb.py reads it for the planner. `cleanup` (#41) is the
+    # revmux profile, auto-merge (#23), big review (#75) and onLimit (#77). wb.py reads it for the planner,
+    # the relay for its limit checks. `cleanup` (#41) is the
     # config's, recorded at each launch: the relay runs in its own session and never sees the config.
     $path = Get-ImplementerStatePath $Checkout
     $cleanup = 'merged'
     if ($Resolved.Cleanup) { $cleanup = [string]$Resolved.Cleanup }
     $record = [pscustomobject]@{ tool = $Resolved.Tool; revmuxProfile = $Resolved.RevmuxProfile; autoMerge = [bool]$Resolved.AutoMerge;
-                                 autonomous = [bool]$Resolved.Autonomous; bigReview = [bool]$Resolved.BigReview; cleanup = $cleanup }
+                                 autonomous = [bool]$Resolved.Autonomous; bigReview = [bool]$Resolved.BigReview;
+                                 onLimit = [string]$Resolved.OnLimit; cleanup = $cleanup }
     if (Test-Path -LiteralPath $path) {
         try {
             $current = Get-Content -Raw -LiteralPath $path -Encoding UTF8 | ConvertFrom-Json
@@ -1181,11 +1213,12 @@ function Save-Implementer([string] $Checkout, $Resolved) {
                 $current.autoMerge -is [bool] -and $current.autoMerge -eq $record.autoMerge -and
                 $current.autonomous -is [bool] -and $current.autonomous -eq $record.autonomous -and
                 $current.bigReview -is [bool] -and $current.bigReview -eq $record.bigReview -and
+                $current.onLimit -ceq $record.onLimit -and
                 $current.cleanup -ceq $record.cleanup) { return }
         } catch { Write-LaunchLog implementer "replacing unreadable '$path': $_" }
     }
     Write-AtomicJson $path $record
-    Write-Step "implementer: $($record.tool) (revmux profile $($record.revmuxProfile)); auto-merge $(Format-AutoMerge $record.autoMerge); autonomous $(Format-AutoMerge $record.autonomous); big review $(Format-AutoMerge $record.bigReview)"
+    Write-Step "implementer: $($record.tool) (revmux profile $($record.revmuxProfile)); auto-merge $(Format-AutoMerge $record.autoMerge); autonomous $(Format-AutoMerge $record.autonomous); big review $(Format-AutoMerge $record.bigReview); on limit $($record.onLimit)"
 }
 
 function Format-AutoMerge([bool] $Value) {
@@ -2189,7 +2222,7 @@ function Format-AdoptedBlock([string] $Checkout, [string] $Issue) {
 function Invoke-LauncherBody {
     param([string] $Issue, [string] $Repo, [switch] $DryRun, [switch] $Yes, [switch] $NoRelay, [switch] $NewSession,
           [string] $Implementer, $AutoMerge = $null, [switch] $Failover, $Autonomous = $null, [string] $RevmuxProfile,
-          $BigReview = $null)
+          $BigReview = $null, [string] $OnLimit)
     $script:Launch.ClaudeHerePending = $false
     $script:Launch.ExitCode = 0
     $script:Launch.NewSession = [bool]$NewSession
@@ -2279,7 +2312,7 @@ function Invoke-LauncherBody {
     }
     if ($DryRun) {
         $resolved = Resolve-Implementer -Checkout $co.Dir -Requested $Implementer -Config $config -NoProbe -RequestedAutoMerge $AutoMerge -RequestedAutonomous $Autonomous `
-            -RequestedRevmuxProfile $RevmuxProfile -RequestedBigReview $BigReview
+            -RequestedRevmuxProfile $RevmuxProfile -RequestedBigReview $BigReview -RequestedOnLimit $OnLimit
         $codexLaunch = (& $implementerLines $resolved.Tool).Launch
         if ($adoptionPlan) {
             Write-Step "would $($adoptionPlan.Mode) session '$($adoptionPlan.Session.id)' as '#$($ref.Number) $slug' in workspace '$workspaceName'"
@@ -2289,7 +2322,7 @@ function Invoke-LauncherBody {
             Write-Step "would open session '#$($ref.Number) $slug' in workspace '$workspaceName'"
             Write-Step "left pane:  $claudeLaunch"
         }
-        Write-Step "implementer: $($resolved.Tool) (revmux profile $($resolved.RevmuxProfile)); auto-merge $(Format-AutoMerge $resolved.AutoMerge); autonomous $(Format-AutoMerge $resolved.Autonomous); big review $(Format-AutoMerge $resolved.BigReview)"
+        Write-Step "implementer: $($resolved.Tool) (revmux profile $($resolved.RevmuxProfile)); auto-merge $(Format-AutoMerge $resolved.AutoMerge); autonomous $(Format-AutoMerge $resolved.Autonomous); big review $(Format-AutoMerge $resolved.BigReview); on limit $($resolved.OnLimit)"
         if ($resolved.Conflict) { Write-Step "would refuse unless the right pane is a shell: $($resolved.Conflict)" }
         if ($Failover) {
             $choice = Get-FailoverTarget -Checkout $co.Dir -Config $config -Saved $resolved.Tool -NoProbe
@@ -2333,7 +2366,7 @@ function Invoke-LauncherBody {
             Set-LaunchStage implementer
         }
         $resolved = Resolve-Implementer -Checkout $co.Dir -Requested $Implementer -Config $config -Tree (Get-Tree) -RequestedAutoMerge $AutoMerge -RequestedAutonomous $Autonomous `
-            -RequestedRevmuxProfile $RevmuxProfile -RequestedBigReview $BigReview
+            -RequestedRevmuxProfile $RevmuxProfile -RequestedBigReview $BigReview -RequestedOnLimit $OnLimit
         if ($resolved.Conflict) { throw [ImplementerConflict]::new($resolved.Conflict) }
         # Kimi is checked before anything is recorded, so a refusal changes nothing (#65). A failover
         # to kimi checked it before it stopped the limited agent.

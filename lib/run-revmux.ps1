@@ -14,11 +14,20 @@
   report is posted to Claude and the relay rings its pane: Claude never waits on it.
 
   Exit 1 from revmux means findings were reported. It is a success.
+
+  The run it used is recorded in .workbench/review/revmux-r<Round>.json ({run, dir, profile, attempt,
+  scope}): wb.py review-round reads the run's events.jsonl from `dir` to tell a reviewer's usage limit
+  from any other degraded source (#77). A rerun of a round (wb.py revmux --rerun) passes its own -Run
+  (r<Round>-<n>: revmux refuses a round that has already run) and -Attempt, and -After M first waits
+  M minutes on screen, redrawing its line every minute, for a reviewer's limit to reset.
 #>
 param([Parameter(Mandatory = $true)] [string] $Checkout,
       [Parameter(Mandatory = $true)] [string] $ScopeFile,
       [int] $Round = 1,
-      [string] $Profile = 'comprehensive')
+      [string] $Profile = 'comprehensive',
+      [string] $Run,
+      [int] $Attempt = 0,
+      [int] $After = 0)
 
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'Workbench.ps1')
@@ -28,17 +37,30 @@ $reviewDir = Join-Path $hubDir 'review'
 New-Item -ItemType Directory -Force -Path $reviewDir | Out-Null
 $report = Join-Path $reviewDir "revmux-r$Round.md"
 
-$run = "r$Round"
+$run = if ($Run) { $Run } else { "r$Round" }
 $code = $null
 $posted = $false
 $why = $null
 try {
+if ($After -gt 0) {
+    # Visible and stoppable (#77): the human sees what it waits for, and the relay's stall watch sees
+    # the pane change every minute.
+    $start = (Get-Date).AddMinutes($After)
+    while ((Get-Date) -lt $start) {
+        $left = [math]::Ceiling(($start - (Get-Date)).TotalMinutes)
+        Write-Host ("waiting for the reviewer's usage limit: starts at {0:HH:mm}, {1} min left" -f $start, $left) -ForegroundColor Cyan
+        Start-Sleep -Seconds ([math]::Min(60, [math]::Max(1, ($start - (Get-Date)).TotalSeconds)))
+    }
+}
 $created = & revmux new --task workbench --run $run | Out-String
 if ($LASTEXITCODE -ne 0) { throw "revmux new failed: $created" }
 $paths = $created | ConvertFrom-Json
 Copy-Item -LiteralPath $ScopeFile -Destination $paths.scope -Force
+$record = [pscustomobject]@{ run = $run; dir = [string]$paths.round_dir; profile = $Profile; attempt = $Attempt;
+                             scope = [string](Resolve-Path -LiteralPath $ScopeFile) }
+Write-AtomicJson (Join-Path $reviewDir "revmux-r$Round.json") $record
 
-Write-Host "revmux round $Round, profile $Profile -> $report" -ForegroundColor Cyan
+Write-Host "revmux round $Round (run $run), profile $Profile -> $report" -ForegroundColor Cyan
 & revmux --task workbench --run $run --profile $Profile --markdown | Out-File -FilePath $report -Encoding utf8
 $code = $LASTEXITCODE
 $verdict = switch ($code) { 0 { 'clean' } 1 { 'findings reported' } default { "tool error (exit $code)" } }
