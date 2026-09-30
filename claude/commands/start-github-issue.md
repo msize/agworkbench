@@ -349,7 +349,8 @@ headed exactly so:
   only the `splice_worksheet` call, not the rest of the per-sheet loop").
 - **Must not change** - what the edits must leave alone, listed explicitly.
 - **Oracle** - the fixture, reference file or sibling code that defines correct behaviour, **by
-  path**. If the repo has none, the plan says `STOP AND REPORT` and why, instead of an oracle: Kimi
+  path**. The path must exist in the checkout: a URL or an outside spec is never an oracle (plan-check
+  counts only what exists). If the repo has none, the plan says `STOP AND REPORT` and why, instead of an oracle: Kimi
   must never invent a format or a sample. **The verdict is a line of its own that starts with
   `STOP AND REPORT`** (a list bullet or bold around it is fine), or the Oracle section's first line.
   The marker inside a sentence, such as a rule restated in Pitfalls, is not a verdict: a restated rule

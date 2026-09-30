@@ -1768,13 +1768,17 @@ class ReviewLimit(unittest.TestCase):
         directory = self.folder / 'revmux-tasks' / run
         directory.mkdir(parents=True, exist_ok=True)
         (directory / 'events.jsonl').write_text(''.join(json.dumps(e) + '\n' for e in events), encoding='utf-8')
+        # revmux's agents are lens groups; the manifest names each one's executor (kimi-mixed's shape).
+        (directory / 'manifest.json').write_text(json.dumps({'run': run, 'agents': [
+            {'name': 'bugs+impl', 'executor': 'claude'}, {'name': 'adversarial', 'executor': 'kimi'}]}),
+            encoding='utf-8')
         (self.reviews / f'revmux-r{round_}.json').write_text(json.dumps(
             {'run': run, 'dir': str(directory), 'profile': 'kimi-mixed', 'attempt': 0,
              'scope': str(self.folder / 'scope.md')}), encoding='utf-8')
 
     RATE_LIMITED = [{'kind': 'stage', 'text': 'find'},
-                    {'kind': 'agent_degraded', 'agent': 'kimi-finder',
-                     'text': "agent kimi-finder rate limited: you've reached your 5-hour usage limit"}]
+                    {'kind': 'agent_degraded', 'agent': 'adversarial',
+                     'text': "agent adversarial rate limited: you've reached your 5-hour usage limit"}]
     STALLED = [{'kind': 'agent_degraded', 'agent': 'claude-a', 'text': 'agent claude-a stalled'}]
 
     def review_limit(self):
@@ -1786,12 +1790,12 @@ class ReviewLimit(unittest.TestCase):
         self.config.write_text(json.dumps({'limitRetryMinutes': 45}), encoding='utf-8')
         self.run_dir(2, self.RATE_LIMITED)
         before = time.time()
-        self.assertEqual('review: limit (reviewer usage limit: kimi-finder)', self.decision(2, self.LIMITED))
+        self.assertEqual('review: limit (reviewer usage limit: adversarial)', self.decision(2, self.LIMITED))
         out = self.out.getvalue()
         self.assertIn('revmux --round 2 --rerun --after 45', out)
         self.assertIn('does not count toward the cap', out)
         entry = self.entries()[-1]
-        self.assertEqual(('limit', ['kimi-finder'], True), (entry['decision'], entry['limitedAgents'], entry['degraded']))
+        self.assertEqual(('limit', ['adversarial'], True), (entry['decision'], entry['limitedAgents'], entry['degraded']))
         wait = self.review_limit()
         self.assertEqual(('kimi', 2), (wait['tool'], wait['round']))
         self.assertAlmostEqual(before + 45 * 60, wait['retryAt'], delta=5)
@@ -1800,7 +1804,7 @@ class ReviewLimit(unittest.TestCase):
         self.on_limit()
         self.config.write_text(json.dumps({'reviewOnLimit': 'fallback'}), encoding='utf-8')
         self.run_dir(1, self.RATE_LIMITED)
-        self.assertEqual('review: limit (reviewer usage limit: kimi-finder)', self.decision(1, self.LIMITED))
+        self.assertEqual('review: limit (reviewer usage limit: adversarial)', self.decision(1, self.LIMITED))
         self.assertIn('revmux --round 1 --rerun --profile claude-only', self.out.getvalue())
         self.assertIsNone(self.review_limit())
 
@@ -1810,6 +1814,26 @@ class ReviewLimit(unittest.TestCase):
         self.run_dir(1, self.RATE_LIMITED)
         self.decision(1, self.LIMITED)
         self.assertIn('--rerun --after 1 ', self.out.getvalue())
+
+    def test_the_tool_comes_from_the_manifest_not_the_lens_group_name(self):
+        # FIX r3 m2: `adversarial` names no tool; the manifest says it ran on kimi.
+        self.on_limit()
+        self.run_dir(2, self.RATE_LIMITED)
+        self.decision(2, self.LIMITED)
+        self.assertEqual('kimi', self.review_limit()['tool'])
+        claude_group = [{'kind': 'agent_degraded', 'agent': 'bugs+impl', 'text': 'agent bugs+impl rate limited: rejected'}]
+        self.run_dir(3, claude_group)
+        self.decision(3, self.LIMITED)
+        self.assertEqual('claude', self.review_limit()['tool'])
+        # Not in the manifest (synthesis), or no readable manifest: the name is the only clue.
+        synthesis = [{'kind': 'agent_degraded', 'agent': 'kimi synthesis', 'text': 'agent kimi synthesis rate limited: 403'}]
+        self.run_dir(4, synthesis)
+        self.decision(4, self.LIMITED)
+        self.assertEqual('kimi', self.review_limit()['tool'])
+        self.run_dir(5, claude_group)
+        (self.folder / 'revmux-tasks' / 'r5' / 'manifest.json').write_text('not json', encoding='utf-8')
+        self.decision(5, self.LIMITED)
+        self.assertEqual('bugs+impl', self.review_limit()['tool'])
 
     def test_failover_and_other_degradations_decide_as_before(self):
         self.run_dir(1, self.RATE_LIMITED)
@@ -1825,7 +1849,7 @@ class ReviewLimit(unittest.TestCase):
     def test_a_limit_at_the_cap_is_still_a_limit(self):
         self.on_limit()
         self.run_dir(5, self.RATE_LIMITED)
-        self.assertEqual('review: limit (reviewer usage limit: kimi-finder)', self.decision(5, self.LIMITED))
+        self.assertEqual('review: limit (reviewer usage limit: adversarial)', self.decision(5, self.LIMITED))
 
     def test_merge_check_refuses_a_limit_until_the_rerun_is_recorded(self):
         self.on_limit()
@@ -1833,7 +1857,7 @@ class ReviewLimit(unittest.TestCase):
         self.decision(2, self.LIMITED)
         code, lines = self.merge_check()
         self.assertEqual(1, code)
-        self.assertIn('review: round 2 hit a reviewer usage limit (kimi-finder); rerun it (wb.py revmux --round 2 '
+        self.assertIn('review: round 2 hit a reviewer usage limit (adversarial); rerun it (wb.py revmux --round 2 '
                       '--rerun), then run wb.py review-round --round 2 on the rerun\'s report', lines)
         self.assertEqual(1, self.wb('review-round', '--summary'))
         self.assertIn('rerun it first', self.out.getvalue())
@@ -2479,6 +2503,10 @@ class PlanCheck(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.folder)
         self.enterContext(patch.dict(os.environ, {'AI_HUB': str(self.folder / '.workbench')}))
         (self.folder / '.workbench/state/implementer.json').write_text('{"tool": "kimi"}', encoding='utf-8')
+        # KIMI_PLAN's oracle: with the checkout known, an oracle path must exist there (FIX r3 m3).
+        for name in ('tests/fixtures/macro-sheet.xlsm', 'crates/xlsx/tests/roundtrip.rs'):
+            (self.folder / name).parent.mkdir(parents=True, exist_ok=True)
+            (self.folder / name).write_text('x', encoding='utf-8')
 
     def check(self, plan, *extra):
         (self.folder / '.workbench/plan.md').write_text(plan, encoding='utf-8')
@@ -2538,22 +2566,45 @@ class PlanCheck(unittest.TestCase):
                 code, out = self.check(KIMI_PLAN.replace(oracle, prose))
                 self.assertEqual(1, code)
                 self.assertIn('no Oracle section naming at least one path', out)
+        self.assertEqual(1, self.check(KIMI_PLAN.replace(oracle, '- tests/fixtures/x.docx'))[0])   # not there
+        (self.folder / 'tests/fixtures/x.docx').write_text('x', encoding='utf-8')
         self.assertEqual(0, self.check(KIMI_PLAN.replace(oracle, '- tests/fixtures/x.docx'))[0])
-        (self.folder / 'tests/fixtures').mkdir(parents=True)
         self.assertEqual(0, self.check(KIMI_PLAN.replace(oracle, '- the files in `tests/fixtures/`'))[0])
+
+    def test_an_outside_spec_is_never_an_oracle(self):
+        # FIX r3 m3: an outside spec is what Kimi must not implement from (#309).
+        oracle = "- `tests/fixtures/macro-sheet.xlsm` and `crates/xlsx/tests/roundtrip.rs` (sibling code to mirror)."
+        for outside in ('- https://example.org/spec.pdf', '- example.org/spec.pdf', '- see <https://example.com/spec.pdf>'):
+            with self.subTest(outside=outside):
+                code, out = self.check(KIMI_PLAN.replace(oracle, outside))
+                self.assertEqual(1, code)
+                self.assertIn('no Oracle section naming at least one path', out)
+        self.assertEqual([], wb.plan_paths('- https://example.org/spec.pdf', None))
+        self.assertEqual(['tests/x.docx'], wb.plan_paths('- `tests/x.docx`, read/write', None))   # a direct call
 
     def test_a_conditional_stop_is_not_a_verdict(self):
         # FIX r2 m2, m3: the rule restated as a bullet, or a condition before the marker in the Oracle.
         no_oracle = KIMI_PLAN.replace('## Oracle', '## Background')
+        # FIX r3 m1: the words right after the marker decide, past punctuation, bold and backticks.
         for line in ('- STOP AND REPORT when a field offset has no source in the repo.',
-                     '- **STOP AND REPORT** if the corpus is missing.'):
+                     '- **STOP AND REPORT** if the corpus is missing.', '- STOP AND REPORT: if the corpus is missing.',
+                     '- **STOP AND REPORT** - when unsure.', '- STOP AND REPORT (if the corpus is missing)',
+                     '- STOP AND REPORT, when unsure', '- STOP AND REPORT — whenever in doubt'):
             with self.subTest(line=line):
                 self.assertEqual(1, self.check(no_oracle + '\n' + line + '\n')[0])
+        for line in ('- STOP AND REPORT: the corpus is missing, and if it were here the plan would change.',
+                     '- **STOP AND REPORT**: without the MPX layout every offset is a guess.'):
+            with self.subTest(line=line):
+                self.assertEqual((0, 'plan-check: ok (STOP AND REPORT)\n'), self.check(no_oracle + '\n' + line + '\n'))
         oracle = "- `tests/fixtures/macro-sheet.xlsm` and `crates/xlsx/tests/roundtrip.rs` (sibling code to mirror)."
-        code, out = self.check(KIMI_PLAN.replace(oracle, 'Without a sample in the repo, STOP AND REPORT.'))
-        self.assertEqual(1, code)
-        self.assertEqual((0, 'plan-check: ok (STOP AND REPORT)\n'),
-                         self.check(KIMI_PLAN.replace(oracle, 'None in the repo: STOP AND REPORT.')))
+        # On the Oracle's first line: only the clause right before the marker, and the words after it.
+        for first, code in (('None in the repo: STOP AND REPORT.', 0),
+                            ('None in the repo; without one every offset is a guess: STOP AND REPORT.', 0),
+                            ('Without a sample in the repo, STOP AND REPORT.', 0),
+                            ('If the offsets have no source STOP AND REPORT.', 1),
+                            ('None in the repo: STOP AND REPORT if unsure.', 1)):
+            with self.subTest(first=first):
+                self.assertEqual(code, self.check(KIMI_PLAN.replace(oracle, first))[0])
 
     def test_bold_and_numbered_headings_count(self):
         plan = KIMI_PLAN.replace('## Exact edits', '**Exact edits**').replace('## Pitfalls', '### 4. Pitfalls:')
@@ -2589,7 +2640,8 @@ class KimiPlanProse(unittest.TestCase):
                        'is lenient: an unknown value falls back to the old behaviour, never to a new hard error',
                        'cites its source in the repo', 'wb.py" plan-check', 'never implemented as a guess',
                        '**The verdict is a line of its own that starts with `STOP AND REPORT`**',
-                       'is not a verdict', 'a restated rule never opens its line with the marker']:
+                       'is not a verdict', 'a restated rule never opens its line with the marker',
+                       'The path must exist in the checkout: a URL or an outside spec is never an oracle']:
             self.assertIn(needle, kimi)
         self.assertLess(kimi.index('plan-check'), kimi.index('Send it as `plan v1`'))
         phase4 = text.split('## Phase 4')[1].split('## Phase 5')[0]

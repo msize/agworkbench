@@ -894,12 +894,15 @@ STOP_LINE = "STOP AND REPORT"
 PLAN_HEADING = re.compile(r"^\s*(?:#{1,6}\s+(?P<hash>.+?)|\*\*(?P<bold>[^*]+?)\*\*[\s:.-]*)\s*$")
 PLAN_PATH = re.compile(r"(?<![\w/\\])[\w.@-]+(?:[/\\][\w.@-]+)+")
 PLAN_FILE = re.compile(r"\.\w{1,8}$")                     # a last segment with a file extension
+PLAN_URL = re.compile(r"\S+://\S+")
+PLAN_HOST = re.compile(r"^[\w-]+(?:\.[\w-]+)*\.[A-Za-z]{2,}$")   # example.org: a host, not a directory
 # A STOP verdict opens its line (after a list bullet, bold or backticks): a plan that restates the rule
 # ("without one, the plan says STOP AND REPORT") in Pitfalls has not said STOP, and neither has a line
-# that opens with the marker but states it as a condition ("STOP AND REPORT when ...").
-STOP_VERDICT = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)?[*_`]*STOP AND REPORT\b"
-                          r"(?![*_`]*\s+(?i:if|when|unless|whenever)\b)")
+# that opens with the marker but states it as a condition ("STOP AND REPORT: if ...").
+STOP_OPEN = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)?[*_`]*STOP AND REPORT\b")
+STOP_AFTER = re.compile(r"^[\s*_`:,(\-–—]*(?:if|when|unless|whenever)\b", re.I)
 STOP_CONDITION = re.compile(r"\b(?:if|when|unless|whenever|without)\b", re.I)
+STOP_CLAUSE = re.compile(r"[;,:]|\s[-–—]\s")
 
 
 def plan_sections(text: str) -> dict[str, list[str]]:
@@ -920,19 +923,35 @@ def plan_sections(text: str) -> dict[str, list[str]]:
 
 def plan_says_stop(text: str) -> bool:
     """The plan's verdict is STOP: a line opening with the marker, or the Oracle section's first line
-    carrying it ("none in the repo - STOP AND REPORT") with no condition before it."""
-    if any(STOP_VERDICT.match(line) for line in text.splitlines()):
-        return True
+    carrying it ("none in the repo - STOP AND REPORT"). Either way the words right after the marker
+    must not make it a condition ("STOP AND REPORT: if ..."), and on the Oracle line the clause right
+    before it must not either ("if the offsets are unsourced, STOP AND REPORT"); a reason elsewhere in
+    the line may use such words."""
+    def conditional(after: str) -> bool:
+        return bool(STOP_AFTER.match(after))
+
+    for line in text.splitlines():
+        match = STOP_OPEN.match(line)
+        if match and not conditional(line[match.end():]):
+            return True
     oracle = next((lines for title, lines in plan_sections(text).items() if title.startswith("oracle")), [])
     first = next((line for line in oracle if line.strip()), "")
-    return STOP_LINE in first and not STOP_CONDITION.search(first.split(STOP_LINE)[0])
+    if STOP_LINE not in first:
+        return False
+    before, after = first.split(STOP_LINE, 1)
+    return not STOP_CONDITION.search(STOP_CLAUSE.split(before)[-1]) and not conditional(after)
 
 
 def plan_paths(line: str, root: Path | None) -> list[str]:
-    """The path-looking tokens of a line: a last segment with a file extension, or something that
-    exists under the checkout. `read/write`, `and/or` and `I/O` are prose."""
-    return [token for token in PLAN_PATH.findall(line)
-            if PLAN_FILE.search(token) or (root is not None and (root / token).exists())]
+    """The path-looking tokens of a line that can be an oracle. With the checkout known, only what
+    exists there; without it (a direct call), a last segment with a file extension. Never a URL or a
+    host (an outside spec is what Kimi must not implement from, #309); `read/write`, `and/or` and
+    `I/O` are prose."""
+    tokens = [token for token in PLAN_PATH.findall(PLAN_URL.sub(" ", line))
+              if not PLAN_HOST.match(re.split(r"[/\\]", token)[0])]
+    if root is not None:
+        return [token for token in tokens if (root / token).exists()]
+    return [token for token in tokens if PLAN_FILE.search(token)]
 
 
 def plan_problems(text: str, root: Path | None = None) -> list[str]:
@@ -1021,12 +1040,29 @@ def rate_limited_agents(root: Path, round_: int) -> list[str]:
     return agents
 
 
-def limited_tool(agents: list[str]) -> str:
-    """The tool behind the limited agents, for the queue's status line: kimi, codex or claude."""
+def limited_tool(root: Path, round_: int, agents: list[str]) -> str:
+    """The tool behind the limited agents, for the queue's status line: kimi, codex or claude. An
+    agent is a lens group (`bugs+impl`), so its executor comes from the run's manifest.json; a guess
+    from the name only for what the manifest does not list (synthesis, verify) or when it is unreadable."""
+    executors: dict[str, str] = {}
+    record = read_run_record(root, round_)
+    if record and isinstance(record.get("dir"), str) and record["dir"]:
+        try:
+            manifest = json.loads((Path(record["dir"]) / "manifest.json").read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            manifest = None
+        listed = manifest.get("agents") if isinstance(manifest, dict) else None
+        for agent in listed if isinstance(listed, list) else []:
+            if isinstance(agent, dict) and isinstance(agent.get("name"), str) and isinstance(agent.get("executor"), str):
+                executors[agent["name"]] = agent["executor"]
+    tools = [executors[agent] for agent in agents if agent in executors]
     for tool in ("kimi", "codex", "claude"):
-        if any(tool in agent.casefold() for agent in agents):
+        if tool in tools:
             return tool
-    return agents[0] if agents else "?"
+    for tool in ("kimi", "codex", "claude"):
+        if any(tool in agent.casefold() for agent in agents if agent not in executors):
+            return tool
+    return tools[0] if tools else agents[0] if agents else "?"
 
 
 def review_on_limit() -> str:
@@ -1055,7 +1091,7 @@ def review_limit(root: Path, round_: int, agents: list[str]) -> int:
     minutes = max(1, math.ceil(limit_retry_minutes()))      # revmux --after takes whole minutes
     since = time.time()
     from conductor import atomic_json
-    atomic_json(review_limit_path(root), {"tool": limited_tool(agents), "agents": agents, "since": since,
+    atomic_json(review_limit_path(root), {"tool": limited_tool(root, round_, agents), "agents": agents, "since": since,
                                           "retryAt": since + minutes * 60, "round": round_})
     print(f"next: rerun with python \"$AGWORKBENCH/lib/wb.py\" revmux --round {round_} --rerun --after {minutes} "
           "(it waits on screen, then reviews); keep your waiter and end your turn")
