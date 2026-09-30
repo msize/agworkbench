@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import stat
 import sys
+import time
 import tempfile
 import unittest
 import uuid
@@ -1747,6 +1748,148 @@ class ReviewRound(unittest.TestCase):
 def git(folder, *args):
     return subprocess.run(['git', '-C', str(folder), '-c', 'user.name=t', '-c', 'user.email=t@t', *args],
                           check=True, capture_output=True, text=True).stdout
+
+
+class ReviewLimit(unittest.TestCase):
+    """#77: in a checkout that waits out usage limits, a revmux round a reviewer's usage limit degraded
+    decides `limit`: no review, not counted toward the cap, refused by merge-check until it is rerun."""
+    setUp, configure, wb, record, decision, entries, merge_check = (
+        ReviewRound.setUp, ReviewRound.configure, ReviewRound.wb, ReviewRound.record, ReviewRound.decision,
+        ReviewRound.entries, ReviewRound.merge_check)
+
+    LIMITED = revmux_report([('Minor', 1)], statuses=('ok', 'degraded', 'ok', 'ok'))
+
+    def on_limit(self, value='wait'):
+        (self.state / 'implementer.json').write_text(json.dumps({'tool': 'kimi', 'onLimit': value}), encoding='utf-8')
+
+    def run_dir(self, round_, events, run=None):
+        """The revmux run behind revmux-r<K>.md, as run-revmux.ps1 records it."""
+        run = run or f'r{round_}'
+        directory = self.folder / 'revmux-tasks' / run
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / 'events.jsonl').write_text(''.join(json.dumps(e) + '\n' for e in events), encoding='utf-8')
+        (self.reviews / f'revmux-r{round_}.json').write_text(json.dumps(
+            {'run': run, 'dir': str(directory), 'profile': 'kimi-mixed', 'attempt': 0,
+             'scope': str(self.folder / 'scope.md')}), encoding='utf-8')
+
+    RATE_LIMITED = [{'kind': 'stage', 'text': 'find'},
+                    {'kind': 'agent_degraded', 'agent': 'kimi-finder',
+                     'text': "agent kimi-finder rate limited: you've reached your 5-hour usage limit"}]
+    STALLED = [{'kind': 'agent_degraded', 'agent': 'claude-a', 'text': 'agent claude-a stalled'}]
+
+    def review_limit(self):
+        path = self.state / 'review-limit.json'
+        return json.loads(path.read_text(encoding='utf-8')) if path.exists() else None
+
+    def test_a_rate_limited_round_in_a_wait_checkout_decides_limit_and_waits(self):
+        self.on_limit()
+        self.config.write_text(json.dumps({'limitRetryMinutes': 45}), encoding='utf-8')
+        self.run_dir(2, self.RATE_LIMITED)
+        before = time.time()
+        self.assertEqual('review: limit (reviewer usage limit: kimi-finder)', self.decision(2, self.LIMITED))
+        out = self.out.getvalue()
+        self.assertIn('revmux --round 2 --rerun --after 45', out)
+        self.assertIn('does not count toward the cap', out)
+        entry = self.entries()[-1]
+        self.assertEqual(('limit', ['kimi-finder'], True), (entry['decision'], entry['limitedAgents'], entry['degraded']))
+        wait = self.review_limit()
+        self.assertEqual(('kimi', 2), (wait['tool'], wait['round']))
+        self.assertAlmostEqual(before + 45 * 60, wait['retryAt'], delta=5)
+
+    def test_fallback_says_rerun_now_with_claude_only(self):
+        self.on_limit()
+        self.config.write_text(json.dumps({'reviewOnLimit': 'fallback'}), encoding='utf-8')
+        self.run_dir(1, self.RATE_LIMITED)
+        self.assertEqual('review: limit (reviewer usage limit: kimi-finder)', self.decision(1, self.LIMITED))
+        self.assertIn('revmux --round 1 --rerun --profile claude-only', self.out.getvalue())
+        self.assertIsNone(self.review_limit())
+
+    def test_failover_and_other_degradations_decide_as_before(self):
+        self.run_dir(1, self.RATE_LIMITED)
+        self.on_limit('failover')
+        self.assertEqual('review: continue (degraded)', self.decision(1, self.LIMITED))
+        self.on_limit()
+        self.run_dir(1, self.STALLED)
+        self.assertEqual('review: continue (degraded)', self.decision(1, self.LIMITED))
+        (self.reviews / 'revmux-r1.json').unlink()               # no run record: nothing to read
+        self.assertEqual('review: continue (degraded)', self.decision(1, self.LIMITED))
+        self.assertIsNone(self.review_limit())
+
+    def test_a_limit_at_the_cap_is_still_a_limit(self):
+        self.on_limit()
+        self.run_dir(5, self.RATE_LIMITED)
+        self.assertEqual('review: limit (reviewer usage limit: kimi-finder)', self.decision(5, self.LIMITED))
+
+    def test_merge_check_refuses_a_limit_until_the_rerun_is_recorded(self):
+        self.on_limit()
+        self.run_dir(2, self.RATE_LIMITED)
+        self.decision(2, self.LIMITED)
+        code, lines = self.merge_check()
+        self.assertEqual(1, code)
+        self.assertIn('review: round 2 hit a reviewer usage limit (kimi-finder); rerun it (wb.py revmux --round 2 '
+                      '--rerun), then run wb.py review-round --round 2 on the rerun\'s report', lines)
+        self.assertEqual(1, self.wb('review-round', '--summary'))
+        self.assertIn('rerun it first', self.out.getvalue())
+        # The rerun: same K, its report replaces the limited one, and its decision replaces `limit`.
+        self.run_dir(2, [], run='r2-1')
+        self.assertEqual('review: clean', self.decision(2, revmux_report(no_findings=True)))
+        self.assertEqual(['clean'], [e['decision'] for e in self.entries()])
+        self.assertIsNone(self.review_limit())
+        self.assertEqual((0, ['ok']), self.merge_check())
+
+    def test_a_decision_for_another_round_keeps_the_wait(self):
+        self.on_limit()
+        self.run_dir(2, self.RATE_LIMITED)
+        self.decision(2, self.LIMITED)
+        self.decision(1, revmux_report([('Major', 1)]))
+        self.assertEqual(2, self.review_limit()['round'])
+
+
+class RevmuxRerun(unittest.TestCase):
+    """#77: wb.py revmux --rerun reruns round K under a new revmux run name, keeping the limited report."""
+    setUp = RevmuxProfile.setUp
+
+    def revmux(self, *args):
+        with patch.object(sys, 'argv', ['wb.py', 'revmux', '--round', '2', *args]):
+            return wb.main()
+
+    def test_a_rerun_keeps_the_limited_report_and_uses_a_new_run_name(self):
+        review = self.folder / '.workbench/review'
+        review.mkdir()
+        (review / 'revmux-r2.md').write_text('limited', encoding='utf-8')
+        (review / 'revmux-r2.json').write_text(json.dumps({'run': 'r2', 'dir': 'x', 'scope': str(self.folder / 'scope.md')}),
+                                               encoding='utf-8')
+        self.assertEqual(0, self.revmux('--rerun', '--after', '30'))
+        command = self.opened.call_args.args[2]
+        self.assertEqual('#20 revmux r2', self.opened.call_args.args[0])
+        for part in ('-Round 2', '-Run r2-1', '-Attempt 1', '-After 30', f'-ScopeFile "{self.folder / "scope.md"}"'):
+            self.assertIn(part, command)
+        self.assertEqual('limited', (review / 'revmux-r2-limited-1.md').read_text(encoding='utf-8'))
+        self.assertTrue((review / 'revmux-r2-limited-1.json').exists())
+        self.assertFalse((review / 'revmux-r2.md').exists())
+        (review / 'revmux-r2.md').write_text('limited again', encoding='utf-8')
+        self.assertEqual(0, self.revmux('--rerun', '--scope', 'scope.md', '--profile', 'claude-only'))
+        command = self.opened.call_args.args[2]
+        for part in ('-Run r2-2', '-Attempt 2', '-Profile claude-only'):
+            self.assertIn(part, command)
+        self.assertNotIn('-After', command)
+        self.assertTrue((review / 'revmux-r2-limited-2.md').exists())
+
+    def test_rerun_refusals(self):
+        with self.assertRaises(SystemExit) as caught:
+            self.revmux('--scope', 'scope.md', '--after', '30')
+        self.assertIn('--after goes with --rerun', str(caught.exception))
+        with self.assertRaises(SystemExit) as caught:
+            self.revmux('--rerun', '--scope', 'scope.md')
+        self.assertIn('no report to rerun', str(caught.exception))
+        with self.assertRaises(SystemExit) as caught:
+            self.revmux()
+        self.assertIn('needs --scope', str(caught.exception))
+        self.opened.assert_not_called()
+
+    def test_a_first_round_passes_no_run_name(self):
+        self.assertEqual(0, self.revmux('--scope', 'scope.md'))
+        self.assertNotIn('-Run', self.opened.call_args.args[2])
 
 
 class ReviewCapSources(unittest.TestCase):

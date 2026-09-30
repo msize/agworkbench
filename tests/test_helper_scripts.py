@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -50,6 +51,48 @@ class HelperScripts(unittest.TestCase):
         [mail] = self.mails()
         self.assertEqual(('helper', 'note'), (mail['from'], mail['kind']))
         self.assertEqual('revmux round 2: ended without a report (it did not finish)', mail['subject'])
+
+    def stub_revmux(self):
+        """A revmux that records its argv, answers `new` with its paths and a round with a clean report."""
+        stub = self.bin / 'revmux_stub.py'
+        stub.write_text(
+            'import json, sys, pathlib\n'
+            f'root = pathlib.Path(r"{self.folder}")\n'
+            'with open(root / "calls.txt", "a", encoding="utf-8") as f: f.write(" ".join(sys.argv[1:]) + "\\n")\n'
+            'if sys.argv[1] == "new":\n'
+            '    run = sys.argv[sys.argv.index("--run") + 1]\n'
+            '    d = root / "tasks" / run; (d / "input").mkdir(parents=True, exist_ok=True)\n'
+            '    print(json.dumps({"round_dir": str(d), "scope": str(d / "input" / "scope.md")}))\n'
+            'else:\n'
+            '    print("# Review\\n\\nNo findings.\\n\\n## Sources\\n\\n| agent | status |\\n| --- | --- |\\n| a | ok |")\n',
+            encoding='utf-8')
+        (self.bin / 'revmux.cmd').write_text(f'@"{sys.executable}" "{stub}" %*\r\n', encoding='utf-8')
+
+    def test_a_round_records_the_revmux_run_it_used(self):
+        # #77: review-round reads the run's events.jsonl from this record.
+        self.stub_revmux()
+        scope = self.checkout / 'scope.md'
+        scope.write_text('scope', encoding='utf-8')
+        done = self.run_script('run-revmux.ps1', '-ScopeFile', str(scope), '-Round', '2', '-Profile', 'kimi-mixed')
+        self.assertEqual(0, done.returncode, done.stdout + done.stderr)
+        record = json.loads((self.checkout / '.workbench/review/revmux-r2.json').read_text(encoding='utf-8-sig'))
+        self.assertEqual({'run': 'r2', 'dir': str(self.folder / 'tasks' / 'r2'), 'profile': 'kimi-mixed', 'attempt': 0,
+                          'scope': str(scope)}, record)
+        [mail] = self.mails()
+        self.assertEqual('revmux round 2: clean', mail['subject'])
+
+    def test_a_rerun_passes_its_own_run_name(self):
+        self.stub_revmux()
+        scope = self.checkout / 'scope.md'
+        scope.write_text('scope', encoding='utf-8')
+        done = self.run_script('run-revmux.ps1', '-ScopeFile', str(scope), '-Round', '2', '-Run', 'r2-1', '-Attempt', '1')
+        self.assertEqual(0, done.returncode, done.stdout + done.stderr)
+        calls = (self.folder / 'calls.txt').read_text(encoding='utf-8').splitlines()
+        self.assertIn('new --task workbench --run r2-1', calls)
+        self.assertTrue(any(call.startswith('--task workbench --run r2-1 ') for call in calls), calls)
+        record = json.loads((self.checkout / '.workbench/review/revmux-r2.json').read_text(encoding='utf-8-sig'))
+        self.assertEqual(('r2-1', 1), (record['run'], record['attempt']))
+        self.assertTrue((self.checkout / '.workbench/review/revmux-r2.md').exists())
 
     def test_a_review_that_fails_mails_the_planner(self):
         (self.bin / 'revdiff.ps1').write_text("throw 'revdiff crashed'\n", encoding='utf-8')

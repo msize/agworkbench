@@ -109,13 +109,39 @@ def revmux_profile(root: Path) -> str:
 
 def cmd_revmux(args: argparse.Namespace) -> int:
     root = checkout()
-    scope = (root / args.scope).resolve() if not Path(args.scope).is_absolute() else Path(args.scope)
+    if args.after is not None and not args.rerun:
+        raise SystemExit("wb: revmux --after goes with --rerun")
+    if args.after is not None and args.after < 1:
+        raise SystemExit("wb: revmux --after must be 1 or more minutes")
+    params = {}
+    scope_arg = args.scope
+    if args.rerun:
+        # A round a reviewer's usage limit stopped (#77): same K, a new revmux run name - revmux refuses a
+        # round that has already run - and the limited report kept beside it.
+        review = root / ".workbench" / "review"
+        report = review / f"revmux-r{args.round}.md"
+        if not report.is_file():
+            raise SystemExit(f"wb: revmux --rerun: no report to rerun: {report}")
+        attempt = 1 + sum(1 for _ in review.glob(f"revmux-r{args.round}-limited-*.md"))
+        record = read_run_record(root, args.round)
+        if scope_arg is None and record and isinstance(record.get("scope"), str):
+            scope_arg = record["scope"]
+        report.rename(review / f"revmux-r{args.round}-limited-{attempt}.md")
+        if run_record_path(root, args.round).exists():
+            run_record_path(root, args.round).rename(review / f"revmux-r{args.round}-limited-{attempt}.json")
+        params.update(Run=f"r{args.round}-{attempt}", Attempt=str(attempt))
+        if args.after is not None:
+            params["After"] = str(args.after)
+    if scope_arg is None:
+        raise SystemExit("wb: revmux needs --scope (a rerun reuses the limited run's scope when it was recorded)")
+    scope = (root / scope_arg).resolve() if not Path(scope_arg).is_absolute() else Path(scope_arg)
     if not scope.is_file():
         raise SystemExit(f"wb: scope file not found: {scope}")
     command = pane_command("run-revmux.ps1", Checkout=str(root), ScopeFile=str(scope),
-                           Round=str(args.round), Profile=args.profile or revmux_profile(root))
+                           Round=str(args.round), Profile=args.profile or revmux_profile(root), **params)
     sid = open_session(f"#{issue_number(root)} revmux r{args.round}", root, command, select=False)
-    print(f"revmux round {args.round} running in session {sid}; the report will arrive as mail")
+    wait = f" after a {args.after}-minute wait for the reviewer's usage limit" if args.after else ""
+    print(f"revmux round {args.round} running in session {sid}{wait}; the report will arrive as mail")
     return 0
 
 
@@ -543,7 +569,10 @@ def merge_failures(pr: dict, inline: list[dict], head: str, root: Path, checks: 
 SEVERE_SECTIONS = ("blocker", "critical", "major")
 MINOR_SECTIONS = ("minor", "immaterial")
 APART_SECTIONS = ("pre-existing", "open questions")      # counted, but they decide nothing
-REVIEW_DECISIONS = ("continue", "stop", "clean", "cap")
+REVIEW_DECISIONS = ("continue", "stop", "clean", "cap", "limit")
+# `limit` (#77): in a checkout that waits out usage limits, a round a reviewer's usage limit degraded is
+# no review at all - it is rerun under the same K, so it never counts toward the cap.
+REVIEW_ON_LIMIT = ("wait", "fallback")
 
 
 class ReportError(ValueError):
@@ -734,6 +763,11 @@ def check_review(root: Path) -> list[str]:
     if not last:
         return []
     k, severe = last["round"], int(last.get("severe") or 0)
+    if last["decision"] == "limit":
+        # The rerun's report has the same K, so the newest-report test above cannot see it (#77).
+        return [f"review: round {k} hit a reviewer usage limit ({', '.join(last.get('limitedAgents') or ['?'])}); "
+                f"rerun it (wb.py revmux --round {k} --rerun), then run wb.py review-round --round {k} "
+                "on the rerun's report"]
     if last["decision"] == "continue":
         if last.get("degraded"):
             return [f"review: round {k} was degraded; another revmux round is due"]
@@ -797,18 +831,126 @@ def cmd_review_round(args: argparse.Namespace) -> int:
     # stopWhenNoMajor apply) instead of reading clean. One that did not reproduce at all errs the safe way.
     minor = sum(counts[name] for name in MINOR_SECTIONS) + max(revmux_severe - severe, 0)
     decision = review_decision(args.round, severe, minor, parsed["degraded"], settings)
+    limited = []
+    if parsed["degraded"] and checkout_settings(root)["onLimit"] == "wait":
+        limited = rate_limited_agents(root, args.round)
+        if limited:
+            decision = "limit"
     entry = {"round": args.round, "counts": counts, "revmuxSevere": revmux_severe, "severe": severe,
              "reason": (args.reason or "").strip() or None, "degraded": parsed["degraded"], "decision": decision,
              "stopWhenNoMajor": settings["stopWhenNoMajor"], "minRounds": settings["minRounds"],
              "cap": cap["cap"], "big": cap["big"], "bigReason": cap["reason"], "at": time.time()}
+    if limited:
+        entry["limitedAgents"] = limited
     entries = [e for e in load_review_rounds(root) if e["round"] != args.round] + [entry]
     save_review_rounds(root, sorted(entries, key=lambda e: e["round"]))
+    if decision == "limit":
+        return review_limit(root, args.round, limited)
+    clear_review_limit(root, args.round)
     print(f"review: {decision}{' (degraded)' if parsed['degraded'] else ''}")
     print(f"round {args.round}: {severe} Major+ (revmux {revmux_severe}), {minor} minor, "
           f"{counts['pre-existing']} pre-existing, {counts['open questions']} open question(s); "
           f"stopWhenNoMajor={'true' if settings['stopWhenNoMajor'] else 'false'} minRounds={settings['minRounds']} "
           f"cap={cap['cap']}" + (f" (big: {cap['reason']})" if cap["big"] else ""))
     return 0
+
+
+# --- a reviewer's usage limit in a checkout that waits limits out (#77) ------------------------------
+
+def review_limit_path(root: Path) -> Path:
+    return root / ".workbench" / "state" / "review-limit.json"
+
+
+def run_record_path(root: Path, round_: int) -> Path:
+    return root / ".workbench" / "review" / f"revmux-r{round_}.json"
+
+
+def read_run_record(root: Path, round_: int) -> dict | None:
+    """run-revmux.ps1's record of the revmux run behind revmux-r<K>.md: {run, dir, profile, attempt, scope}."""
+    try:
+        record = json.loads(run_record_path(root, round_).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def rate_limited_agents(root: Path, round_: int) -> list[str]:
+    """The agents revmux degraded for a rate limit in round K's run, from its events.jsonl: the
+    `agent_degraded` events whose text says `rate limited` (revmux find.go's fault, every executor).
+    The markdown Sources table only says `degraded`. Empty when the run cannot be read."""
+    record = read_run_record(root, round_)
+    if not record or not isinstance(record.get("dir"), str) or not record["dir"]:
+        return []
+    try:
+        lines = (Path(record["dir"]) / "events.jsonl").read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    agents = []
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if (isinstance(event, dict) and event.get("kind") == "agent_degraded"
+                and "rate limited" in str(event.get("text") or "")):
+            agent = str(event.get("agent") or "?")
+            if agent not in agents:
+                agents.append(agent)
+    return agents
+
+
+def limited_tool(agents: list[str]) -> str:
+    """The tool behind the limited agents, for the queue's status line: kimi, codex or claude."""
+    for tool in ("kimi", "codex", "claude"):
+        if any(tool in agent.casefold() for agent in agents):
+            return tool
+    return agents[0] if agents else "?"
+
+
+def review_on_limit() -> str:
+    """`reviewOnLimit` from ~/.agworkbench.json: wait (default) or fallback. The launcher refuses others."""
+    try:
+        value = followup.read_config().get("reviewOnLimit")
+    except followup.SettingsError:
+        return "wait"
+    return value if value in REVIEW_ON_LIMIT else "wait"
+
+
+def limit_retry_minutes() -> float:
+    import relay
+    return relay.limit_retry_setting()
+
+
+def review_limit(root: Path, round_: int, agents: list[str]) -> int:
+    print(f"review: limit (reviewer usage limit: {', '.join(agents)})")
+    print(f"round {round_} is no review: it does not count toward the cap, and merge-check refuses it until "
+          f"it is rerun and recorded")
+    if review_on_limit() == "fallback":
+        clear_review_limit(root, round_)
+        print(f"next: rerun now with python \"$AGWORKBENCH/lib/wb.py\" revmux --round {round_} --rerun "
+              "--profile claude-only (reviewOnLimit=fallback)")
+        return 0
+    minutes = limit_retry_minutes()
+    since = time.time()
+    from conductor import atomic_json
+    atomic_json(review_limit_path(root), {"tool": limited_tool(agents), "agents": agents, "since": since,
+                                          "retryAt": since + minutes * 60, "round": round_})
+    print(f"next: rerun with python \"$AGWORKBENCH/lib/wb.py\" revmux --round {round_} --rerun --after {minutes:g} "
+          "(it waits on screen, then reviews); keep your waiter and end your turn")
+    return 0
+
+
+def clear_review_limit(root: Path, round_: int) -> None:
+    """A recorded decision other than `limit` for the round a review-limit.json waits on ends that wait."""
+    path = review_limit_path(root)
+    try:
+        record = json.loads(path.read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError):
+        record = None
+    if not isinstance(record, dict) or record.get("round") == round_:
+        path.unlink(missing_ok=True)
 
 
 def review_summary(root: Path) -> int:
@@ -820,6 +962,9 @@ def review_summary(root: Path) -> int:
         print("wb: review-round --summary: no review round recorded", file=sys.stderr)
         return 2
     k, decision = last["round"], last["decision"]
+    if decision == "limit":
+        print(f"review: round {k} hit a reviewer usage limit; rerun it first - no summary yet")
+        return 1
     if decision not in ("stop", "clean") and not (decision == "cap" and last.get("stopWhenNoMajor") is False):
         print(f"review: round {k} decided {decision}; no summary yet")
         return 1
@@ -1973,8 +2118,14 @@ def main() -> int:
     p.set_defaults(func=cmd_loop_state)
     p = subs.add_parser("revmux", help="run a revmux round in its own visible session")
     p.add_argument("--round", type=int, required=True)
-    p.add_argument("--scope", required=True, help="scope file, relative to the clone or absolute")
+    p.add_argument("--scope", help="scope file, relative to the clone or absolute (required, except that a "
+                                   "--rerun reuses the recorded one)")
     p.add_argument("--profile", help="revmux profile (default: the one the launcher saved for this checkout)")
+    p.add_argument("--rerun", action="store_true",
+                   help="rerun round K that a reviewer's usage limit stopped (#77): the report is kept as "
+                        "revmux-r<K>-limited-<n>.md and revmux runs as r<K>-<n>")
+    p.add_argument("--after", type=int, metavar="MINUTES",
+                   help="with --rerun: wait this long on screen first, for the reviewer's limit to reset")
     p.set_defaults(func=cmd_revmux)
     p = subs.add_parser("settings", help="print this checkout's settings (implementer, revmux profile, auto-merge, review, failover)")
     p.set_defaults(func=cmd_settings)
@@ -2000,7 +2151,7 @@ def main() -> int:
     p.add_argument("--pr", required=True, help="PR number or URL")
     p.add_argument("--head", required=True, help="the full SHA the whole suite passed on")
     p.set_defaults(func=cmd_merge_check)
-    p = subs.add_parser("review-round", help="record a verified revmux round's decision: continue, stop, clean or cap (#64)")
+    p = subs.add_parser("review-round", help="record a verified revmux round's decision: continue, stop, clean, cap, or limit (#64, #77)")
     p.add_argument("--round", type=int)
     p.add_argument("--report", help="default .workbench/review/revmux-r<K>.md")
     p.add_argument("--severe", type=int, help="the verified Blocker+Critical+Major count, when it differs from revmux's")
