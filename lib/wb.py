@@ -216,7 +216,8 @@ def checkout_settings(root: Path) -> dict:
         # implementer.json is missing, so it stays claude-only, which every revmux has.
         profile = "comprehensive" if tool == "codex" else "claude-only"
     return {"implementer": tool, "revmuxProfile": profile, "autoMerge": saved.get("autoMerge") is True,
-            "autonomous": saved.get("autonomous") is True, "bigReview": saved.get("bigReview") is True}
+            "autonomous": saved.get("autonomous") is True, "bigReview": saved.get("bigReview") is True,
+            "onLimit": "wait" if saved.get("onLimit") == "wait" else "failover"}
 
 
 def failover_setting() -> bool:
@@ -244,7 +245,7 @@ def cmd_settings(args: argparse.Namespace) -> int:
     print(f"implementer={settings['implementer']} revmuxProfile={settings['revmuxProfile']} "
           f"autoMerge={'true' if settings['autoMerge'] else 'false'} "
           f"autonomous={'true' if settings['autonomous'] else 'false'} {review_line} {cap_line} "
-          f"failover={'true' if failover_setting() else 'false'}")
+          f"failover={'true' if failover_setting() else 'false'} onLimit={settings['onLimit']}")
     return 0
 
 

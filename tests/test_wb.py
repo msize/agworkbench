@@ -1236,18 +1236,27 @@ class Settings(unittest.TestCase):
         return out.getvalue().strip()
 
     def test_defaults_and_records(self):
-        self.assertEqual('implementer=codex revmuxProfile=comprehensive autoMerge=false autonomous=false stopWhenNoMajor=true minRounds=1 reviewCap=5 failover=true', self.printed())
+        self.assertEqual('implementer=codex revmuxProfile=comprehensive autoMerge=false autonomous=false stopWhenNoMajor=true minRounds=1 reviewCap=5 failover=true onLimit=failover', self.printed())
         # a #20 record has no autoMerge key: off
-        self.assertEqual('implementer=claude revmuxProfile=claude-only autoMerge=false autonomous=false stopWhenNoMajor=true minRounds=1 reviewCap=5 failover=true',
+        self.assertEqual('implementer=claude revmuxProfile=claude-only autoMerge=false autonomous=false stopWhenNoMajor=true minRounds=1 reviewCap=5 failover=true onLimit=failover',
                          self.printed('{"tool": "claude", "revmuxProfile": "claude-only"}'))
-        self.assertEqual('implementer=claude revmuxProfile=claude-only autoMerge=true autonomous=false stopWhenNoMajor=true minRounds=1 reviewCap=5 failover=true',
+        self.assertEqual('implementer=claude revmuxProfile=claude-only autoMerge=true autonomous=false stopWhenNoMajor=true minRounds=1 reviewCap=5 failover=true onLimit=failover',
                          self.printed('{"tool": "claude", "revmuxProfile": "claude-only", "autoMerge": true}'))
         self.assertIn('autoMerge=false', self.printed('{"tool": "codex", "autoMerge": "true"}'))
-        self.assertEqual('implementer=kimi revmuxProfile=claude-only autoMerge=false autonomous=false stopWhenNoMajor=true minRounds=1 reviewCap=5 failover=true',
+        self.assertEqual('implementer=kimi revmuxProfile=claude-only autoMerge=false autonomous=false stopWhenNoMajor=true minRounds=1 reviewCap=5 failover=true onLimit=failover',
                          self.printed('{"tool": "kimi", "revmuxProfile": "claude-only"}'))
         self.assertIn('implementer=codex', self.printed('{"tool": "aider"}'))
         import hub
         self.assertIn('kimi', hub.TOOLS)
+
+    def test_on_limit_is_printed_from_the_record(self):
+        # #77: a checkout launched with -WaitOnLimit waits out usage limits; anything else fails over.
+        for record, shown in (('{"tool": "kimi", "onLimit": "wait"}', 'wait'),
+                              ('{"tool": "kimi", "onLimit": "failover"}', 'failover'),
+                              ('{"tool": "kimi"}', 'failover'), ('{"tool": "kimi", "onLimit": "WAIT"}', 'failover'),
+                              ('{"tool": "kimi", "onLimit": true}', 'failover')):
+            with self.subTest(record=record):
+                self.assertTrue(self.printed(record).endswith(f'onLimit={shown}'))
 
     def test_failover_is_on_unless_the_config_says_false(self):
         # #24
@@ -1255,7 +1264,7 @@ class Settings(unittest.TestCase):
                             ('not json', 'true'), ('{"failover": 0}', 'true')):
             with self.subTest(config=text):
                 self.config.write_text(text, encoding='utf-8')
-                self.assertTrue(self.printed().endswith('failover=' + shown))
+                self.assertTrue(self.printed().endswith(f'failover={shown} onLimit=failover'))
 
 
 def revmux_report(sections=(), statuses=('ok',) * 4, extra='', no_findings=False):
@@ -1424,7 +1433,7 @@ class ReviewRound(unittest.TestCase):
 
     def test_a_growing_diff_switches_to_the_big_cap_and_stays(self):
         # #75 AC3
-        self.assertEqual('stopWhenNoMajor=true minRounds=1 reviewCap=5 failover=true',
+        self.assertEqual('stopWhenNoMajor=true minRounds=1 reviewCap=5 failover=true onLimit=failover',
                          self.settings_line().split('autonomous=false ')[1])
         self.lines = (1500, 'origin/main')                 # at the threshold is not past it
         self.assertEqual(['review: continue'] * 4, self.majors(range(1, 5)))

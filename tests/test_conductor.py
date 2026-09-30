@@ -986,6 +986,40 @@ class QueueCase(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             q.main(['start', '--spec', 'o/r#1', '--big-review', '--no-big-review'])
 
+    # #77: -WaitOnLimit / -NoWaitOnLimit on a queue are saved ('failover' included) and passed to members.
+    def test_on_limit_is_saved_and_passed_to_members(self):
+        self.start('o/r#1')
+        self.assertNotIn('onLimit', self.store.load())
+        self.assertNotIn('-WaitOnLimit', self.launched_args())
+        self.assertNotIn('-NoWaitOnLimit', self.launched_args())
+        self.start('o/r#2', on_limit='wait')
+        self.assertEqual('wait', self.store.load()['onLimit'])
+        self.assertIn('-WaitOnLimit', self.launched_args())
+        self.start('o/r#3')
+        self.assertEqual('wait', self.store.load()['onLimit'])
+        self.start('o/r#4', on_limit='failover')
+        self.assertEqual('failover', self.store.load()['onLimit'])
+        args = self.launched_args()
+        self.assertIn('-NoWaitOnLimit', args)
+        self.assertNotIn('-WaitOnLimit', args)
+
+    def test_invalid_saved_on_limit_is_refused(self):
+        self.start('o/r#1')
+        data = json.loads(self.store.path.read_text())
+        for bad in ('Wait', True, 1):
+            with self.subTest(value=bad):
+                data['onLimit'] = bad
+                self.store.path.write_text(json.dumps(data))
+                with self.assertRaises(q.StateError):
+                    self.store.load()
+
+    def test_cli_wait_on_limit_flags(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            q.main(['start', '--spec', 'o/r#1', '--wait-on-limit', '--no-wait-on-limit'])
+        with patch.object(q, 'start_queue', return_value=0) as start:
+            q.main(['start', '--spec', 'o/r#1', '--wait-on-limit'])
+        self.assertEqual('wait', start.call_args.kwargs['on_limit'])
+
     # #27: -Autonomous / -NoAutonomous on a queue are saved (false included) and passed to members.
     def test_autonomy_is_saved_and_passed_to_members(self):
         self.start('o/r#1')
