@@ -787,7 +787,9 @@ Keep Claude reviewers in the roster (`kimi-mixed` does), and never merge on Kimi
 Review stops once a verified revmux round has no Blocker, Critical or Major finding (#64): that
 round's fix is the last, its Minor findings are fixed if cheap and otherwise go to the PR's
 "Leftovers from #N" issue, and no further revmux round runs. The planner records each round with
-`wb.py review-round --round K`, which prints `continue`, `stop`, `clean` or `cap` (at or past the review cap).
+`wb.py review-round --round K`, which prints `continue`, `stop`, `clean`, `cap` (at or past the review cap), or
+`limit` (a `-WaitOnLimit` checkout whose reviewer hit its usage limit: the same round is rerun, and it never
+counts toward the cap; see A slow queue that waits out usage limits).
 The review cap is `review.maxRounds` (5), or `review.maxRoundsBig` (10) for a big issue (#75): its title
 starts with `Batch:`, it has a `batch` or `big` label, its diff against the base passes
 `review.bigDiffLines` (1500 lines added + deleted) when a round is recorded, or its checkout was launched
@@ -805,7 +807,8 @@ That check is read-only. It requires:
 - there is no unread mail from you (`human`) or from GitHub;
 - the relay has seen the PR open;
 - the PR head is the tested commit;
-- the newest revmux report has a recorded decision, and the last one is not `continue`, nor a `cap` (a
+- the newest revmux report has a recorded decision, and the last one is not `continue`, nor a `limit`
+  (rerun it and record it again), nor a `cap` (a
   Major or a degraded run at or past the review cap) unless `stopWhenNoMajor` was off; after any `stop`,
   every recorded follow-up is filed;
 - **no hold**: a label (`do-not-merge`, `hold`, `wip`), the title, or any unmarked description,

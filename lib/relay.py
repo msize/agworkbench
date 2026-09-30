@@ -925,7 +925,6 @@ class Relay:
                 self._save()
 
     def announce_limit(self, peer: Peer, episode: dict, text: str) -> None:
-        import agw
         rows = [row for row in text.splitlines() if row.strip()][-limits.WINDOW:]
         if episode.get('wait'):
             self.announce_wait(peer, episode, rows)
@@ -946,17 +945,23 @@ class Relay:
         body = "\n".join([f"Matched: {episode['line']}", f"Pane: {peer.box} ({peer.tool}) {peer.pane}",
                            f"First seen: {episode['firstSeen']}", "", "Next step: " + step, "",
                            "Last rows of the pane:", "", "```", *rows, "```"])
+        self.alert_limit(peer, subject, body, episode['line'])
+
+    def alert_limit(self, peer: Peer, subject: str, body: str, detail: str) -> None:
+        """A limit the human hears about: the planner's note, then the pane blocked with sound, and a
+        notification."""
+        import agw
         try:
             self.hub.write_message(to='claude', sender='relay', kind='note', subject=subject, body=body)
         except OSError as err:
             self.log(f"could not file usage-limit mail: {err}")
-        self.log(f"ALERT {subject}: {episode['line']}")
+        self.log(f"ALERT {subject}: {detail}")
         try:
             agw.set_status('blocked', sound=True, blink=True, pane_id=peer.pane)
         except (agw.CtlError, OSError) as err:
             self.log(f"could not set blocked status for {peer.box}: {err}")
         try:
-            agw.notify(peer.pane, f"{subject}: {episode['line']}", title='workbench relay')
+            agw.notify(peer.pane, f"{subject}: {detail}", title='workbench relay')
         except (agw.CtlError, OSError) as err:
             self.log(f"could not notify {peer.box}: {err}")
 
@@ -1035,26 +1040,13 @@ class Relay:
 
     def escalate_wait(self, peer: Peer, episode: dict, reason: str) -> None:
         """The only human-facing step of a wait: the probe could not be typed for limitRetryMinutes."""
-        import agw
         subject = f"usage limit: {peer.box} ({peer.tool}) waiting, cannot probe"
         body = "\n".join([f"Matched: {episode['line']}", f"Pane: {peer.box} ({peer.tool}) {peer.pane}",
                            f"First seen: {episode['firstSeen']}", "",
                            f"The relay could not type its probe pointer for {self.retry_seconds() / 60:g} min: "
                            f"{reason}. The pane is not an idle agent composer (a shell, a dialog or a draft); "
                            "the human has been notified. The relay keeps trying."])
-        try:
-            self.hub.write_message(to='claude', sender='relay', kind='note', subject=subject, body=body)
-        except OSError as err:
-            self.log(f"could not file usage-limit mail: {err}")
-        self.log(f"ALERT {subject}: {reason}")
-        try:
-            agw.set_status('blocked', sound=True, blink=True, pane_id=peer.pane)
-        except (agw.CtlError, OSError) as err:
-            self.log(f"could not set blocked status for {peer.box}: {err}")
-        try:
-            agw.notify(peer.pane, f"{subject}: {reason}", title='workbench relay')
-        except (agw.CtlError, OSError) as err:
-            self.log(f"could not notify {peer.box}: {err}")
+        self.alert_limit(peer, subject, body, reason)
 
     # the autonomous close (#27) ------------------------------------------------------------------
     def closer(self) -> "closer.Closer":

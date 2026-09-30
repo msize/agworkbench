@@ -287,7 +287,7 @@ if ($PSBoundParameters.ContainsKey('Queue')) {
     if ($NoWaitOnLimit) { $queueArgs += '--no-wait-on-limit' }
     if ($Triage) { $queueArgs += '--triage' }
     if ($Retriage -or $KimiOnly -or $PSBoundParameters.ContainsKey('Limit')) {
-        Write-Host '-Retriage and -Limit belong to -Triage without -Queue; a queue triages each untriaged member once.' -ForegroundColor Yellow
+        Write-Host '-Retriage, -KimiOnly and -Limit belong to -Triage without -Queue; a queue triages each untriaged member once.' -ForegroundColor Yellow
         exit 2
     }
     $env:AGWORKBENCH_QUEUE_SPEC = $Queue

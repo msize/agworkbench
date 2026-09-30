@@ -126,7 +126,12 @@ def cmd_revmux(args: argparse.Namespace) -> int:
                    if (match := re.fullmatch(rf"revmux-r{args.round}-limited-(\d+)\.(?:md|json)", path.name))]
         if not report.is_file() and not earlier:
             raise SystemExit(f"wb: revmux --rerun: no report to rerun: {report}")
-        attempt = max(earlier, default=0) + 1
+        # The current record's run counts too: a rerun that decided `limit` again left r<K>-<n> in it.
+        current = read_run_record(root, args.round) or {}
+        used = [current["attempt"]] if type(current.get("attempt")) is int else []
+        if match := re.fullmatch(rf"r{args.round}-(\d+)", str(current.get("run") or "")):
+            used.append(int(match[1]))
+        attempt = max(earlier + used, default=0) + 1
         # The scope: this round's run record, else the newest limited one (a rerun that died early).
         records = [read_run_record(root, args.round)]
         if earlier:
@@ -888,9 +893,13 @@ KIMI_PLAN_SECTIONS = ("Exact edits", "Must not change", "Tests first", "Pitfalls
 STOP_LINE = "STOP AND REPORT"
 PLAN_HEADING = re.compile(r"^\s*(?:#{1,6}\s+(?P<hash>.+?)|\*\*(?P<bold>[^*]+?)\*\*[\s:.-]*)\s*$")
 PLAN_PATH = re.compile(r"(?<![\w/\\])[\w.@-]+(?:[/\\][\w.@-]+)+")
+PLAN_FILE = re.compile(r"\.\w{1,8}$")                     # a last segment with a file extension
 # A STOP verdict opens its line (after a list bullet, bold or backticks): a plan that restates the rule
-# ("without one, the plan says STOP AND REPORT") in Pitfalls has not said STOP.
-STOP_VERDICT = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)?[*_`]*STOP AND REPORT\b")
+# ("without one, the plan says STOP AND REPORT") in Pitfalls has not said STOP, and neither has a line
+# that opens with the marker but states it as a condition ("STOP AND REPORT when ...").
+STOP_VERDICT = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)?[*_`]*STOP AND REPORT\b"
+                          r"(?![*_`]*\s+(?i:if|when|unless|whenever)\b)")
+STOP_CONDITION = re.compile(r"\b(?:if|when|unless|whenever|without)\b", re.I)
 
 
 def plan_sections(text: str) -> dict[str, list[str]]:
@@ -911,14 +920,22 @@ def plan_sections(text: str) -> dict[str, list[str]]:
 
 def plan_says_stop(text: str) -> bool:
     """The plan's verdict is STOP: a line opening with the marker, or the Oracle section's first line
-    carrying it ("none in the repo - STOP AND REPORT")."""
+    carrying it ("none in the repo - STOP AND REPORT") with no condition before it."""
     if any(STOP_VERDICT.match(line) for line in text.splitlines()):
         return True
     oracle = next((lines for title, lines in plan_sections(text).items() if title.startswith("oracle")), [])
-    return STOP_LINE in next((line for line in oracle if line.strip()), "")
+    first = next((line for line in oracle if line.strip()), "")
+    return STOP_LINE in first and not STOP_CONDITION.search(first.split(STOP_LINE)[0])
 
 
-def plan_problems(text: str) -> list[str]:
+def plan_paths(line: str, root: Path | None) -> list[str]:
+    """The path-looking tokens of a line: a last segment with a file extension, or something that
+    exists under the checkout. `read/write`, `and/or` and `I/O` are prose."""
+    return [token for token in PLAN_PATH.findall(line)
+            if PLAN_FILE.search(token) or (root is not None and (root / token).exists())]
+
+
+def plan_problems(text: str, root: Path | None = None) -> list[str]:
     sections = plan_sections(text)
 
     def find(name: str) -> list[str] | None:
@@ -932,7 +949,7 @@ def plan_problems(text: str) -> list[str]:
         problems.append("Done means does not ask for skipped tests by name")
     oracle = find("Oracle")
     stop = plan_says_stop(text)
-    if not stop and not (oracle and any(PLAN_PATH.search(line) for line in oracle)):
+    if not stop and not (oracle and any(plan_paths(line, root) for line in oracle)):
         problems.append(f"no Oracle section naming at least one path, and no {STOP_LINE} line")
     return problems
 
@@ -950,7 +967,7 @@ def cmd_plan_check(args: argparse.Namespace) -> int:
     except OSError as err:
         print(f"plan-check: cannot read {path}: {err}", file=sys.stderr)
         return 2
-    problems = plan_problems(text)
+    problems = plan_problems(text, root)
     for problem in problems:
         print(f"plan-check: {problem}")
     if problems:

@@ -70,8 +70,9 @@ Agree because the plan is right, not to be agreeable. Do not write code before a
   reach is a question for the planner, not a judgement call.
 - **Never invent a file format, a field id, an offset or a sample.** Correctness comes from the plan's
   Oracle (a fixture, a reference file or sibling code in the repo). When the plan's verdict is STOP
-  (a line of the plan, or its Oracle section's first line, starts with `STOP AND REPORT`; the phrase
-  inside a restated rule is not a verdict), or you find that correctness depends on an outside spec or sample the repo does
+  (a line of the plan that starts with `STOP AND REPORT`, or an Oracle section whose first line
+  carries it; the phrase inside a restated rule, or `STOP AND REPORT when/if ...`, is not a
+  verdict), or you find that correctness depends on an outside spec or sample the repo does
   not have, stop: reply with what is missing and implement nothing on a guess. New decoding of an
   outside format is lenient: an unknown value keeps the old behaviour, never a new error.
 - Write the plan's Tests first, and see each one fail on the current code before you fix it.

@@ -1665,6 +1665,8 @@ class QueueEntry(LauncherFixtures):
         for switch, hint in (('-Prune', '-Queue -Watch'), ('-FollowUps', '-Triage or -Retriage')):
             result, _ = self.launcher(switch)
             self.assertIn(hint, result.stdout + result.stderr)
+        result, _ = self.launcher('-Queue', 'bugs', '-Repo', 'o/repo', '-KimiOnly')      # #77 FIX r2 m4
+        self.assertIn('-Retriage, -KimiOnly and -Limit belong to -Triage without -Queue', result.stdout + result.stderr)
 
     def test_member_autonomous_switch_reaches_its_checkout(self):
         # #27: the conductor passes a queue's saved autonomy as -Autonomous / -NoAutonomous.

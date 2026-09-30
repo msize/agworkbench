@@ -1915,6 +1915,14 @@ class RevmuxRerun(unittest.TestCase):
             self.assertIn(part, command)
         self.assertEqual(['revmux-r2-limited-1.json', 'revmux-r2-limited-1.md', 'revmux-r2.json'],
                          sorted(p.name for p in review.iterdir()))
+        # FIX r2 M1: r2-2 ran and decided `limit` again; the next rerun must not reuse r2-2.
+        (review / 'revmux-r2.md').write_text('limited again', encoding='utf-8')
+        (review / 'revmux-r2.json').write_text(json.dumps({'run': 'r2-2', 'dir': 'z', 'attempt': 2,
+                                                           'scope': str(self.folder / 'scope.md')}), encoding='utf-8')
+        self.assertEqual(0, self.revmux('--rerun'))
+        self.assertIn('-Run r2-3', self.opened.call_args.args[2])
+        self.assertIn('-Attempt 3', self.opened.call_args.args[2])
+        self.assertTrue((review / 'revmux-r2-limited-3.md').exists())
 
     def test_rerun_refusals(self):
         with self.assertRaises(SystemExit) as caught:
@@ -2522,6 +2530,31 @@ class PlanCheck(unittest.TestCase):
             'None in the repo: STOP AND REPORT.')
         self.assertEqual((0, 'plan-check: ok (STOP AND REPORT)\n'), self.check(oracle_stop))
 
+    def test_slash_prose_is_not_an_oracle_path(self):
+        # FIX r2 m1: an Oracle must name a file (an extension) or something that exists in the checkout.
+        oracle = "- `tests/fixtures/macro-sheet.xlsm` and `crates/xlsx/tests/roundtrip.rs` (sibling code to mirror)."
+        for prose in ('None in the repo; the read/write round-trip is new.', 'and/or the I/O layer'):
+            with self.subTest(prose=prose):
+                code, out = self.check(KIMI_PLAN.replace(oracle, prose))
+                self.assertEqual(1, code)
+                self.assertIn('no Oracle section naming at least one path', out)
+        self.assertEqual(0, self.check(KIMI_PLAN.replace(oracle, '- tests/fixtures/x.docx'))[0])
+        (self.folder / 'tests/fixtures').mkdir(parents=True)
+        self.assertEqual(0, self.check(KIMI_PLAN.replace(oracle, '- the files in `tests/fixtures/`'))[0])
+
+    def test_a_conditional_stop_is_not_a_verdict(self):
+        # FIX r2 m2, m3: the rule restated as a bullet, or a condition before the marker in the Oracle.
+        no_oracle = KIMI_PLAN.replace('## Oracle', '## Background')
+        for line in ('- STOP AND REPORT when a field offset has no source in the repo.',
+                     '- **STOP AND REPORT** if the corpus is missing.'):
+            with self.subTest(line=line):
+                self.assertEqual(1, self.check(no_oracle + '\n' + line + '\n')[0])
+        oracle = "- `tests/fixtures/macro-sheet.xlsm` and `crates/xlsx/tests/roundtrip.rs` (sibling code to mirror)."
+        code, out = self.check(KIMI_PLAN.replace(oracle, 'Without a sample in the repo, STOP AND REPORT.'))
+        self.assertEqual(1, code)
+        self.assertEqual((0, 'plan-check: ok (STOP AND REPORT)\n'),
+                         self.check(KIMI_PLAN.replace(oracle, 'None in the repo: STOP AND REPORT.')))
+
     def test_bold_and_numbered_headings_count(self):
         plan = KIMI_PLAN.replace('## Exact edits', '**Exact edits**').replace('## Pitfalls', '### 4. Pitfalls:')
         self.assertEqual(0, self.check(plan)[0])
@@ -2556,7 +2589,7 @@ class KimiPlanProse(unittest.TestCase):
                        'is lenient: an unknown value falls back to the old behaviour, never to a new hard error',
                        'cites its source in the repo', 'wb.py" plan-check', 'never implemented as a guess',
                        '**The verdict is a line of its own that starts with `STOP AND REPORT`**',
-                       'is not a verdict']:
+                       'is not a verdict', 'a restated rule never opens its line with the marker']:
             self.assertIn(needle, kimi)
         self.assertLess(kimi.index('plan-check'), kimi.index('Send it as `plan v1`'))
         phase4 = text.split('## Phase 4')[1].split('## Phase 5')[0]
@@ -2581,7 +2614,8 @@ class KimiPlanProse(unittest.TestCase):
         for needle in ["**Follow the plan's Exact edits literally**", 'never touch anything under Must not change',
                        '**Never invent a file format, a field id, an offset or a sample.**', '`STOP AND REPORT`',
                        'implement nothing on a guess', '**every skipped test by name**',
-                       'starts with `STOP AND REPORT`; the phrase inside a restated rule is not a verdict']:
+                       'a line of the plan that starts with `STOP AND REPORT`, or an Oracle section whose first line carries it',
+                       'is not a verdict']:
             self.assertIn(needle, text)
 
     def test_the_readme_describes_the_slow_queue(self):
