@@ -752,10 +752,12 @@ class StallWatch:
     def ci_backstop(self) -> bool:
         """#94: finished CI on the open PR's head that no `ci` mail named yet is the stall: queue that mail
         instead of the pointer. Defensive: watch_pr queues it in the same save as the snapshot, so this is
-        reached only when `ci_mailed` was lost while the snapshot survived (hand-edited state). True when
-        the mail was queued (its flush may still be retried)."""
+        reached only when `ci_mailed` was lost while the snapshot survived (hand-edited state). Only a
+        finished `ci_result`: the time-based no-checks mail comes from a fresh watch_pr snapshot alone, never
+        from a saved one that gh failures left stale (#94 r3). True when the mail was queued (its flush may
+        still be retried)."""
         pr = self.relay.state.get("pr")
-        return bool(pr) and pr.get("state") == "OPEN" and self.relay.ci_mail(pr)
+        return bool(pr) and ci_result(pr) is not None and self.relay.ci_mail(pr)
 
     def implementer_line(self, texts: dict[str, Any]) -> str | None:
         for peer in self.relay.peers:
@@ -1851,8 +1853,9 @@ class Relay:
         return True
 
     def ci_mail(self, snapshot: dict[str, Any], outbox: list[dict[str, Any]] | None = None) -> bool:
-        """#94: mail the planner once per finished CI run on the PR's head (`ci_result`'s key), so a
-        planner whose wait-ci was killed is still woken. Queued on `outbox` when given (watch_pr saves
+        """#94: mail the planner once per finished CI run on the PR's head (`ci_result`'s key), or once for
+        a head with no check past the grace (`no_checks_result`'s key), so a planner whose wait-ci was
+        killed is still woken. Queued on `outbox` when given (watch_pr saves
         it with the snapshot); otherwise appended to the saved outbox and flushed. The id is fixed, so a
         retried or replayed write never duplicates it. True when the mail was queued."""
         result = ci_result(snapshot) or self.no_checks_result(snapshot)

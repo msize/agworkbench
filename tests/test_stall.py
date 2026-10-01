@@ -597,7 +597,8 @@ class QuietHelper(StallFixture):
 class CiBackstop(StallFixture):
     """#94: finished CI on the open PR's head that no `ci` mail named is the stall; the watch queues that
     mail. Defensive: watch_pr queues it in the same save as the snapshot, so only state whose `ci_mailed`
-    was lost while the snapshot survived (hand-edited) reaches this; these tests plant such state."""
+    was lost while the snapshot survived (hand-edited) reaches this; these tests plant such state. It
+    files only a finished CI result, never the time-based no-checks mail (#94 r3)."""
 
     FINISHED = {'number': 9, 'url': 'https://github.com/o/repo/pull/9', 'state': 'OPEN', 'headRefOid': 'c' * 40,
                 'statusCheckRollup': [
@@ -626,6 +627,15 @@ class CiBackstop(StallFixture):
         self.run_until(3 * S, start=S + 1)
         self.assertEqual(1, len(self.ci_mail()))
         self.assertEqual([], self.stall_mail())
+
+    def test_a_stale_snapshot_without_checks_gets_the_pointer_not_a_no_checks_mail(self):
+        # #94 r3: gh failed for a stall period after a poll saved an empty rollup; checks may be running now.
+        self.r.state['pr'] = dict(self.FINISHED, statusCheckRollup=[])
+        self.r.no_checks = ((9, 'c' * 40), 0.0)      # watch_pr saw that head without checks at minute 0
+        self.run_until(S)
+        self.assertEqual([], self.ci_mail())
+        self.assertNotIn('ci_mailed', self.r.state)
+        self.assertEqual(1, len(self.stall_mail()))
 
     def test_a_ci_mail_that_was_not_filed_falls_through_to_the_pointer(self):
         with patch.object(self.r, 'ci_mail', return_value=False):
