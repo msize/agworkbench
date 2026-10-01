@@ -56,6 +56,8 @@ EXPECTED = {
     # same frame in a ~60-column pane, where the error wraps over 5 rows and the hint over 3
     "kimi-limited-5hour-tool": ("kimi", "limited", False),
     "kimi-limited-5hour-narrow": ("kimi", "limited", False),
+    # #88 reopened: docxy #820 - the same error twice, under Kimi's todo panel docked over the composer
+    "kimi-limited-5hour-todo": ("kimi", "limited", False),
     "kimi-rate-limit-transient": ("kimi", None, False),
     "kimi-retrying": ("kimi", None, False),
     "kimi-tool-output": ("kimi", None, False),
@@ -142,7 +144,8 @@ class Fixtures(unittest.TestCase):
                 self.assertTrue(f'"{code}"' in kimi or f'.{code.split(".", 1)[1]}":' in kimi, code)
                 self.assertTrue(" ".join(text.split()).find(" ".join(hint.split())) >= 0 or name == "kimi-diff")
                 if kind == "limited" and name not in ("kimi-limited-usage", "kimi-limited-5hour",
-                                                         "kimi-limited-5hour-tool", "kimi-limited-5hour-narrow"):
+                                                         "kimi-limited-5hour-tool", "kimi-limited-5hour-narrow",
+                                                         "kimi-limited-5hour-todo"):
                     self.assertTrue(any(phrase in " ".join(text.split()) for phrase in
                                         ("exceeded your current quota", "insufficient balance")), name)
 
@@ -287,6 +290,98 @@ class KimiTurnLimit(unittest.TestCase):
         answered = frame("kimi-limited-5hour-tool").replace(" Please don't share it publicly.\n",
                                                              " Please don't share it publicly.\n\n ● Done.\n")
         self.assertIsNone(limits.kimi_turn_limit(answered))
+
+
+def todo_panel(*todos: str, more: str | None = None) -> list[str]:
+    """Kimi's TodoPanelComponent rows (#88) in its 1-column gutter, as wide as KIMI_BOX."""
+    return [" " + "─" * 86, "   Todo", *(f"   {todo}" for todo in todos), *([f"   {more}"] if more else [])]
+
+
+# In progress `●` rows titled like a tool call (`● Read …`, `● Running …`) are still panel rows.
+COLLAPSED = todo_panel("● Read the spec", "● Running tests", "○ Implement the fix", "○ Commit", "○ Reply",
+                       more="… +2 more (2 done) · ctrl+t to expand")
+EXPANDED = todo_panel(*[f"{'✓' if n < 4 else '●' if n == 4 else '○'} step {n}" for n in range(12)],
+                      more="all 12 items · ctrl+t to collapse")
+SPINNER = "  ⠹ Thinking… · Tip: /plugins: manage plugins"
+
+
+def kimi_docked(rows: list[str], panel: list[str]) -> str:
+    """`kimi()` with the todo panel docked between `rows` and the box: no blank row below the panel."""
+    return kimi(*rows, "", *panel).replace("\n\n ╭", "\n ╭")
+
+
+class KimiTodoPanel(unittest.TestCase):
+    """#88 reopened (docxy #820): Kimi docks its todo panel between the transcript and the composer box,
+    so the error and hint are no longer the last rows above the box."""
+
+    def test_the_820_frame_with_and_without_blank_rows_around_the_panel(self):
+        rows = frame("kimi-limited-5hour-todo").splitlines()
+        rule = next(i for i, row in enumerate(rows) if row.startswith(" ─"))
+        box = next(i for i, row in enumerate(rows) if row.startswith(" ╭"))
+        self.assertEqual("", rows[rule - 1])
+        variants = {
+            "as built": rows,
+            "no blank above": rows[:rule - 1] + rows[rule:],
+            "blank below too": rows[:box] + [""] + rows[box:],
+            "blank below only": rows[:rule - 1] + rows[rule:box] + [""] + rows[box:],
+        }
+        for name, variant in variants.items():
+            with self.subTest(variant=name):
+                text = "\n".join(variant)
+                found = limits.classify(text, "kimi")
+                self.assertEqual("limited", found.kind if found else None)
+                self.assertTrue(found.line.startswith("Error: [provider.auth_error] 403 You've reached your 5-hour"))
+                self.assertEqual("limited", limits.kimi_turn_limit(text).kind)
+
+    def test_the_775_tool_call_layout_under_a_panel(self):
+        docked = frame("kimi-limited-5hour-tool").replace(" ╭", "\n".join(COLLAPSED) + "\n ╭", 1)
+        self.assertEqual("limited", limits.classify(docked, "kimi").kind)
+        self.assertEqual("limited", limits.kimi_turn_limit(docked).kind)
+
+    def test_an_expanded_panel_does_not_count_against_the_window(self):
+        rows = frame("kimi-limited-5hour-tool").splitlines()
+        start = next(i for i, row in enumerate(rows) if "Error: [provider." in row)
+        error = [" ✨ go", *rows[start:start + 5]]                # wrapped over 3 rows, the hint over 2
+        self.assertEqual("limited", limits.classify(kimi_docked(error, EXPANDED), "kimi").kind)
+        longer = todo_panel(*[f"○ step {n}" for n in range(40)], more="all 40 items · ctrl+t to collapse")
+        self.assertEqual("limited", limits.classify(kimi_docked(error, longer), "kimi").kind)
+
+    def test_a_spinner_above_the_panel_is_a_running_turn(self):
+        self.assertIsNone(limits.classify(kimi_docked([" ✨ go", ERROR_5H, HINT, "", SPINNER], COLLAPSED), "kimi"))
+        self.assertIsNone(limits.kimi_turn_limit(kimi_docked([" ✨ go", ERROR_5H, HINT, "", SPINNER], EXPANDED)))
+        # Without a panel, as before.
+        self.assertIsNone(limits.classify(kimi(" ✨ go", ERROR_5H, HINT, "", SPINNER), "kimi"))
+        self.assertEqual("limited", limits.classify(kimi(" ✨ go", ERROR_5H, HINT), "kimi").kind)
+
+    def test_a_panel_with_no_error_above_it_is_not_a_limit(self):
+        self.assertIsNone(limits.classify(kimi_docked([" ● Tests written; implementing now."], COLLAPSED), "kimi"))
+        self.assertIsNone(limits.kimi_turn_limit(kimi_docked([" ● Tests written."], EXPANDED)))
+
+    def test_an_item_after_the_error_makes_it_old(self):
+        for item in (" ● Resumed: the window reset.", " ✗ Ran a command · $ make test"):
+            with self.subTest(item=item):
+                text = kimi_docked([" ✨ go", ERROR_5H, HINT, "", item], COLLAPSED)
+                self.assertIsNone(limits.classify(text, "kimi"))
+                self.assertIsNone(limits.kimi_turn_limit(text))
+
+    def test_only_the_exact_panel_is_removed(self):
+        above = [" ✨ go", ERROR_5H, HINT, ""]
+        self.assertEqual(above[:-1], limits.kimi_without_todo(above + COLLAPSED))
+        self.assertEqual(above[:-1], limits.kimi_without_todo(above + EXPANDED + [""]))
+        self.assertEqual(above[:-1], limits.kimi_without_todo(above + todo_panel("✓ Done")))   # no overflow row
+        lookalikes = {
+            "a non-marker row": todo_panel("- Write tests"),
+            "no todo row (clipped)": todo_panel(),
+            "no rule": COLLAPSED[1:],
+            "no Todo head": COLLAPSED[:1] + COLLAPSED[2:],
+            "two overflow rows": COLLAPSED + [COLLAPSED[-1]],
+            "a row after the overflow": COLLAPSED + ["   ○ one more"],
+            "an item between the rows": COLLAPSED[:3] + [" ✨ go on"] + COLLAPSED[3:],
+        }
+        for name, panel in lookalikes.items():
+            with self.subTest(lookalike=name):
+                self.assertEqual(above + panel, limits.kimi_without_todo(above + panel))
+                self.assertIsNone(limits.classify(kimi_docked(above[:3], panel), "kimi"))
 
 
 class Cli(unittest.TestCase):

@@ -23,7 +23,10 @@ greps, test output and fixture dumps - so a phrase counts only by POSITION, neve
   only when the call's output provably ended above them (#88): a successful call collapsed to ONE row
   marked `…` right above the error, or a status row wrapped to column 1 (output rows never wrap). The
   error may wrap over up to 8 rows and the hint over 3. `kimi_turn_limit` drops the owner rule for the
-  relay's safety nets (the stall watch, a forced wait episode).
+  relay's safety nets (the stall watch, a forced wait episode). Kimi docks its todo panel between the
+  transcript (and the spinner) and the box (#88, docxy #820): `kimi_without_todo` removes exactly that
+  panel first, and the window counts only the rows above it. A panel clipped in a short pane is not
+  that exact shape, so it stays and hides the error: a miss, never a false limit.
 - Any tool exited: the last row is a shell prompt and the phrase starts one of the rows just
   above it, in the output since the previous prompt.
 
@@ -107,6 +110,12 @@ KIMI_ITEM_RE = re.compile(r"^\s*[●✗✨$]\s")
 # A tool call's header row: its output rows follow it at the same indent as a status row would.
 KIMI_TOOL_RE = re.compile(r"^\s*(?:✗\s|●\s+(?:Ran|Running|Used|Using|Read|Reading|Wrote|Writing|Edited|Editing"
                           r"|Searched|Searching|Fetched|Fetching)\b)")
+# Kimi's todo panel (TodoPanelComponent.render, #88): a rule, `Todo`, one row per todo marked `●` in
+# progress, `✓` done or `○` pending, then the collapsed panel's overflow row or the expanded one's footer.
+KIMI_TODO_RULE_RE = re.compile(r"^\s*─{10,}\s*$")
+KIMI_TODO_HEAD_RE = re.compile(r"^\s*Todo\s*$")
+KIMI_TODO_ROW_RE = re.compile(r"^\s*[●✓○] ")
+KIMI_TODO_MORE_RE = re.compile(r"^\s*(?:… \+\d+ more\b.* · ctrl\+t to expand|all \d+ items · ctrl\+t to collapse)\s*$")
 
 
 @dataclass(frozen=True)
@@ -127,14 +136,21 @@ def _starts_with(row: str, patterns: list[str], glyph: str) -> bool:
 
 def _rows(text: str) -> list[str]:
     """The frame's rows from the WINDOW-th last non-empty one, blank rows kept."""
-    rows = (text or "").splitlines()
+    return _window((text or "").splitlines(), WINDOW)
+
+
+def _window(rows: list[str], size: int) -> list[str]:
+    """`rows` from the `size`-th last non-empty one, trailing blank rows dropped."""
+    if size <= 0:
+        return []
+    rows = list(rows)
     while rows and not rows[-1].strip():
         rows.pop()
     count = 0
     for start in range(len(rows) - 1, -1, -1):
         if rows[start].strip():
             count += 1
-            if count == WINDOW:
+            if count == size:
                 return rows[start:]
     return rows
 
@@ -255,7 +271,33 @@ def _kimi_collapsed(row: str) -> bool:
     return text.startswith("… ") or text.endswith(" …")
 
 
-def _kimi(rows: list[str], owner_check: bool = True) -> Limit | None:
+def kimi_without_todo(above: list[str]) -> list[str]:
+    """`above` (the rows above Kimi's composer box) without the todo panel docked at its end (#88), and
+    the blank rows before it. Unchanged when the end is not exactly a panel: a rule row, `Todo`, at
+    least one todo row, at most one overflow or footer row, and nothing else."""
+    end = len(above)
+    while end and not above[end - 1].strip():
+        end -= 1
+    if end and KIMI_TODO_MORE_RE.match(above[end - 1]):
+        end -= 1
+    start = end
+    while start and KIMI_TODO_ROW_RE.match(above[start - 1]):
+        start -= 1
+    if (start == end or start < 2 or not KIMI_TODO_HEAD_RE.match(above[start - 1])
+            or not KIMI_TODO_RULE_RE.match(above[start - 2])):
+        return list(above)
+    rest = list(above[:start - 2])
+    while rest and not rest[-1].strip():
+        rest.pop()
+    return rest
+
+
+def _kimi(frame: list[str], owner_check: bool = True) -> Limit | None:
+    """`frame` is the whole pane. The window is taken above the box and the todo panel (#88), so a panel
+    never crowds the error out of it; without a panel these are the rows of the frame's last WINDOW."""
+    rows = list(frame)
+    while rows and not rows[-1].strip():
+        rows.pop()
     filled = [i for i, row in enumerate(rows) if row.strip()]
     bottom = next((i for i in reversed(filled) if KIMI_BOTTOM_RE.match(rows[i])), None)
     if bottom is None or sum(1 for i in filled if i > bottom) > 3:
@@ -265,9 +307,8 @@ def _kimi(rows: list[str], owner_check: bool = True) -> Limit | None:
         top -= 1
     if top < 0 or top == bottom - 1 or not KIMI_TOP_RE.match(rows[top]):
         return None
-    above = rows[:top]
-    while above and not above[-1].strip():
-        above = above[:-1]
+    # The box and its footer take their rows of the window; the todo panel takes none.
+    above = _window(kimi_without_todo(rows[:top]), WINDOW - sum(1 for i in filled if i >= top))
     if not above or KIMI_SPINNER_RE.match(above[-1]):
         return None                        # a running turn, or its retries: any error on screen is old
     # The hint is the last row, or starts up to 2 rows above it when it wraps (#88: 3 rows at 60 columns).
@@ -313,7 +354,7 @@ def kimi_turn_limit(text: str) -> Limit | None:
     rows = _rows(text)
     if not rows or shell_prompt(rows):
         return None
-    return _kimi(rows, owner_check=False)
+    return _kimi(text.splitlines(), owner_check=False)
 
 
 def classify(text: str, tool: str) -> Limit | None:
@@ -329,7 +370,7 @@ def classify(text: str, tool: str) -> Limit | None:
     if tool == "codex":
         return _codex_warning(rows) or _codex(rows)
     if tool == "kimi":
-        return _kimi(rows)
+        return _kimi(text.splitlines())
     return _claude(rows)
 
 

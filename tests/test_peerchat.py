@@ -536,6 +536,21 @@ class KimiComposer(unittest.TestCase):
         # The other tools' frames never look like a Kimi turn.
         self.assertFalse(peerchat.kimi_busy(CLAUDE_IDLE) or peerchat.kimi_busy(CODEX_IDLE))
 
+    def test_the_todo_panel_between_the_spinner_and_the_box(self):
+        # #88 reopened: Kimi docks its todo panel under the spinner, right over the composer box.
+        def docked(name, todos):
+            head, _, box = kimi_frame(name).rpartition('\n ╭')     # the composer, not the welcome panel
+            return head + '\n' + '\n'.join([' ' + '─' * 40, '   Todo', *todos]) + '\n ╭' + box
+        collapsed = ['   ● Running tests', '   ○ Commit', '   … +2 more (2 done) · ctrl+t to expand']
+        expanded = [f'   ○ step {n}' for n in range(40)] + ['   all 40 items · ctrl+t to collapse']
+        for todos in (collapsed, expanded):
+            with self.subTest(rows=len(todos)):
+                for name, expected in [('running-thinking', True), ('running-tool', True),
+                                       ('idle-after-turn', False), ('status-error', False)]:
+                    self.assertEqual(expected, peerchat.kimi_busy(docked(name, todos)), name)
+                    self.assertEqual(expected, peerchat.is_busy(docked(name, todos)), name)
+                self.assertEqual('', peerchat.kimi_composer(docked('idle-after-turn', todos)))
+
     def test_dialogs_are_dialogs(self):
         for name, expected in [('approval', True), ('trust-dialog', True), ('idle-after-turn', False),
                                ('running-tool', False), ('draft-wrapped', False)]:

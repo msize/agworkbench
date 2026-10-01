@@ -58,3 +58,16 @@ what the synthesised ones could not: the session error glued under a successful 
 collapsed to one `…` row, and a status row that wraps to column 1 while tool output sits at column 3.
 `kimi-limited-5hour-narrow.txt` is the same frame re-wrapped for a 60-column pane (`textwrap` at the
 width that reproduces the real rows): the error spans 5 rows and the hint 3.
+
+`kimi-limited-5hour-todo.txt` (#88 reopened) is docxy #820's implementer pane, **constructed**: that
+checkout is gone, and its relay's stall pointer quoted only the todo panel. The pane showed the
+5-hour error twice: once ending a turn, and once more after the planner's `continue` mail rang it.
+The todo panel was docked between the last error and the composer. The error and hint rows are those
+of `kimi-limited-5hour-tool.txt`. The panel follows `TodoPanelComponent.render` in the Kimi Code 2.1.x
+binary: a rule `"─".repeat(width)`, `  Todo`, one `  <marker> <title>` row per todo (`●` in progress,
+`✓` done, `○` pending), at most 5 when collapsed, then `  … +N more (<counts>) · ctrl+t to expand`.
+Expanded, it shows every row and then `  all N items · ctrl+t to collapse`. Only some of the panel is quoted from #820's stall pointer: `Write xlsxy tests (see them fail)`,
+`Commit and reply IMPLEMENTED <sha>` and the `… +2 more (2 done)` row. The other titles are invented. Each dock container is a
+`GutterContainer(1, 1)`: a 1-column gutter and no padding rows, so nothing sits between the panel and
+the box. The tests build the other blank-row placements, the expanded panel and the #775 tool-call
+layout under a panel from the same rows.

@@ -44,6 +44,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import agw  # noqa: E402
 import hub  # noqa: E402
+import limits  # noqa: E402
 
 # A cp437 console cannot encode every character a message may carry; replace rather than crash.
 for _stream in (sys.stdout, sys.stderr):
@@ -333,14 +334,25 @@ def kimi_composer(text: str) -> str | None:
     return " ".join(part for part in parts if part).strip()
 
 
-def kimi_busy(text: str) -> bool:
-    """A Kimi Code turn is running: its spinner row sits right above the composer box."""
+def kimi_above(text: str) -> list[str] | None:
+    """Every row of the pane above Kimi Code's composer box, without the todo panel docked over the box
+    (#88) - whole, not just BOX_LINES: an expanded panel can be longer than that. None without the box."""
     box = kimi_box(text)
     if box is None:
+        return None
+    rows = text.splitlines()
+    _, top, _ = box
+    return limits.kimi_without_todo(rows[:max(0, len(rows) - BOX_LINES) + top])
+
+
+def kimi_busy(text: str) -> bool:
+    """A Kimi Code turn is running: its spinner row sits right above the composer box, or above the
+    todo panel docked over it (#88)."""
+    above = kimi_above(text)
+    if above is None:
         return False
-    lines, top, _ = box
-    above = next((row for row in reversed(lines[:top]) if row.strip()), "")
-    return bool(KIMI_SPINNER_RE.match(above))
+    last = next((row for row in reversed(above) if row.strip()), "")
+    return bool(KIMI_SPINNER_RE.match(last))
 
 
 def composer_content(tool: str, text: str) -> str | None:
