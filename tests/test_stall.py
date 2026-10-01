@@ -594,6 +594,59 @@ class QuietHelper(StallFixture):
         self.assertEqual(1, len(self.stall_mail()))
 
 
+class CiBackstop(StallFixture):
+    """#94: finished CI on the open PR's head that no `ci` mail named is the stall; the watch files that
+    mail. watch_pr files it with the snapshot, so only state saved before #94 reaches this."""
+
+    FINISHED = {'number': 9, 'url': 'https://github.com/o/repo/pull/9', 'state': 'OPEN', 'headRefOid': 'c' * 40,
+                'statusCheckRollup': [
+                    {'__typename': 'CheckRun', 'name': 'tests', 'status': 'COMPLETED', 'conclusion': 'SUCCESS'},
+                    {'__typename': 'StatusContext', 'context': 'ci/x', 'state': 'FAILURE'}]}
+
+    def setUp(self):
+        super().setUp()
+        self.write('implementer.json', {'tool': 'codex', 'autoMerge': True})
+        self.r.state['pr'] = dict(self.FINISHED)
+
+    def ci_mail(self):
+        box = self.hub_dir / 'inbox' / 'claude'
+        return [message for message in map(hub.parse_message, sorted(box.glob('*.md')))
+                if message.get('kind') == 'ci']
+
+    def test_an_unmailed_finished_ci_files_the_ci_mail_not_the_pointer(self):
+        self.run_until(S)
+        mails = self.ci_mail()
+        self.assertEqual(1, len(mails))
+        self.assertEqual(('claude', 'relay'), (mails[0]['to'], mails[0]['from']))
+        self.assertEqual('CI finished on ccccccc: 1 passed, 1 failed (ci/x)', mails[0]['subject'])
+        self.assertEqual(relay.ci_result(self.FINISHED)['key'], self.r.state['ci_mailed'])
+        self.assertEqual([], self.stall_mail())
+        # Unread, it exempts the loop; the stall watch files it only once.
+        self.run_until(3 * S, start=S + 1)
+        self.assertEqual(1, len(self.ci_mail()))
+        self.assertEqual([], self.stall_mail())
+
+    def test_a_ci_mail_that_was_not_filed_falls_through_to_the_pointer(self):
+        with patch.object(self.r, 'ci_mail', return_value=False):
+            self.run_until(S)
+        self.assertEqual(1, len(self.stall_mail()))
+
+    def test_ci_already_mailed_and_read_the_pointer_says_what_was_missed(self):
+        self.r.state['ci_mailed'] = relay.ci_result(self.FINISHED)['key']
+        self.run_until(S)
+        self.assertEqual([], self.ci_mail())
+        mails = self.stall_mail()
+        self.assertEqual(1, len(mails))
+        self.assertIn('CI on the PR head: CI finished on ccccccc: 1 passed, 1 failed (ci/x)', mails[0]['body'])
+
+    def test_dry_run_files_nothing(self):
+        self.r = self.make_relay(dry_run=True)
+        self.r.state['pr'] = dict(self.FINISHED)
+        self.run_until(S)
+        self.assertEqual([], self.ci_mail())
+        self.assertNotIn('ci_mailed', self.r.state)
+
+
 class LastWords(unittest.TestCase):
     def test_codex_last_paragraph_above_the_composer_not_the_footer(self):
         self.assertEqual('• No unread mail. Waiting for the next “Chat from Workbench:” notification; no files edited.',

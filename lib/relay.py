@@ -104,7 +104,7 @@ import closer  # noqa: E402
 import tslog  # noqa: E402
 
 PR_FIELDS = ("number,url,state,createdAt,updatedAt,closedAt,reviewDecision,mergedAt,reviews,comments,headRefName,"
-             "isCrossRepository,statusCheckRollup")
+             "isCrossRepository,statusCheckRollup,headRefOid")
 HOLD_ALERT_AFTER = 60.0
 AMBIGUOUS_ALERT_AFTER = 600.0
 ALERT_EVERY = 300.0
@@ -375,6 +375,10 @@ def clock_text(epoch: float) -> str:
     return time.strftime("%H:%M", time.localtime(epoch))
 
 
+def check_kind(item: dict[str, Any]) -> str:
+    return item.get("__typename") or ("CheckRun" if "status" in item else "StatusContext")
+
+
 def ci_pending(pr: dict[str, Any]) -> list[str]:
     """The PR's checks that are still running, from the snapshot's statusCheckRollup (#45 r1): a
     check run not COMPLETED, a commit status PENDING or EXPECTED."""
@@ -382,12 +386,52 @@ def ci_pending(pr: dict[str, Any]) -> list[str]:
     for item in pr.get("statusCheckRollup") or []:
         if not isinstance(item, dict):
             continue
-        kind = item.get("__typename") or ("CheckRun" if "status" in item else "StatusContext")
+        kind = check_kind(item)
         if kind == "CheckRun" and item.get("status") != "COMPLETED":
             pending.append(str(item.get("name") or "?"))
         elif kind == "StatusContext" and item.get("state") in ("PENDING", "EXPECTED"):
             pending.append(str(item.get("context") or "?"))
     return pending
+
+
+def ci_result(pr: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The finished CI on an OPEN PR's head (#94), or None while it is not OPEN, has no head, no check
+    has reported or any check still runs. `key` names this finished run of this PR's head: a rerun or
+    a check that registered late gives a new one, a repeated poll the same one. The counts take every
+    check; merge-check alone knows which are required."""
+    if not isinstance(pr, dict) or pr.get("state") != "OPEN" or not pr.get("headRefOid"):
+        return None
+    items = [item for item in pr.get("statusCheckRollup") or [] if isinstance(item, dict)]
+    if not items or ci_pending(pr):
+        return None
+    passed, skipped, failed, rows = 0, 0, [], []
+    for item in items:
+        kind = check_kind(item)
+        if kind == "CheckRun":
+            name, verdict = item.get("name"), item.get("conclusion")
+            when, link = item.get("completedAt"), item.get("detailsUrl")
+            bucket = ("passed" if verdict == "SUCCESS" else "skipped" if verdict in ("NEUTRAL", "SKIPPED")
+                      else "failed")
+        else:
+            name, verdict = item.get("context"), item.get("state")
+            when, link = item.get("startedAt"), item.get("targetUrl")
+            bucket = "passed" if verdict == "SUCCESS" else "failed"
+        name = str(name or "?")
+        if bucket == "passed":
+            passed += 1
+        elif bucket == "skipped":
+            skipped += 1
+        else:
+            failed.append((name, str(link or "")))
+        rows.append([str(kind), name, str(verdict or ""), str(when or ""), str(link or "")])
+    head = str(pr["headRefOid"])
+    key = hashlib.sha256(json.dumps([pr.get("number"), head, sorted(rows)], sort_keys=True)
+                         .encode("utf-8")).hexdigest()
+    names = [name for name, _ in failed]
+    summary = (f"CI finished on {head[:7]}: {passed} passed, {len(failed)} failed"
+               + (f" ({', '.join(names)})" if failed else "") + (f", {skipped} skipped" if skipped else ""))
+    return {"head": head, "key": key, "passed": passed, "failed": names, "failed_links": failed,
+            "skipped": skipped, "summary": summary}
 
 
 def git_head(root: Path) -> str | None:
@@ -642,6 +686,8 @@ class StallWatch:
             if instant - self.since >= self.period:
                 if self.wait_out_limit(texts):
                     self.reset("usage limit")
+                elif self.ci_backstop():
+                    self.reset("CI mail filed")
                 elif self.pointer(instant - self.since, quiet, texts):
                     self.level, self.pointer_at = 1, instant
         elif self.level == 1:
@@ -676,6 +722,13 @@ class StallWatch:
         self.relay.force_wait(peer, found, texts[peer.box], "stall")
         return True
 
+    def ci_backstop(self) -> bool:
+        """#94: finished CI on the open PR's head that no `ci` mail named yet is the stall: file that mail
+        instead of the pointer. watch_pr files it in the same save as the snapshot, so this only finds
+        state saved before #94. True when it was filed."""
+        pr = self.relay.state.get("pr")
+        return bool(pr) and pr.get("state") == "OPEN" and self.relay.ci_mail(pr)
+
     def implementer_line(self, texts: dict[str, Any]) -> str | None:
         for peer in self.relay.peers:
             if peer.box == "codex" and isinstance(texts.get(peer.box), str):
@@ -701,6 +754,9 @@ class StallWatch:
         limited = self.implementer_limit(texts)
         if limited:
             body += [f"The implementer's pane shows a usage-limit error: {limited[1].line}", ""]
+        ci = ci_result(self.relay.state.get("pr"))
+        if ci:
+            body += [f"CI on the PR head: {ci['summary']}", ""]
         body += ["Next step: check your mail waiter - it may have been killed under memory pressure; rearm it",
                  "if it is not running - and any finished helper (mail from `helper`,",
                  "`.workbench/state/helpers/*.done`, `.workbench/review/`). Then continue the loop, or, if it",
@@ -789,7 +845,7 @@ class Relay:
         changed = self.state.get('branch') != self.branch
         if saved_branch != self.branch or (saved_pr and saved_pr.get('headRefName') != self.branch):
             branch_keys = ('pr', 'terminal_mail', 'ignored_prs', 'seen_open', 'completed_prs',
-                           'watch_since', 'outbox', 'event_sequence')
+                           'watch_since', 'outbox', 'event_sequence', 'ci_mailed')
             if saved_branch is not None or any(self.state.get(key) for key in branch_keys):
                 stale_branch = saved_pr.get('headRefName') if saved_pr else saved_branch
                 self.log(f"discarding saved PR state for branch {stale_branch} "
@@ -800,6 +856,7 @@ class Relay:
             changed = True
         self.state['branch'] = self.branch
         self._dry_watch_since = None
+        self._dry_ci_key = None
         if saved_pr and saved_pr.get('state') == 'OPEN' and 'seen_open' not in self.state:
             self.state['seen_open'] = [saved_pr['number']]
             changed = True
@@ -1622,6 +1679,7 @@ class Relay:
         self.state['completed_prs'] = sorted({*self.state.get('completed_prs', []), number})
         self.state.pop('pr', None)
         self.state.pop('terminal_mail', None)
+        self.state.pop('ci_mailed', None)
         if self.state.get('close_pending') == number:
             self.state.pop('limits', None)  # a merged PR ends the loop
         self.log(f'retired finished PR #{number}; the relay can watch the next PR if this one was unmerged')
@@ -1761,6 +1819,42 @@ class Relay:
             return False
         return True
 
+    def ci_mail(self, snapshot: dict[str, Any], outbox: list[dict[str, Any]] | None = None) -> bool:
+        """#94: mail the planner once per finished CI run on the PR's head (`ci_result`'s key), so a
+        planner whose wait-ci was killed is still woken. Queued on `outbox` when given (watch_pr saves
+        it with the snapshot); otherwise appended to the saved outbox and flushed. The id is fixed, so a
+        retried or replayed write never duplicates it. True when the mail was queued."""
+        result = ci_result(snapshot)
+        if result is None or result["key"] == self.state.get("ci_mailed"):
+            return False
+        if self.dry_run:
+            if result["key"] != self._dry_ci_key:
+                self._dry_ci_key = result["key"]
+                self.log(f"[dry-run] would mail the planner: {result['summary']}")
+            return False
+        number = snapshot["number"]
+        body = [f"CI finished on PR #{number} ({snapshot.get('url') or '?'}), head {result['head']}:",
+                f"{result['passed']} passed, {len(result['failed'])} failed, {result['skipped']} skipped.", ""]
+        if result["failed_links"]:
+            body += ["Failed:"] + [f"- {name}" + (f": {link}" if link else "")
+                                   for name, link in result["failed_links"]] + [""]
+        body += ["The counts take every check; merge-check decides which are required - do not act on the",
+                 "count, run merge-check.", "",
+                 f"Next step: if {result['head']} is the head you tested, stop any wait-ci still running for it",
+                 f"and run `wb.py merge-check --pr {number} --head {result['head']}`, as on wait-ci's exit 0.",
+                 "A `ci` mail for another head is ignored. Without auto-merge, mention a red result in chat."]
+        message = dict(to="claude", sender="relay", subject=result["summary"], body="\n".join(body), kind="ci",
+                       message_id=f"relay-ci-pr{number}-{result['key'][:8]}")
+        self.state["ci_mailed"] = result["key"]
+        self.log(f"CI mail to the planner: {result['summary']}")
+        if outbox is not None:
+            outbox.append(message)
+            return True
+        self.state["outbox"] = [*self.state.get("outbox", []), message]
+        self._save()
+        self.flush_outbox()
+        return True
+
     def watch_pr(self) -> bool:
         """Returns True when the PR is terminal; its filed notices must still be delivered."""
         if not self.flush_outbox():
@@ -1808,6 +1902,8 @@ class Relay:
                     terminal_mail.append([box, mid])
             if not self.dry_run:
                 self.log(f"github: {event['subject']}")
+        if snapshot.get('state') == 'OPEN':
+            self.ci_mail(snapshot, outbox)
         if not self.dry_run:
             seen_open.add(snapshot['number'])
             if snapshot.get('state') == 'OPEN':
@@ -1822,7 +1918,7 @@ class Relay:
                 self.state['completed_prs'] = sorted(completed)
             self.state.pop('event_sequence', None)  # Migrate the obsolete counter.
             if outbox:
-                self.state['outbox'] = outbox
+                self.state['outbox'] = [*self.state.get('outbox', []), *outbox]
             self._save()
             self.flush_outbox()
         return terminal
