@@ -246,20 +246,20 @@ class HelperWorkspace(unittest.TestCase):
     def test_both_helpers_use_callers_workspace_even_when_another_is_active(self):
         os.environ.update(AGWINTERM_PANE_ID='caller-right', AGWINTERM_SESSION_ID='active-session')
         for name, select in [('revmux', False), ('human-review', True)]:
-            self.assertEqual('new-session', wb.open_session(name, Path('checkout'), 'command', select))
+            self.assertEqual('new-session', wb.open_session(name, Path('checkout'), ['app', 'arg one'], select))
             args = self.request.call_args.kwargs['args']
             self.assertEqual('session.new', self.request.call_args.args[0])
             self.assertEqual('caller-workspace', args['workspace'])
             self.assertEqual(name, args['name'])
             self.assertEqual('checkout', args['cwd'])
-            self.assertEqual('command', args['command'])
+            self.assertEqual('app "arg one"', args['command'])
             self.assertEqual('direct', args['command-mode'])     # no shell: the ended pane takes no input (#33)
             self.assertEqual(not select, args.get('no-select', False))
         self.assertEqual('', self.stderr.getvalue())
 
     def test_session_id_is_used_when_pane_id_is_absent(self):
         os.environ['AGWINTERM_SESSION_ID'] = 'unsplit-session'
-        wb.open_session('revmux', Path('checkout'), 'command', False)
+        wb.open_session('revmux', Path('checkout'), ['app'], False)
         self.assertEqual('caller-workspace', self.request.call_args.kwargs['args']['workspace'])
         self.assertEqual('', self.stderr.getvalue())
 
@@ -268,36 +268,198 @@ class HelperWorkspace(unittest.TestCase):
             os.environ['AGWINTERM_PANE_ID'] = pane
             self.stderr.seek(0)
             self.stderr.truncate()
-            wb.open_session('revmux', Path('checkout'), 'command', False)
+            wb.open_session('revmux', Path('checkout'), ['app'], False)
             self.assertNotIn('workspace', self.request.call_args.kwargs['args'])
             self.assertEqual(1, len(self.stderr.getvalue().splitlines()))
             self.assertIn('workspace', self.stderr.getvalue())
 
 
-class HelperCommand(unittest.TestCase):
-    """#33: helpers run in agwinterm's direct mode, so their command line is Windows-quoted."""
+def parse_windows(line):
+    """The argv agwinterm's direct mode makes of a session command: CommandLineToArgvW (#33)."""
+    import ctypes
+    from ctypes import wintypes
+    parse = ctypes.windll.shell32.CommandLineToArgvW
+    parse.argtypes, parse.restype = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)], ctypes.POINTER(wintypes.LPWSTR)
+    count = ctypes.c_int()
+    argv = parse(line, ctypes.byref(count))
+    parsed = [argv[i] for i in range(count.value)]
+    ctypes.windll.kernel32.LocalFree(argv)
+    return parsed
 
-    @unittest.skipUnless(sys.platform == 'win32', 'Windows quoting')
-    def test_helper_command_line_survives_windows_quoting_and_runs_the_script(self):
-        import ctypes
-        from ctypes import wintypes
-        parse = ctypes.windll.shell32.CommandLineToArgvW
-        parse.argtypes, parse.restype = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)], ctypes.POINTER(wintypes.LPWSTR)
-        values = {'Checkout': 'C:\\dir with space\\','Base': 'it\'s "quoted"', 'Round': '2'}
+
+def host_refusal(line):
+    """agwinterm's own check of a direct-mode command (SessionCommand.cs): the reason it refuses, or None."""
+    argv = parse_windows(line)
+    if len(argv[0].encode('utf-8')) >= 260:
+        return 'app'
+    if len(argv) - 1 > 16:
+        return f'{len(argv) - 1} arguments'
+    if any(len(arg.encode('utf-8')) >= 2048 for arg in argv[1:]):
+        return 'argument bytes'
+    return None
+
+
+DUMP_PARAMS = ('Checkout', 'ScopeFile', 'Round', 'Profile', 'Run', 'Attempt', 'After', 'Base', 'Extra')
+
+
+def dump_script(path):
+    """A stand-in helper script that prints the parameters it was given as JSON, then exits 7."""
+    names = ', '.join(f'${name}' for name in DUMP_PARAMS)
+    path.write_text(f'param({names})\n'
+                    '[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)\n'
+                    "$given = [ordered]@{}\n"
+                    "foreach ($key in $PSBoundParameters.Keys) { $given[$key] = $PSBoundParameters[$key] }\n"
+                    "[Console]::Out.Write(\"`n\" + (ConvertTo-Json -Compress $given))\n"
+                    'exit 7\n', encoding='utf-8-sig')
+
+
+def run_dumped(line):
+    """Run a session command the way the host would (already split by Windows rules) and return the
+    parameters the dump script printed and its exit code."""
+    done = subprocess.run(parse_windows(line), capture_output=True, timeout=120)
+    out = done.stdout.decode('utf-8', 'replace')
+    return json.loads(out.splitlines()[-1]), done.returncode  # after any profile output
+
+
+AWKWARD = {'Checkout': 'C:\\dir with space\\', 'Base': 'it\'s "quoted" \u2018typographic\u2019 \u201a\u201b',
+           'Round': '2', 'Profile': 'caf\u00e9 \u00fc \u65e5\u672c', 'Run': '$env:PATH `n $(calc) @(1)',
+           'Attempt': 'two\nlines', 'Extra': 'x' * 2500}
+
+
+class HelperCommand(unittest.TestCase):
+    """#33: helpers run in agwinterm's direct mode, so their command line is Windows-quoted. #86: their
+    parameters go into a launch file, so that line stays short whatever the parameters are."""
+
+    def test_the_command_is_short_and_the_parameters_are_in_the_launch_file(self):
         with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            argv = wb.pane_command(root, 'revmux-r3-2', 'run-revmux.ps1', **AWKWARD)
+            launcher = root / '.workbench' / 'state' / 'helpers' / 'launch-revmux-r3-2.ps1'
+            self.assertEqual(['-NoLogo', '-ExecutionPolicy', 'Bypass', '-File', str(launcher)], argv[1:])
+            self.assertRegex(Path(argv[0]).name.lower(), r'^(pwsh|powershell)(\.exe)?$')
+            self.assertTrue(launcher.read_bytes().startswith(b'\xef\xbb\xbf'), 'BOM: Windows PowerShell 5.1 reads UTF-8')
+            text = launcher.read_text(encoding='utf-8-sig')
+            self.assertIn(f"& '{wb.HERE / 'run-revmux.ps1'}' -Checkout ", text)
+            self.assertIn("-Base 'it''s \"quoted\" \u2018\u2018typographic\u2019\u2019 \u201a\u201a\u201b\u201b'", text)
+            self.assertTrue(text.endswith('\nexit $LASTEXITCODE\n'))
+            self.assertIsNone(wb.fits_host(argv))
+
+    @unittest.skipUnless(sys.platform == 'win32', 'Windows quoting, PowerShell')
+    def test_the_launcher_runs_the_script_with_every_value_unchanged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "check out \u00e9 it's"
             script = Path(tmp) / 'dump args.ps1'
-            script.write_text('param($Checkout, $Base, $Round)\n'
-                              '[Console]::Out.Write((ConvertTo-Json -Compress @($Checkout, $Base, $Round)))\n',
-                              encoding='utf-8')
-            command = wb.pane_command(str(script), **values)
-            count = ctypes.c_int()
-            argv = parse(command, ctypes.byref(count))
-            parsed = [argv[i] for i in range(count.value)]
-            ctypes.windll.kernel32.LocalFree(argv)
-            self.assertEqual(['-NoLogo', '-ExecutionPolicy', 'Bypass', '-File', str(script),
-                              '-Checkout', values['Checkout'], '-Base', values['Base'], '-Round', '2'], parsed[1:])
-            out = subprocess.run(command, capture_output=True, text=True, timeout=60).stdout
-            self.assertEqual([values['Checkout'], values['Base'], '2'], json.loads(out.splitlines()[-1]))  # after any profile output
+            dump_script(script)
+            line = subprocess.list2cmdline(wb.pane_command(root, 'test', str(script), **AWKWARD))
+            self.assertIsNone(host_refusal(line))
+            given, code = run_dumped(line)
+            self.assertEqual(AWKWARD, given)
+            self.assertEqual(7, code, "the script's own exit code is the pane's")
+
+    def test_fits_host_names_each_limit(self):
+        app = 'C:\\pwsh.exe'
+        self.assertIsNone(wb.fits_host([app, *['a'] * 16, ]))
+        self.assertIsNone(wb.fits_host(['x' * 259, 'y' * 2047]))
+        self.assertIn('the app is 260 bytes', wb.fits_host(['x' * 260]))
+        self.assertIn('the app is 260 bytes', wb.fits_host(['\u00e9' * 130]))       # UTF-8 bytes, not characters
+        self.assertEqual('17 arguments after the app', wb.fits_host([app, *['a'] * 17]))
+        self.assertIn('an argument is 2048 bytes', wb.fits_host([app, 'y' * 2048]))
+        self.assertIn('an argument is 2049 bytes', wb.fits_host([app, 'a', '\u00e9' * 1024 + 'z']))
+        self.assertEqual('no command', wb.fits_host([]))
+
+    def test_a_command_past_the_limits_is_refused_before_session_new(self):
+        with patch.object(agw, 'request') as request, patch.object(agw, 'my_pane', return_value=None):
+            for argv in (['x' * 260], ['app', *['a'] * 17], ['app', 'y' * 2048]):
+                with self.subTest(argv=argv[:2]), self.assertRaises(SystemExit) as refused:
+                    wb.open_session('revmux', Path('checkout'), argv, False)
+                self.assertTrue(str(refused.exception).startswith(
+                    "wb: helper command exceeds agwinterm's session.new limits (app 259 bytes, 16 arguments, "
+                    "2047 bytes each): "), refused.exception)
+            request.assert_not_called()
+
+
+class HelperLaunchLimits(unittest.TestCase):
+    """#86: every helper session wb.py opens fits agwinterm's session.new limits, whatever its parameters."""
+
+    def setUp(self):
+        # A long checkout path with spaces, a quote and non-ASCII, still inside MAX_PATH for the scope file.
+        base = Path(__file__).resolve().parent.parent / ('test wb launch ' + uuid.uuid4().hex)
+        self.addCleanup(shutil.rmtree, base, True)
+        self.folder = base / ("it's a checkout \u00e9\u65e5 " + 'd' * max(1, 150 - len(str(base))))
+        (self.folder / '.workbench/review').mkdir(parents=True)
+        self.scope = self.folder / ("scope it's \u00e9 " + 's' * max(1, 200 - len(str(self.folder)) - 20) + '.md')
+        self.scope.write_text('scope', encoding='utf-8')
+        self.assertGreaterEqual(len(str(self.scope)), 190)
+        self.enterContext(patch.dict(os.environ, {'AI_HUB': str(self.folder / '.workbench'), 'AI_BOX': 'codex'}))
+        self.enterContext(patch.object(wb, 'issue_number', return_value='86'))
+        self.enterContext(patch.object(agw, 'my_pane', return_value=None))
+        self.request = self.enterContext(patch.object(agw, 'request', return_value='sid'))
+        self.opened = self.enterContext(patch.object(wb, 'open_session', wraps=wb.open_session))
+        self.enterContext(contextlib.redirect_stdout(io.StringIO()))
+        self.enterContext(contextlib.redirect_stderr(io.StringIO()))
+
+    def launch(self, *argv):
+        with patch.object(sys, 'argv', ['wb.py', *argv]):
+            self.assertEqual(0, wb.main())
+        command = self.request.call_args.kwargs['args']['command']
+        argv = self.opened.call_args.args[2]
+        self.assertIsNone(wb.fits_host(argv))
+        self.assertLessEqual(len(argv) - 1, 16)
+        if sys.platform == 'win32':
+            self.assertEqual(argv, parse_windows(command))
+            self.assertIsNone(host_refusal(command))
+        return command
+
+    def limited_round(self):
+        review = self.folder / '.workbench/review'
+        (review / 'revmux-r3.md').write_text('limited', encoding='utf-8')
+        (review / 'revmux-r3.json').write_text(json.dumps({'run': 'r3', 'dir': 'x', 'scope': str(self.scope)}),
+                                               encoding='utf-8')
+
+    def test_every_helper_launch_fits(self):
+        launches = {
+            'revmux': ('revmux', '--round', '3', '--scope', str(self.scope)),
+            'rerun with --after': ('revmux', '--round', '3', '--rerun', '--after', '30', '--profile', 'claude-only'),
+            'suite': ('suite', '--label', 'abc1234', '--', 'python', *[f'word{i}' for i in range(29)], 'z' * 3000),
+            'human-review': ('human-review', '--base', 'origin/main'),
+        }
+        for name, argv in launches.items():
+            with self.subTest(name):
+                if name == 'rerun with --after':
+                    self.limited_round()
+                self.launch(*argv)
+
+    @unittest.skipUnless(sys.platform == 'win32', 'Windows quoting, PowerShell')
+    def test_a_rerun_runs_the_script_with_exactly_its_parameters(self):
+        self.limited_round()
+        lib = self.folder.parent / 'lib'
+        lib.mkdir()
+        dump_script(lib / 'run-revmux.ps1')
+        with patch.object(wb, 'HERE', lib):
+            line = self.launch('revmux', '--round', '3', '--rerun', '--after', '30', '--profile', 'claude-only')
+        given, _ = run_dumped(line)
+        self.assertEqual({'Checkout': str(self.folder.resolve()), 'ScopeFile': str(self.scope), 'Round': '3',
+                          'Profile': 'claude-only', 'Run': 'r3-1', 'Attempt': '1', 'After': '30'}, given)
+
+    def test_the_suite_passes_its_whole_argv_through_the_launch_file(self):
+        import run_helper
+        command = ['python', '-m', 'unittest', *[f'w{i}' for i in range(27)], 'a "quoted" \u00e9 ' + 'z' * 3000]
+        self.launch('suite', '--label', 'abc1234', '--', *command)
+        argv = self.opened.call_args.args[2]
+        self.assertEqual([str(wb.HERE / 'run_helper.py'), '--args-file'], argv[1:3])
+        self.assertEqual(['--hub', str(self.folder.resolve() / '.workbench'), '--label', 'abc1234', '--to', 'codex', '--',
+                          *command], run_helper.read_args_file(None, argv[2:]))
+
+    def test_a_rerun_refused_for_its_size_puts_the_limited_report_back(self):
+        self.limited_round()
+        with patch.object(wb, 'fits_host', return_value='17 arguments after the app'), \
+                patch.object(sys, 'argv', ['wb.py', 'revmux', '--round', '3', '--rerun']), \
+                self.assertRaises(SystemExit) as refused:
+            wb.main()
+        self.assertIn("exceeds agwinterm's session.new limits", str(refused.exception))
+        self.request.assert_not_called()
+        self.assertEqual(['revmux-r3.json', 'revmux-r3.md'],
+                         sorted(p.name for p in (self.folder / '.workbench/review').iterdir()))
 
 
 class WaitMail(unittest.TestCase):
@@ -526,6 +688,11 @@ class WaitMail(unittest.TestCase):
         self.assertNotIn('NEW MAIL', output)
         self.assertTrue((path.parent / 'read' / path.name).is_file())
 
+def launched(opened):
+    """The launch file the last helper session runs (#86): the script call with its parameters."""
+    return Path(opened.call_args.args[2][-1]).read_text(encoding='utf-8-sig')
+
+
 class RevmuxProfile(unittest.TestCase):
     """#20: the review round's profile follows the implementer the launcher saved for the checkout."""
 
@@ -542,37 +709,37 @@ class RevmuxProfile(unittest.TestCase):
     def run_round(self, *extra):
         with patch.object(sys, 'argv', ['wb.py', 'revmux', '--round', '1', '--scope', 'scope.md', *extra]):
             self.assertEqual(0, wb.main())
-        return self.opened.call_args.args[2]
+        return launched(self.opened)
 
     def save(self, text):
         (self.folder / '.workbench/state/implementer.json').write_text(text, encoding='utf-8')
 
     def test_no_saved_implementer_keeps_comprehensive(self):
-        self.assertIn("-Profile comprehensive", self.run_round())
+        self.assertIn("-Profile 'comprehensive'", self.run_round())
 
     def test_claude_implementer_uses_the_saved_claude_only_profile(self):
         self.save('{"tool": "claude", "revmuxProfile": "claude-only"}')
-        self.assertIn("-Profile claude-only", self.run_round())
+        self.assertIn("-Profile 'claude-only'", self.run_round())
 
     def test_kimi_implementer_uses_claude_only_unless_the_record_says_otherwise(self):
         # #65: the launcher records claude-only for kimi; a record without a usable profile falls
         # back the same way, since Codex is not in the loop to review.
         self.save('{"tool": "kimi", "revmuxProfile": "claude-only"}')
-        self.assertIn("-Profile claude-only", self.run_round())
+        self.assertIn("-Profile 'claude-only'", self.run_round())
         self.save('{"tool": "kimi"}')
-        self.assertIn("-Profile claude-only", self.run_round())
+        self.assertIn("-Profile 'claude-only'", self.run_round())
         self.save('{"tool": "kimi", "revmuxProfile": "codex-final"}')
-        self.assertIn("-Profile codex-final", self.run_round())
+        self.assertIn("-Profile 'codex-final'", self.run_round())
 
     def test_explicit_profile_wins(self):
         self.save('{"tool": "claude", "revmuxProfile": "claude-only"}')
-        self.assertIn("-Profile codex-final", self.run_round('--profile', 'codex-final'))
+        self.assertIn("-Profile 'codex-final'", self.run_round('--profile', 'codex-final'))
 
     def test_unreadable_or_unsafe_saved_profile_falls_back(self):
         for text in ('not json', '{"revmuxProfile": "x\' ; calc"}', '[]'):
             with self.subTest(text=text):
                 self.save(text)
-                self.assertIn("-Profile comprehensive", self.run_round())
+                self.assertIn("-Profile 'comprehensive'", self.run_round())
 
 
 HEAD = 'a' * 40
@@ -1894,17 +2061,17 @@ class RevmuxRerun(unittest.TestCase):
         (review / 'revmux-r2.json').write_text(json.dumps({'run': 'r2', 'dir': 'x', 'scope': str(self.folder / 'scope.md')}),
                                                encoding='utf-8')
         self.assertEqual(0, self.revmux('--rerun', '--after', '30'))
-        command = self.opened.call_args.args[2]
+        command = launched(self.opened)
         self.assertEqual('#20 revmux r2', self.opened.call_args.args[0])
-        for part in ('-Round 2', '-Run r2-1', '-Attempt 1', '-After 30', f'-ScopeFile "{self.folder / "scope.md"}"'):
+        for part in ("-Round '2'", "-Run 'r2-1'", "-Attempt '1'", "-After '30'", f"-ScopeFile '{self.folder / 'scope.md'}'"):
             self.assertIn(part, command)
         self.assertEqual('limited', (review / 'revmux-r2-limited-1.md').read_text(encoding='utf-8'))
         self.assertTrue((review / 'revmux-r2-limited-1.json').exists())
         self.assertFalse((review / 'revmux-r2.md').exists())
         (review / 'revmux-r2.md').write_text('limited again', encoding='utf-8')
         self.assertEqual(0, self.revmux('--rerun', '--scope', 'scope.md', '--profile', 'claude-only'))
-        command = self.opened.call_args.args[2]
-        for part in ('-Run r2-2', '-Attempt 2', '-Profile claude-only'):
+        command = launched(self.opened)
+        for part in ("-Run 'r2-2'", "-Attempt '2'", "-Profile 'claude-only'"):
             self.assertIn(part, command)
         self.assertNotIn('-After', command)
         self.assertTrue((review / 'revmux-r2-limited-2.md').exists())
@@ -1934,8 +2101,8 @@ class RevmuxRerun(unittest.TestCase):
         self.assertEqual(0, self.revmux('--rerun'))
         (review / 'revmux-r2.json').write_text(json.dumps({'run': 'r2-1', 'dir': 'y'}), encoding='utf-8')
         self.assertEqual(0, self.revmux('--rerun'))
-        command = self.opened.call_args.args[2]
-        for part in ('-Run r2-2', '-Attempt 2', f'-ScopeFile "{self.folder / "scope.md"}"'):
+        command = launched(self.opened)
+        for part in ("-Run 'r2-2'", "-Attempt '2'", f"-ScopeFile '{self.folder / 'scope.md'}'"):
             self.assertIn(part, command)
         self.assertEqual(['revmux-r2-limited-1.json', 'revmux-r2-limited-1.md', 'revmux-r2.json'],
                          sorted(p.name for p in review.iterdir()))
@@ -1944,8 +2111,8 @@ class RevmuxRerun(unittest.TestCase):
         (review / 'revmux-r2.json').write_text(json.dumps({'run': 'r2-2', 'dir': 'z', 'attempt': 2,
                                                            'scope': str(self.folder / 'scope.md')}), encoding='utf-8')
         self.assertEqual(0, self.revmux('--rerun'))
-        self.assertIn('-Run r2-3', self.opened.call_args.args[2])
-        self.assertIn('-Attempt 3', self.opened.call_args.args[2])
+        self.assertIn("-Run 'r2-3'", launched(self.opened))
+        self.assertIn("-Attempt '3'", launched(self.opened))
         self.assertTrue((review / 'revmux-r2-limited-3.md').exists())
 
     def test_rerun_refusals(self):
@@ -1962,7 +2129,7 @@ class RevmuxRerun(unittest.TestCase):
 
     def test_a_first_round_passes_no_run_name(self):
         self.assertEqual(0, self.revmux('--scope', 'scope.md'))
-        self.assertNotIn('-Run', self.opened.call_args.args[2])
+        self.assertNotIn('-Run', launched(self.opened))
 
 
 class ReviewCapSources(unittest.TestCase):
