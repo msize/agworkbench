@@ -21,6 +21,7 @@
   wb.py wait-ci --pr 12 --head <sha>                              # background: until CI on the head is done (#32)
   wb.py update-check --reviewed <sha> --base <sha>                # an UPDATE round is one merge of the base (#32)
   wb.py merge-round --pr 12 --kind update                         # count a proved round; refuse past the limit (#32)
+  wb.py merge-round --pr 12 --summary                             # the merge note's line of the PR's rounds (#90)
   wb.py ci-rerun --pr 12                                          # rerun the failed Actions jobs once (#32)
   wb.py ci-log --pr 12                                            # the failed jobs' log for a FIX round (#32)
 
@@ -496,7 +497,7 @@ def _when(item: dict) -> str:
 
 CHECK_FIELDS = "name,state,bucket,link,workflow"
 FAILED_BUCKETS = ("fail", "cancel")
-ROUND_LIMITS = {"update": 3, "conflict": 1, "ci-rerun": 1, "ci-fix": 1}
+ROUND_LIMITS = {"update": 3, "conflict": 3, "ci-rerun": 1, "ci-fix": 1}     # conflict: mergeRounds.conflict (#90)
 RUN_LINK = re.compile(r"/actions/runs/(\d+)(?:/job/(\d+))?")
 
 
@@ -2168,11 +2169,203 @@ def git_out(root: Path, *args: str) -> str:
     return done.stdout
 
 
+# --- conflict UPDATE rounds (#90) ----------------------------------------------------------------
+# A small conflict - at most mergeRounds.smallConflictHunks conflict regions, nothing changed outside
+# them, no conflicted file that the review flagged - is not counted. update-check decides it from the
+# remerge-diff and records it for the HEAD; merge-round reads that record, so the planner never declares
+# a conflict small itself.
+
+MARKER_OPEN = re.compile(r"<{7,}(?:\s|$)")
+MARKER_CLOSE = re.compile(r">{7,}(?:\s|$)")
+# A marker left in the result: git's own, exactly 7 wide, so a heading's `=============` underline is
+# not one. In the diff only `<<<<<<<` and `>>>>>>>` are sure; a `=======` or `|||||||` (also a 7-letter
+# heading's underline) is a marker only when neither parent had that line (markers_left).
+MARKER_LEFT = re.compile(r"(?:<{7}|>{7})(?: |$)|={7}$|\|{7}(?: |$)")
+MARKER_SURE = re.compile(r"(?:<{7}|>{7})(?: |$)")
+# git's remerge-diff, whatever the user's config says about colour, context, prefixes, blank lines,
+# submodules or signatures.
+REMERGE_DIFF = ("-c", "core.quotepath=false", "-c", "diff.suppressBlankEmpty=false", "show", "--remerge-diff",
+                "--no-color", "--no-ext-diff", "--no-textconv", "--no-relative", "--submodule=short",
+                "--no-show-signature", "-U3", "--format=", "--src-prefix=a/", "--dst-prefix=b/", "HEAD")
+TEXT_CONFLICTS = ("content", "add/add")       # the conflict types that leave marker regions
+LOCATION_RANGE = re.compile(r":\d+(?:-\d+)?(?::\d+)?$")
+COUNTED_ONCE = ("update", "conflict", "conflict-small")     # a HEAD is one round of these
+
+
+def merge_round_limits() -> dict:
+    """ROUND_LIMITS with mergeRounds.conflict over it (#90). Raises followup.SettingsError."""
+    return {**ROUND_LIMITS, "conflict": followup.merge_round_settings(followup.read_config())["conflict"]}
+
+
+def update_check_path(root: Path) -> Path:
+    return root / ".workbench" / "state" / "update-check.json"
+
+
+def location_file(text: str | None, token: bool = False) -> str:
+    """A finding's location (`path:272-275`, `path:3:7`, `path`) as a path, or "" when it is not one.
+    Any path counts (`app/[id]/page.tsx`, `src/my file.py`). A backticked `token` from a report must
+    not start with `-`, and one with neither a dot nor a slash counts only with a line (`Makefile:3`),
+    so a bare word such as `refuses` is no path."""
+    lined = bool(LOCATION_RANGE.search((text or "").strip()))
+    name = LOCATION_RANGE.sub("", followup.normalise_file(text)).strip()
+    if token and (name.startswith("-") or not (lined or re.search(r"[./]", name))):
+        return ""
+    return name
+
+
+def review_flagged_files(root: Path) -> set[str]:
+    """Files the PR's review flagged: the location line under every finding heading of every revmux
+    report (`limited` partials too), and every recorded follow-up's `file`."""
+    files = set()
+    sections = SEVERE_SECTIONS + MINOR_SECTIONS + APART_SECTIONS
+    for path in sorted((root / ".workbench" / "review").glob("revmux-r*.md")):
+        try:
+            text = path.read_text(encoding="utf-8-sig", errors="replace")
+        except OSError:
+            continue
+        section, pending = None, False
+        for line in text.splitlines():
+            if line.startswith("## "):
+                section, pending = line[3:].strip().casefold(), False
+            elif line.startswith("### "):
+                pending = section in sections
+            elif pending and line.strip():
+                pending = False            # the first non-empty line after the heading: the location
+                files.update(name for token in re.findall(r"`([^`]+)`", line) if (name := location_file(token, token=True)))
+    files.update(name for item in load_follow_ups(root) if (name := location_file(item.get("file"))))
+    return files
+
+
+def is_flagged(name: str, flagged: set[str]) -> bool:
+    """Equal, or one is a `/`-boundary suffix of the other (a report may name a shorter path)."""
+    return any(name == other or name.endswith("/" + other) or other.endswith("/" + name) for other in flagged)
+
+
+def remerge_files(diff: str) -> list[dict]:
+    """`git show --remerge-diff` split per file: {path, conflicts (git's `remerge CONFLICT` types),
+    binary, hunks (each a list of lines)}."""
+    files = []
+    for line in diff.splitlines():
+        line = line.rstrip("\r")
+        if line.startswith("diff --git "):
+            match = re.match(r'diff --git "?a/(.*?)"? "?b/(.*?)"?$', line)
+            files.append({"path": match[2] if match else line[11:], "conflicts": [], "binary": False,
+                          "hunks": [], "old": "", "new": ""})
+        elif not files:
+            continue
+        elif files[-1]["hunks"] and line[:1] in (" ", "-", "+", "\\", ""):
+            files[-1]["hunks"][-1].append(line or " ")          # an empty line is a blank context line
+        elif line.startswith("@@"):
+            files[-1]["hunks"].append([])
+        elif match := re.match(r"remerge CONFLICT \(([^)]*)\)", line):
+            files[-1]["conflicts"].append(match[1])
+        elif line.startswith("Binary files "):
+            files[-1]["binary"] = True
+        elif line.startswith("--- a/"):
+            files[-1]["old"] = line[6:].rstrip("\t").strip('"')        # git adds a TAB after a path with a space
+        elif line.startswith("+++ b/"):
+            files[-1]["new"] = line[6:].rstrip("\t").strip('"')
+    for entry in files:
+        entry["path"] = entry.pop("new") or entry.pop("old", "") or entry["path"]
+        entry.pop("old", None)
+    return files
+
+
+def outside_regions(entry: dict) -> tuple[int, str]:
+    """(conflict regions, the first problem or ""). Each change block - a run of `-`/`+` lines with no
+    context between them - must stay in a conflict region of the old side: every `-` line inside one
+    (markers included), every `+` line inside one or in a block that touched one. A marker left in the
+    result is a problem too. The region state carries across hunks: a resolution that keeps a long side
+    splits one region over two hunks. A block never does: each hunk ends the block it holds."""
+    regions, inside, problem = 0, False, ""
+    outside = f"the merge changes code outside the conflict regions in {entry['path']}"
+    left = f"conflict markers left in {entry['path']}"
+    block, touched = [], False
+    for hunk in entry["hunks"]:
+        for line in hunk + [" "]:                # a closing context line ends the hunk's last block
+            tag, text = line[:1], line[1:]
+            if tag == "\\":
+                continue
+            if tag == " ":
+                if MARKER_SURE.match(text):
+                    return regions, left
+                if not touched and not all(block):
+                    problem = problem or outside
+                block, touched = [], False
+            elif tag == "-":
+                if MARKER_OPEN.match(text):
+                    inside, regions = True, regions + 1
+                if not inside:
+                    return regions, outside
+                touched = True
+                if MARKER_CLOSE.match(text):
+                    inside = False
+            else:
+                if MARKER_SURE.match(text):
+                    return regions, left
+                block.append(inside)
+    return regions, problem or (left if inside else "")
+
+
+def markers_left(path: str, show) -> bool:
+    """Whether the merge's `path` holds a git marker line that neither parent had. A stray `=======`
+    outside every hunk is in no diff (keeping both sides, deleting only `<<<<<<<` and `>>>>>>>`)."""
+    result = [line.rstrip("\r") for line in show("HEAD", path).splitlines()]
+    if not any(MARKER_LEFT.match(line) for line in result):
+        return False
+    before = {line.rstrip("\r") for rev in ("HEAD^1", "HEAD^2") for line in show(rev, path).splitlines()}
+    return any(MARKER_LEFT.match(line) and line not in before for line in result)
+
+
+def classify_merge(diff: str, flagged: set[str], small_limit: int, show=None) -> dict:
+    """A non-empty remerge-diff: {"result": "small"|"counted", "hunks", "files", "reason"}. A
+    structural problem is the reason first, then a flagged file, then the number of regions.
+    `show(rev, path)` reads a file's text at a revision ("" when absent) for markers_left."""
+    regions, conflicted, problem = 0, [], ""
+    entries = remerge_files(diff)
+    for entry in entries:
+        if entry["conflicts"]:
+            conflicted.append(entry["path"])
+        other = [kind for kind in entry["conflicts"] if kind not in TEXT_CONFLICTS]
+        if other:
+            found = f"{entry['path']}: {other[0]} conflict"
+        elif not entry["conflicts"]:
+            found = f"{entry['path']} changed outside any conflict"
+        elif entry["binary"] or not entry["hunks"]:
+            found = f"{entry['path']}: binary conflict (no text hunk)"
+        else:
+            count, found = outside_regions(entry)
+            regions += count
+        problem = problem or found
+    if not problem and (not entries or not regions):
+        problem = "the remerge-diff could not be parsed"            # fail closed: never small by accident
+    if not problem and show:
+        problem = next((f"conflict markers left in {path}" for path in conflicted if markers_left(path, show)), "")
+    record = {"hunks": regions, "files": conflicted}
+    flagged_file = next((name for name in conflicted if is_flagged(name, flagged)), None)
+    if problem:
+        reason = problem
+    elif flagged_file:
+        reason = f"{flagged_file} was flagged by review"
+    elif small_limit == 0:
+        reason = "small conflicts are off (mergeRounds.smallConflictHunks is 0)"
+    elif regions > small_limit:
+        reason = f"{regions} conflict hunks > {small_limit}"
+    else:
+        return {"result": "small", **record, "reason": ""}
+    return {"result": "counted", **record, "reason": reason}
+
+
+def plural(count: int, word: str) -> str:
+    return f"{count} {word}" + ("" if count == 1 else "s")
+
+
 def cmd_update_check(args: argparse.Namespace) -> int:
     """After `UPDATED <sha>` (#32): HEAD must be exactly one new commit, a merge of the pinned base
     into the reviewed head, and the tree clean. Prints `update: clean` (git's own merge, nothing
     added) or `update: conflict` (a non-empty remerge-diff: resolved conflicts or anything else
-    added in the merge - review it like a fix)."""
+    added in the merge - review it like a fix) with `(small: ...)` or `(counted: <reason>)` (#90), and
+    records the result for this HEAD in state/update-check.json, which merge-round reads."""
     for name in ("reviewed", "base"):
         if not re.fullmatch(r"[0-9a-fA-F]{40}", getattr(args, name) or ""):
             print(f"wb: update-check --{name} needs a full 40-character SHA", file=sys.stderr)
@@ -2200,14 +2393,38 @@ def cmd_update_check(args: argparse.Namespace) -> int:
         if failures:
             print("\n".join(f"update-check: {line}" for line in failures))
             return 1
-        remerge = git_out(root, "show", "--remerge-diff", "--format=", "HEAD").strip()
+        remerge = git_out(root, *REMERGE_DIFF).strip()
     except (RuntimeError, OSError) as err:
         print(f"update-check: {err}")
         return 1
     if remerge:
-        print(f"update: conflict - review the resolution: git show --remerge-diff {head}")
+        invalid = ""
+        try:
+            small_limit = followup.merge_round_settings(followup.read_config())["smallConflictHunks"]
+        except followup.SettingsError as err:          # fail closed: no conflict is small, and say why
+            small_limit, invalid = 0, str(err)
+            print(f"wb: update-check: {err} - the conflict is counted", file=sys.stderr)
+
+        def show(rev: str, path: str) -> str:
+            try:
+                return git_out(root, "show", f"{rev}:{path}")
+            except (RuntimeError, OSError):
+                return ""                              # not in that revision
+
+        verdict = classify_merge(remerge, review_flagged_files(root), small_limit, show)
+        if invalid and verdict["reason"].startswith("small conflicts are off"):
+            verdict["reason"] = f"mergeRounds is invalid ({invalid})"
+        if verdict["result"] == "small":
+            how = (f"small: {plural(verdict['hunks'], 'conflict hunk')} in {plural(len(verdict['files']), 'file')}; "
+                   "not counted")
+        else:
+            how = f"counted: {verdict['reason']}"
+        print(f"update: conflict ({how}) - review the resolution: git show --remerge-diff {head}")
     else:
+        verdict = {"result": "clean", "hunks": 0, "files": [], "reason": ""}
         print(f"update: clean - git's own merge of {base[:12]} into {reviewed[:12]}, nothing added")
+    from conductor import atomic_json
+    atomic_json(update_check_path(root), {"head": head, "reviewed": reviewed, "base": base, **verdict})
     return 0
 
 
@@ -2215,14 +2432,45 @@ def rounds_path(root: Path) -> Path:
     return root / ".workbench" / "state" / "merge-rounds.json"
 
 
+def merge_summary(record: dict, limits: dict) -> str:
+    """The merge note's line (#90): `merge rounds: 1 clean update; conflicts: 2 small (uncounted), 1 counted of 3`."""
+    def count(kind: str) -> int:
+        return int(record.get(kind) or 0)
+    parts = []
+    if count("update"):
+        parts.append(plural(count("update"), "clean update"))
+    if count("conflict") or count("conflict-small"):
+        small = [f"{count('conflict-small')} small (uncounted)"] if count("conflict-small") else []
+        parts.append("conflicts: " + ", ".join(small + [f"{count('conflict')} counted of {limits['conflict']}"]))
+    if count("ci-rerun"):
+        parts.append(plural(count("ci-rerun"), "CI rerun"))
+    if count("ci-fix"):
+        parts.append(plural(count("ci-fix"), "CI fix round"))
+    return "merge rounds: " + ("; ".join(parts) or "none")
+
+
 def cmd_merge_round(args: argparse.Namespace) -> int:
     """Count one proved round of a kind for this PR (#32); refuse beyond its limit (exit 1: the
-    human's). The counts reset when the PR number changes."""
+    human's). The counts reset when the PR number changes. A conflict that update-check found small
+    for this HEAD is recorded as `conflict-small` and never refused (#90); a kind that contradicts
+    update-check's record for this HEAD is refused (exit 2); an update or conflict round is counted
+    once per HEAD. --summary prints the merge note's line."""
     root = checkout()
     number = int(str(args.pr).rsplit("/", 1)[-1]) if re.fullmatch(r"(?:.*/)?\d+", str(args.pr)) else None
     if number is None:
         print("wb: merge-round --pr needs a PR number or URL", file=sys.stderr)
         return 2
+    summary = getattr(args, "summary", False)       # ci-rerun calls it with a Namespace of its own
+    if bool(args.kind) == bool(summary):
+        print("wb: merge-round needs --kind or --summary", file=sys.stderr)
+        return 2
+    limits = ROUND_LIMITS
+    if summary or args.kind == "conflict":         # mergeRounds never blocks counting the other kinds
+        try:
+            limits = merge_round_limits()
+        except followup.SettingsError as err:
+            print(f"wb: merge-round: {err}", file=sys.stderr)
+            return 2
     path = rounds_path(root)
     try:
         record = json.loads(path.read_text(encoding="utf-8-sig"))
@@ -2230,14 +2478,51 @@ def cmd_merge_round(args: argparse.Namespace) -> int:
         record = {}
     if not isinstance(record, dict) or record.get("pr") != number:
         record = {"pr": number}
-    limit, count = ROUND_LIMITS[args.kind], int(record.get(args.kind) or 0)
-    if count >= limit:
-        print(f"{args.kind}: the limit of {limit} round(s) for PR #{number} is reached - this goes to the human")
-        return 1
-    record[args.kind] = count + 1
-    from conductor import atomic_json
-    atomic_json(path, record)
-    print(f"{args.kind} round {count + 1} of {limit} for PR #{number}")
+    if summary:
+        print(merge_summary(record, limits))
+        return 0
+    head = ""                                      # no HEAD: nothing to bind to, so it is counted
+    if args.kind in ("update", "conflict"):        # the CI rounds are not bound to update-check
+        try:
+            head = git_out(root, "rev-parse", "HEAD").strip()
+        except (RuntimeError, OSError):
+            pass
+    try:
+        check = json.loads(update_check_path(root).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        check = None
+    said = check.get("result") if isinstance(check, dict) and head and check.get("head") == head else None
+    if args.kind == "update" and said in ("small", "counted"):
+        print(f"wb: merge-round: update-check said conflict for {head[:12]} - count it with --kind conflict",
+              file=sys.stderr)
+        return 2
+    if args.kind == "conflict" and said == "clean":
+        print(f"wb: merge-round: update-check said clean for {head[:12]} - count it with --kind update",
+              file=sys.stderr)
+        return 2
+    kind = "conflict-small" if args.kind == "conflict" and said == "small" else args.kind
+    heads = record.get("heads") if isinstance(record.get("heads"), dict) else {}
+    again = bool(head) and kind in COUNTED_ONCE and heads.get(kind) == head
+    count = int(record.get(kind) or 0)
+    note = f" (already counted for {head[:12]})" if again else ""
+    if kind == "conflict-small":
+        count += 0 if again else 1
+        message = (f"conflict round (small, not counted): {count} small so far; "
+                   f"{int(record.get('conflict') or 0)} of {limits['conflict']} counted rounds used for PR #{number}{note}")
+    else:
+        limit = limits[kind]
+        if not again and count >= limit:
+            print(f"{kind}: the limit of {limit} round(s) for PR #{number} is reached - this goes to the human")
+            return 1
+        count += 0 if again else 1
+        message = f"{kind} round {count} of {limit} for PR #{number}{note}"
+    if not again:
+        record[kind] = count
+        if head and kind in COUNTED_ONCE:
+            record["heads"] = {**heads, kind: head}
+        from conductor import atomic_json
+        atomic_json(path, record)
+    print(message)
     return 0
 
 
@@ -2458,7 +2743,8 @@ def main() -> int:
     p.set_defaults(func=cmd_update_check)
     p = subs.add_parser("merge-round", help="count one proved merge round; refuse beyond its limit (#32)")
     p.add_argument("--pr", required=True)
-    p.add_argument("--kind", required=True, choices=sorted(ROUND_LIMITS))
+    p.add_argument("--kind", choices=sorted(ROUND_LIMITS))
+    p.add_argument("--summary", action="store_true", help="print the merge note's line of this PR's rounds (#90)")
     p.set_defaults(func=cmd_merge_round)
     p = subs.add_parser("ci-log", help="write the failed CI jobs' logs for a FIX round (#32)")
     p.add_argument("--pr", required=True)

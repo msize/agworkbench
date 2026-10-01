@@ -1013,6 +1013,20 @@ class Rules(unittest.TestCase):
         self.assertEqual([1, 2, 3], followup.parse_pages('[1, 2]\n[3]\n'))
         self.assertEqual([], followup.parse_pages(''))
 
+    def test_merge_round_settings(self):
+        # #90: counted conflict rounds 1..10, small-conflict regions 0..20 (0: off); defaults 3 and 3.
+        self.assertEqual({'conflict': 3, 'smallConflictHunks': 3}, followup.merge_round_settings({}))
+        self.assertEqual({'conflict': 10, 'smallConflictHunks': 0},
+                         followup.merge_round_settings({'mergeRounds': {'conflict': 10, 'smallConflictHunks': 0}}))
+        for section, needle in (([], 'mergeRounds must be an object'),
+                                ({'conflict': 0}, 'mergeRounds.conflict'), ({'conflict': 11}, 'mergeRounds.conflict'),
+                                ({'conflict': '3'}, 'mergeRounds.conflict'), ({'conflict': True}, 'mergeRounds.conflict'),
+                                ({'smallConflictHunks': -1}, 'mergeRounds.smallConflictHunks'),
+                                ({'smallConflictHunks': 21}, 'mergeRounds.smallConflictHunks'),
+                                ({'smallConflictHunks': 2.0}, 'mergeRounds.smallConflictHunks')):
+            with self.subTest(section=section), self.assertRaisesRegex(followup.SettingsError, needle):
+                followup.merge_round_settings({'mergeRounds': section})
+
 
 class Prose(unittest.TestCase):
 
