@@ -780,7 +780,8 @@ What waits (#77), for a member launched with `-WaitOnLimit` (saved as `onLimit: 
   member idle with a Kimi limit error at the bottom of the implementer's pane, it starts the wait itself
   instead of pinging the planner. A planner that sees a limit the relay missed runs `wb.py wait-limit
   --reason "..."`, which starts the same wait. In a `-WaitOnLimit` loop `wb.py loop-state blocked`
-  refuses a reason that names a usage limit: a limit never waits for you.
+  refuses any reason that mentions a limit unless the planner adds `--needs-human` (a GitHub, CI or disk
+  limit is a real block): an agent's usage limit never waits for you.
 - **The queue** starts no new member while any member waits. The conductor prints
   `(kimi) waiting: #N kimi usage limit since HH:MM, next try HH:MM` once and
   `queue resumed: usage limit cleared` when it ends, and the queue's summary shows the member as

@@ -3191,32 +3191,97 @@ class WaitLimit(unittest.TestCase):
                 self.assertFalse((self.state / 'limit-request.json').exists())
                 self.assertIn('-Failover', self.err.getvalue())
 
-    def test_blocked_for_a_usage_limit_is_refused_in_wait_mode(self):
+    # Rounds 1-2: a limit an agent waits out, in every wording the reviewers tried, and the agents' own.
+    AGENT_LIMITS = (
+        'implementer (kimi) at its usage limit', 'Kimi quota exhausted', "kimi's quota is used up", 'plan quota reached',
+        'waiting out the 5-HOUR window', 'codex limited', 'Kimi hit its limit', 'claude has reached the weekly limit',
+        'Kimi implementer limited', 'The Kimi implementer hit its limit', 'kimi (implementer) hit its limit',
+        'implementer (kimi): limited', 'the implementer (Kimi Code) hit its limit', 'kimi 5h limit', 'Kimi 5 hour limit',
+        'kimi hit 5h limit', 'Kimi: 5 hour limit', 'kimi: 5h limit hit', 'kimi out of quota', 'kimi ran out of quota',
+        'kimi exhausted its quota', 'kimi weekly quota', 'kimi: quota exceeded', 'Kimi: 403 quota exhausted',
+        'Kimi rate limited', 'codex hit rate limit', 'codex hit its rate limit', 'Kimi plan limit reached',
+        'kimi is over its limit', 'codex exceeded its limit', 'codex: limited', 'kimi: limit reached', 'kimi-code limited',
+        'implementer usage-limited', "claude: You've hit your limit", "claude: You’ve hit your session limit",
+        'codex out of credits', 'Kimi: Error: [provider.auth_error] 403 exceeded your current quota')
+    # Rounds 1-2: real blocks that mention a limit - the human answers them, with --needs-human.
+    REAL_BLOCKS = (
+        'GitHub API rate limit', 'CI runner limited', 'disk quota exceeded', 'GitHub Actions minutes quota exhausted',
+        'CI runner quota reached', 'codex push failed: GitHub API rate limit', 'claude cannot push: GitHub API rate limit',
+        'claude needs a human: PR body exceeds the 65536 char limit', 'kimi: CI time limit exceeded',
+        'codex: CI runner time limit', 'codex sandbox: network limited', 'CLAUDE.md line limit question',
+        'codex limited; failover is off', 'kimi limited; failover is off',
+        'codex is limited by the sandbox: cannot write outside the repo',
+        'claude has limited context left, needs a new session', 'Claude limits the PR to 500 lines? question for human',
+        'kimi reached the limit of 3 review rounds', 'kimi hit the limit of retries on flaky CI',
+        'codex is at the limit of what it can verify without secrets', 'codex has hit the limit on open PRs',
+        'kimi is limited to read-only sandbox; needs human', 'GitHub API usage limit exceeded',
+        'GitHub Actions usage limit reached', 'GitHub Actions usage quota exhausted', 'Copilot usage limit',
+        'Azure OpenAI usage limit on the CI key', 'claude needs a human: plan quota for GitHub Copilot',
+        "failover refused: codex recorded limited at 10:02 ('You've hit your usage limit')")
+
+    def blocked(self, reason, *flags):
+        self.err.seek(0)
+        self.err.truncate()
+        return self.run_wb('loop-state', 'blocked', *flags, '--reason', reason)
+
+    def test_any_limit_reason_is_refused_in_wait_mode_until_the_planner_answers(self):
+        # FIX r2: a free-text pattern cannot tell a usage limit from a GitHub one; the planner says which.
         self.on_limit('wait')
-        for reason in ('implementer (kimi) at its usage limit', 'Kimi quota exhausted', "kimi's quota is used up",
-                       'plan quota reached', 'waiting out the 5-HOUR window', 'codex limited', 'Kimi hit its limit',
-                       'claude has reached the weekly limit'):
+        for reason in self.AGENT_LIMITS + self.REAL_BLOCKS:
             with self.subTest(reason=reason):
-                self.err.seek(0)
-                self.err.truncate()
-                self.assertEqual(1, self.run_wb('loop-state', 'blocked', '--reason', reason))
-                self.assertIn('wb.py wait-limit', self.err.getvalue())
-                self.assertEqual(1, self.run_wb('loop-state', 'blocked', '--environmental', '--reason', reason))
+                self.assertEqual(1, self.blocked(reason))
+                stderr = self.err.getvalue()
+                self.assertIn('wb.py wait-limit', stderr)
+                self.assertIn('--needs-human', stderr)
+                self.assertLess(stderr.index('wait-limit'), stderr.index('--needs-human'))
+                self.assertEqual(1, self.blocked(reason, '--environmental'))
         self.assertFalse((self.state / 'loop.json').exists())
-        # FIX r1 M1: real blocks that mention a quota, or name an agent and later say "limit".
-        for reason in ('GitHub API rate limit', 'CI runner limited', 'a question for the human',
-                       'disk quota exceeded', 'GitHub Actions minutes quota exhausted', 'CI runner quota reached',
-                       'codex push failed: GitHub API rate limit', 'claude cannot push: GitHub API rate limit',
-                       'claude needs a human: PR body exceeds the 65536 char limit', 'kimi: CI time limit exceeded',
-                       'codex: CI runner time limit', 'codex sandbox: network limited', 'CLAUDE.md line limit question'):
+        for reason in self.REAL_BLOCKS:
+            with self.subTest(needs_human=reason):
+                self.assertEqual(0, self.blocked(reason, '--environmental', '--needs-human'))
+                self.assertEqual(reason, self.q.read_json(self.state / 'loop.json')['reason'])
+        self.assertEqual(0, self.blocked('codex limited; failover is off', '--needs-human'))
+
+    def test_a_reason_with_no_limit_word_needs_no_answer(self):
+        self.on_limit('wait')
+        for reason in ('plan disagreement', 'review rounds exhausted: the parser still drops rows', 'PR closed',
+                       'mail waiter configuration error', 'a question for the human',
+                       'no-op: already fixed in #12; close the issue to finish'):
             with self.subTest(reason=reason):
-                self.assertEqual(0, self.run_wb('loop-state', 'blocked', '--environmental', '--reason', reason))
+                self.assertEqual(0, self.blocked(reason))
 
     def test_blocked_for_a_usage_limit_is_allowed_when_failing_over(self):
         self.on_limit('failover')
-        self.assertEqual(0, self.run_wb('loop-state', 'blocked', '--environmental', '--reason',
-                                        'implementer (kimi) at its usage limit'))
-        self.assertEqual('blocked', self.q.read_json(self.state / 'loop.json')['state'])
+        for reason in ('implementer (kimi) at its usage limit', 'codex limited; failover is off'):
+            with self.subTest(reason=reason):
+                self.assertEqual(0, self.blocked(reason, '--environmental'))
+                self.assertEqual('blocked', self.q.read_json(self.state / 'loop.json')['state'])
+
+    def test_the_planner_doc_answers_the_refusal_where_it_prescribes_a_limit_block(self):
+        doc = (Path(__file__).resolve().parent.parent / 'claude/commands/start-github-issue.md').read_text(encoding='utf-8')
+        usage = doc.split('## Usage limits')[1].split('## Stall pointers')[0]
+        for command in ('loop-state blocked --environmental --needs-human --reason "<the refusal line>"',
+                        'loop-state blocked --environmental --needs-human --reason "<tool> limited; failover is off"',
+                        '`--environmental --needs-human`', 'wait-limit --reason'):
+            with self.subTest(command=command):
+                self.assertIn(command, usage)
+        # Every prescribed reason that mentions a limit carries the answer.
+        for command, reason in re.findall(r'(loop-state blocked[^`"]*)--reason "([^"]*)"', doc):
+            if wb.limit_reason(reason):
+                with self.subTest(reason=reason):
+                    self.assertIn('--needs-human', command)
+
+    def test_needs_human_is_only_for_blocked(self):
+        self.on_limit('wait')
+        with patch.object(sys, 'argv', ['wb.py', 'loop-state', 'resumed', '--environmental']):
+            environmental = wb.main()
+        for state in ('resumed', 'pr-open'):
+            with self.subTest(state=state):
+                argv = ['loop-state', state, '--needs-human'] + (['--pr', 'https://github.com/o/r/pull/2']
+                                                                 if state == 'pr-open' else [])
+                self.assertEqual(environmental, self.run_wb(*argv))
+        self.assertEqual(2, environmental)
+        self.assertFalse((self.state / 'loop.json').exists())
 
 
 if __name__ == '__main__':
