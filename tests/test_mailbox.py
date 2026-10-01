@@ -48,6 +48,14 @@ class Mailbox(unittest.TestCase):
         read = self.run_py(str(LIB / "agmsg.py"), "read", "--box", "claude")
         self.assertIn("(empty)", read.stdout)
 
+    def test_ci_is_a_kind(self):
+        # #94: the relay's CI result mail.
+        sent = self.run_py(str(LIB / "agmsg.py"), "send", "--to", "claude", "--force", "--kind", "ci",
+                           "--subject", "CI finished on aaaaaaa: 1 passed, 0 failed", "--text", "t")
+        self.assertEqual(0, sent.returncode, sent.stderr)
+        read = self.run_py(str(LIB / "agmsg.py"), "read", "--box", "claude")
+        self.assertIn("kind:    ci", read.stdout)
+
     def test_a_box_name_cannot_escape_the_mailbox(self):
         posted = self.run_py(str(LIB / "post.py"), "--hub", self.tmp, "--to", "../outside",
                              "--sender", "x", "--subject", "s", "--text", "t")

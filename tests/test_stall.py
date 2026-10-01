@@ -594,6 +594,133 @@ class QuietHelper(StallFixture):
         self.assertEqual(1, len(self.stall_mail()))
 
 
+class CiBackstop(StallFixture):
+    """#94: finished CI on the open PR's head that no `ci` mail named is the stall; the watch queues that
+    mail. Defensive: watch_pr queues it in the same save as the snapshot, so only state whose `ci_mailed`
+    was lost while the snapshot survived (hand-edited) reaches this; these tests plant such state. It
+    files only a finished CI result, never the time-based no-checks mail (#94 r3)."""
+
+    FINISHED = {'number': 9, 'url': 'https://github.com/o/repo/pull/9', 'state': 'OPEN', 'headRefOid': 'c' * 40,
+                'statusCheckRollup': [
+                    {'__typename': 'CheckRun', 'name': 'tests', 'status': 'COMPLETED', 'conclusion': 'SUCCESS'},
+                    {'__typename': 'StatusContext', 'context': 'ci/x', 'state': 'FAILURE'}]}
+
+    def setUp(self):
+        super().setUp()
+        self.write('implementer.json', {'tool': 'codex', 'autoMerge': True})
+        self.r.state['pr'] = dict(self.FINISHED)
+
+    def ci_mail(self):
+        box = self.hub_dir / 'inbox' / 'claude'
+        return [message for message in map(hub.parse_message, sorted(box.glob('*.md')))
+                if message.get('kind') == 'ci']
+
+    def test_an_unmailed_finished_ci_files_the_ci_mail_not_the_pointer(self):
+        self.run_until(S)
+        mails = self.ci_mail()
+        self.assertEqual(1, len(mails))
+        self.assertEqual(('claude', 'relay'), (mails[0]['to'], mails[0]['from']))
+        self.assertEqual('CI finished on ccccccc: 1 passed, 1 failed (ci/x)', mails[0]['subject'])
+        self.assertEqual(relay.ci_result(self.FINISHED)['key'], self.r.state['ci_mailed'])
+        self.assertEqual([], self.stall_mail())
+        # Unread, it exempts the loop; the stall watch files it only once.
+        self.run_until(3 * S, start=S + 1)
+        self.assertEqual(1, len(self.ci_mail()))
+        self.assertEqual([], self.stall_mail())
+
+    def test_a_stale_snapshot_without_checks_gets_the_pointer_not_a_no_checks_mail(self):
+        # #94 r3: gh failed for a stall period after a poll saved an empty rollup; checks may be running now.
+        self.r.state['pr'] = dict(self.FINISHED, statusCheckRollup=[])
+        self.r.no_checks = ((9, 'c' * 40), 0.0)      # watch_pr saw that head without checks at minute 0
+        self.run_until(S)
+        self.assertEqual([], self.ci_mail())
+        self.assertNotIn('ci_mailed', self.r.state)
+        self.assertEqual(1, len(self.stall_mail()))
+
+    def test_a_ci_mail_that_was_not_filed_falls_through_to_the_pointer(self):
+        with patch.object(self.r, 'ci_mail', return_value=False):
+            self.run_until(S)
+        self.assertEqual(1, len(self.stall_mail()))
+
+    def test_ci_already_mailed_and_read_the_pointer_says_what_was_missed(self):
+        self.r.state['ci_mailed'] = relay.ci_result(self.FINISHED)['key']
+        self.run_until(S)
+        self.assertEqual([], self.ci_mail())
+        mails = self.stall_mail()
+        self.assertEqual(1, len(mails))
+        self.assertIn('CI on the PR head: CI finished on ccccccc: 1 passed, 1 failed (ci/x)', mails[0]['body'])
+
+    def test_dry_run_files_nothing(self):
+        self.r = self.make_relay(dry_run=True)
+        self.r.state['pr'] = dict(self.FINISHED)
+        self.run_until(S)
+        self.assertEqual([], self.ci_mail())
+        self.assertNotIn('ci_mailed', self.r.state)
+
+
+class CiStuck(StallFixture):
+    """#94 r1: with wait-ci optional, a check stuck pending (an offline runner, a status that never
+    reports) must not exempt the loop forever: a pending set unchanged for CI_STUCK_MINUTES ends it."""
+
+    BOUND = int(relay.CI_STUCK_MINUTES)
+
+    def setUp(self):
+        super().setUp()
+        self.write('implementer.json', {'tool': 'codex', 'autoMerge': True})
+        self.pending(('build',))
+
+    def pending(self, names, head='c' * 40):
+        self.r.state['pr'] = {'number': 9, 'state': 'OPEN', 'headRefOid': head, 'statusCheckRollup': [
+            {'__typename': 'CheckRun', 'name': 'tests', 'status': 'COMPLETED', 'conclusion': 'SUCCESS'}] + [
+            {'__typename': 'CheckRun', 'name': name, 'status': 'QUEUED'} for name in names]}
+
+    def test_a_pending_set_unchanged_past_the_bound_is_pointed_at_then_escalated(self):
+        self.assertEqual(90, self.BOUND)
+        self.run_until(self.BOUND + S - 1, step=1)
+        self.assertEqual([], self.stall_mail())
+        self.tick(self.BOUND + S)
+        mails = self.stall_mail()
+        self.assertEqual(1, len(mails))
+        self.assertIn('CI on PR #9 stuck: build pending, unchanged for 105 min', mails[0]['body'])
+        self.run_until(self.BOUND + 4 * S, start=self.BOUND + S + 1)
+        self.assertEqual(1, len(self.escalations()))
+        # #94 r2: the human hears why - waiting.json, the notification.
+        reason = json.loads((self.hub_dir / 'state' / 'waiting.json').read_text(encoding='utf-8'))['reason']
+        self.assertIn('; CI on PR #9 stuck: build pending, unchanged for', reason)
+        self.assertIn('CI on PR #9 stuck: build pending', self.notify.call_args.args[1])
+
+    def test_the_stuck_note_is_logged_once(self):
+        # #94 r2: not every tick, though another exemption (waiting.json) alternates with it.
+        self.run_until(self.BOUND + 5)
+        self.write('waiting.json', {'by': 'planner'})
+        self.run_until(self.BOUND + 20, start=self.BOUND + 6)
+        self.assertEqual(1, sum('CI on PR #9 stuck' in line for line in self.logs))
+
+    def test_a_changing_pending_set_restarts_the_bound(self):
+        self.run_until(60)
+        self.pending(('build', 'lint'))
+        self.run_until(60 + self.BOUND - 1, start=61)
+        self.assertEqual([], self.stall_mail())
+        # The clock restarts on the first tick that sees the new set (minute 61).
+        self.run_until(61 + self.BOUND + S, start=60 + self.BOUND)
+        self.assertEqual(1, len(self.stall_mail()))
+
+    def test_a_new_head_restarts_the_bound(self):
+        self.run_until(60)
+        self.pending(('build',), head='d' * 40)
+        self.run_until(60 + self.BOUND + S - 1, start=61)
+        self.assertEqual([], self.stall_mail())
+
+    def test_finished_ci_clears_the_stuck_note(self):
+        self.run_until(self.BOUND)
+        self.assertIsNotNone(self.r.stall.ci_stuck)
+        self.r.state['pr']['statusCheckRollup'] = self.r.state['pr']['statusCheckRollup'][:1]
+        self.r.state['ci_mailed'] = relay.ci_result(self.r.state['pr'])['key']
+        self.tick(self.BOUND + 1)
+        self.assertIsNone(self.r.stall.ci_stuck)
+        self.assertIsNone(self.r.stall.ci_wait)
+
+
 class LastWords(unittest.TestCase):
     def test_codex_last_paragraph_above_the_composer_not_the_footer(self):
         self.assertEqual('• No unread mail. Waiting for the next “Chat from Workbench:” notification; no files edited.',
@@ -668,6 +795,26 @@ class StallProse(unittest.TestCase):
         self.assertIn('never with a hand-rolled watcher', rules)
         self.assertIn('run `wb.py status active` when you resume', rules)
         self.assertIn('`wb.py suite --label <sha7> -- <command>`', text.split('## Phase 6')[1].split('## Phase 7')[0])
+
+    def test_the_planner_knows_the_relays_ci_mail(self):
+        # #94: the relay's `ci` mail stands in for a killed wait-ci.
+        text = self.text('claude/commands/start-github-issue.md')
+        section = text.split('## CI results')[1].split('## Stall pointers')[0]
+        for needle in ('from `relay`, kind `ci`', 'same signal as wait-ci\'s exit 0', '`wait-ci` is optional',
+                       'Read every `ci` mail', 'merge-check decides which checks are required',
+                       'stop any wait-ci still running for that head', 'mail for another head is ignored',
+                       'Without auto-merge: mention a red result in chat'):
+            self.assertIn(needle, section)
+        self.assertIn("the relay's `ci` mail for this head", text.split('| `ci-pending:` |')[1].split('|')[0])
+        self.assertIn('`CI on the PR head: <summary>`', text.split('## Stall pointers')[1])
+        self.assertIn('unchanged for 90 minutes (wait-ci\'s timeout)', section)
+        self.assertNotIn('push, wait-ci, merge-check', text)
+        self.assertNotIn('then wait-ci and merge-check', text)
+        readme = self.text('README.md')
+        self.assertIn('no checks reported in 5 min', section)
+        for needle in ('no checks reported in 5 min', 'unchanged for 90 minutes, wait-ci\'s timeout', "**The relay's CI mail (#94).**", 'once per finished run, not once per head',
+                       'A check that registers late', '`CI on the PR head: ...`'):
+            self.assertIn(needle, readme)
 
     def test_implementers_never_hide_a_suite_in_a_background_watcher(self):
         self.assertIn('wb.py" suite --label <sha7> -- <command>`', self.text('claude/commands/workbench-implementer.md'))

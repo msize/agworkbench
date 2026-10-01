@@ -104,13 +104,19 @@ import closer  # noqa: E402
 import tslog  # noqa: E402
 
 PR_FIELDS = ("number,url,state,createdAt,updatedAt,closedAt,reviewDecision,mergedAt,reviews,comments,headRefName,"
-             "isCrossRepository,statusCheckRollup")
+             "isCrossRepository,statusCheckRollup,headRefOid")
 HOLD_ALERT_AFTER = 60.0
 AMBIGUOUS_ALERT_AFTER = 600.0
 ALERT_EVERY = 300.0
 TERMINAL_DRAIN_TIMEOUT = 30 * 60.0
 LIMIT_READS = 2          # consecutive reads that start (or end) a usage-limit episode
 STALL_MINUTES = 15.0     # the default stall period (#45); `stallMinutes` in ~/.agworkbench.json, 0 = off
+# A pending set unchanged this long is stuck, not running (#94 r1): wait-ci's default --timeout, the
+# bound the CI-running exemption had while every planner ran wait-ci.
+CI_STUCK_MINUTES = 90.0
+# A head with no check reported this long gets its `ci` mail (#94 r2): wait-ci's default --no-ci-grace,
+# after which wait-ci called a head without CI done.
+NO_CI_GRACE_MINUTES = 5.0
 LIMIT_RETRY_MINUTES = 30.0   # between probes of an agent waiting out its limit (#77); `limitRetryMinutes`
 KIMI_WINDOW_SECONDS = 5 * 3600.0   # Kimi's usage window (#88): its limit gives no reset time
 WINDOW_SLACK = 60.0      # the window-end probe comes this long after the window's end
@@ -375,6 +381,10 @@ def clock_text(epoch: float) -> str:
     return time.strftime("%H:%M", time.localtime(epoch))
 
 
+def check_kind(item: dict[str, Any]) -> str:
+    return item.get("__typename") or ("CheckRun" if "status" in item else "StatusContext")
+
+
 def ci_pending(pr: dict[str, Any]) -> list[str]:
     """The PR's checks that are still running, from the snapshot's statusCheckRollup (#45 r1): a
     check run not COMPLETED, a commit status PENDING or EXPECTED."""
@@ -382,12 +392,52 @@ def ci_pending(pr: dict[str, Any]) -> list[str]:
     for item in pr.get("statusCheckRollup") or []:
         if not isinstance(item, dict):
             continue
-        kind = item.get("__typename") or ("CheckRun" if "status" in item else "StatusContext")
+        kind = check_kind(item)
         if kind == "CheckRun" and item.get("status") != "COMPLETED":
             pending.append(str(item.get("name") or "?"))
         elif kind == "StatusContext" and item.get("state") in ("PENDING", "EXPECTED"):
             pending.append(str(item.get("context") or "?"))
     return pending
+
+
+def ci_result(pr: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The finished CI on an OPEN PR's head (#94), or None while it is not OPEN, has no head, no check
+    has reported or any check still runs. `key` names this finished run of this PR's head: a rerun or
+    a check that registered late gives a new one, a repeated poll the same one. The counts take every
+    check; merge-check alone knows which are required."""
+    if not isinstance(pr, dict) or pr.get("state") != "OPEN" or not pr.get("headRefOid"):
+        return None
+    items = [item for item in pr.get("statusCheckRollup") or [] if isinstance(item, dict)]
+    if not items or ci_pending(pr):
+        return None
+    passed, skipped, failed, rows = 0, 0, [], []
+    for item in items:
+        kind = check_kind(item)
+        if kind == "CheckRun":
+            name, verdict = item.get("name"), item.get("conclusion")
+            when, link = item.get("completedAt"), item.get("detailsUrl")
+            bucket = ("passed" if verdict == "SUCCESS" else "skipped" if verdict in ("NEUTRAL", "SKIPPED")
+                      else "failed")
+        else:
+            name, verdict = item.get("context"), item.get("state")
+            when, link = item.get("startedAt"), item.get("targetUrl")
+            bucket = "passed" if verdict == "SUCCESS" else "failed"
+        name = str(name or "?")
+        if bucket == "passed":
+            passed += 1
+        elif bucket == "skipped":
+            skipped += 1
+        else:
+            failed.append((name, str(link or "")))
+        rows.append([str(kind), name, str(verdict or ""), str(when or ""), str(link or "")])
+    head = str(pr["headRefOid"])
+    key = hashlib.sha256(json.dumps([pr.get("number"), head, sorted(rows)], sort_keys=True)
+                         .encode("utf-8")).hexdigest()
+    names = [name for name, _ in failed]
+    summary = (f"CI finished on {head[:7]}: {passed} passed, {len(failed)} failed"
+               + (f" ({', '.join(names)})" if failed else "") + (f", {skipped} skipped" if skipped else ""))
+    return {"head": head, "key": key, "passed": passed, "failed": names, "failed_links": failed,
+            "skipped": skipped, "summary": summary}
 
 
 def git_head(root: Path) -> str | None:
@@ -459,6 +509,9 @@ class StallWatch:
         self.quiet: dict[str, tuple[str, float]] = {}   # marker-less helper pane -> (tail hash, unchanged since)
         self.sent: set[str] = set()              # this relay's stall mail: neither progress nor unread
         self.held: list[str] = []                # unread implementer mail held by its usage limit (#88)
+        self.ci_wait: tuple[tuple, float] | None = None   # (PR, head, pending checks), unchanged since (#94 r1)
+        self.ci_stuck: str | None = None         # the pointer's note on CI stuck pending
+        self.ci_stuck_logged: str | None = None
         self.last_note: str | None = None
 
     @property
@@ -548,8 +601,26 @@ class StallWatch:
             if not (isinstance(settings, dict) and settings.get("autoMerge") is True):
                 reasons.append(f"PR #{pr.get('number')} is open for review")
             elif ci_pending(pr):
-                # Under auto-merge the planner waits on CI with a background wait-ci the relay cannot see.
-                reasons.append(f"PR #{pr.get('number')} CI running: {', '.join(ci_pending(pr))}")
+                # Under auto-merge the planner waits on CI: for the relay's `ci` mail or a wait-ci. A pending
+                # set unchanged for CI_STUCK_MINUTES is stuck (an offline runner, a status that never reports),
+                # and no `ci` mail will come: the exemption ends, as wait-ci's timeout ended its wait.
+                pending = ci_pending(pr)
+                current = (pr.get("number"), pr.get("headRefOid"), tuple(sorted(pending)))
+                if self.ci_wait is None or self.ci_wait[0] != current:
+                    self.ci_wait = (current, now())
+                waited = now() - self.ci_wait[1]
+                if waited < CI_STUCK_MINUTES * 60:
+                    self.ci_stuck = None
+                    reasons.append(f"PR #{pr.get('number')} CI running: {', '.join(pending)}")
+                else:
+                    stuck = f"CI on PR #{pr.get('number')} stuck: {', '.join(pending)} pending"
+                    self.ci_stuck = f"{stuck}, unchanged for {waited / 60:.0f} min"
+                    if stuck != self.ci_stuck_logged:
+                        # Logged once: note() would repeat it, alternating with tick's "not stalled" note.
+                        self.ci_stuck_logged = stuck
+                        self.relay.log(f"stall watch: {self.ci_stuck}; not an exemption")
+        if not (pr.get("state") == "OPEN" and ci_pending(pr)):
+            self.ci_wait, self.ci_stuck, self.ci_stuck_logged = None, None, None
         unread, held = self.unread(), []
         if any(entry.startswith("codex/") for entry in unread) and texts is not None and self.implementer_limit(texts):
             held = [entry for entry in unread if entry.startswith("codex/")]
@@ -642,6 +713,8 @@ class StallWatch:
             if instant - self.since >= self.period:
                 if self.wait_out_limit(texts):
                     self.reset("usage limit")
+                elif self.ci_backstop():
+                    self.reset("CI mail queued")
                 elif self.pointer(instant - self.since, quiet, texts):
                     self.level, self.pointer_at = 1, instant
         elif self.level == 1:
@@ -676,6 +749,16 @@ class StallWatch:
         self.relay.force_wait(peer, found, texts[peer.box], "stall")
         return True
 
+    def ci_backstop(self) -> bool:
+        """#94: finished CI on the open PR's head that no `ci` mail named yet is the stall: queue that mail
+        instead of the pointer. Defensive: watch_pr queues it in the same save as the snapshot, so this is
+        reached only when `ci_mailed` was lost while the snapshot survived (hand-edited state). Only a
+        finished `ci_result`: the time-based no-checks mail comes from a fresh watch_pr snapshot alone, never
+        from a saved one that gh failures left stale (#94 r3). True when the mail was queued (its flush may
+        still be retried)."""
+        pr = self.relay.state.get("pr")
+        return bool(pr) and ci_result(pr) is not None and self.relay.ci_mail(pr)
+
     def implementer_line(self, texts: dict[str, Any]) -> str | None:
         for peer in self.relay.peers:
             if peer.box == "codex" and isinstance(texts.get(peer.box), str):
@@ -694,6 +777,8 @@ class StallWatch:
                 f"composer, {mail}, no running helper, no PR open for review or CI",
                 "running, no usage-limit episode, and the loop neither done nor waiting on the human.", ""]
         notes = [f"unread mail {entry} is held for the implementer at its usage limit" for entry in held] + quiet
+        if self.ci_stuck:
+            notes.append(f"{self.ci_stuck} - look at the checks; a runner or an external CI may be down")
         body += [f"- {line}" for line in notes] + ([""] if notes else [])
         words = self.implementer_line(texts)
         if words:
@@ -701,6 +786,9 @@ class StallWatch:
         limited = self.implementer_limit(texts)
         if limited:
             body += [f"The implementer's pane shows a usage-limit error: {limited[1].line}", ""]
+        ci = ci_result(self.relay.state.get("pr"))
+        if ci:
+            body += [f"CI on the PR head: {ci['summary']}", ""]
         body += ["Next step: check your mail waiter - it may have been killed under memory pressure; rearm it",
                  "if it is not running - and any finished helper (mail from `helper`,",
                  "`.workbench/state/helpers/*.done`, `.workbench/review/`). Then continue the loop, or, if it",
@@ -723,7 +811,7 @@ class StallWatch:
     def escalate(self, idle: float, quiet: list[str]) -> None:
         import agw
         summary = (f"stalled: loop idle for {idle / 60:.0f} min, no progress since the relay's stall pointer"
-                   + (f"; {quiet[0]}" if quiet else ""))
+                   + (f"; {self.ci_stuck}" if self.ci_stuck else "") + (f"; {quiet[0]}" if quiet else ""))
         if self.relay.dry_run:
             self.relay.log(f"[dry-run] would report the loop blocked: {summary}")
             return
@@ -789,7 +877,7 @@ class Relay:
         changed = self.state.get('branch') != self.branch
         if saved_branch != self.branch or (saved_pr and saved_pr.get('headRefName') != self.branch):
             branch_keys = ('pr', 'terminal_mail', 'ignored_prs', 'seen_open', 'completed_prs',
-                           'watch_since', 'outbox', 'event_sequence')
+                           'watch_since', 'outbox', 'event_sequence', 'ci_mailed')
             if saved_branch is not None or any(self.state.get(key) for key in branch_keys):
                 stale_branch = saved_pr.get('headRefName') if saved_pr else saved_branch
                 self.log(f"discarding saved PR state for branch {stale_branch} "
@@ -800,6 +888,8 @@ class Relay:
             changed = True
         self.state['branch'] = self.branch
         self._dry_watch_since = None
+        self._dry_ci_key = None
+        self.no_checks: tuple[tuple, float] | None = None   # (PR, head) seen with an empty rollup, since (#94 r2)
         if saved_pr and saved_pr.get('state') == 'OPEN' and 'seen_open' not in self.state:
             self.state['seen_open'] = [saved_pr['number']]
             changed = True
@@ -1622,6 +1712,7 @@ class Relay:
         self.state['completed_prs'] = sorted({*self.state.get('completed_prs', []), number})
         self.state.pop('pr', None)
         self.state.pop('terminal_mail', None)
+        self.state.pop('ci_mailed', None)
         if self.state.get('close_pending') == number:
             self.state.pop('limits', None)  # a merged PR ends the loop
         self.log(f'retired finished PR #{number}; the relay can watch the next PR if this one was unmerged')
@@ -1761,6 +1852,66 @@ class Relay:
             return False
         return True
 
+    def ci_mail(self, snapshot: dict[str, Any], outbox: list[dict[str, Any]] | None = None) -> bool:
+        """#94: mail the planner once per finished CI run on the PR's head (`ci_result`'s key), or once for
+        a head with no check past the grace (`no_checks_result`'s key), so a planner whose wait-ci was
+        killed is still woken. Queued on `outbox` when given (watch_pr saves
+        it with the snapshot); otherwise appended to the saved outbox and flushed. The id is fixed, so a
+        retried or replayed write never duplicates it. True when the mail was queued."""
+        result = ci_result(snapshot) or self.no_checks_result(snapshot)
+        if result is None or result["key"] == self.state.get("ci_mailed"):
+            return False
+        if self.dry_run:
+            if result["key"] != self._dry_ci_key:
+                self._dry_ci_key = result["key"]
+                self.log(f"[dry-run] would mail the planner: {result['summary']}")
+            return False
+        number = snapshot["number"]
+        body = [f"CI finished on PR #{number} ({snapshot.get('url') or '?'}), head {result['head']}:"]
+        if result.get("no_checks"):
+            body += [f"no check reported for this head in {NO_CI_GRACE_MINUTES:g} minutes (wait-ci's no-CI grace).", ""]
+        else:
+            body += [f"{result['passed']} passed, {len(result['failed'])} failed, {result['skipped']} skipped.", ""]
+        if result["failed_links"]:
+            body += ["Failed:"] + [f"- {name}" + (f": {link}" if link else "")
+                                   for name, link in result["failed_links"]] + [""]
+        body += ["The counts take every check; merge-check decides which are required - do not act on the",
+                 "count.", "",
+                 f"Under auto-merge: if {result['head']} is the head you tested, stop any wait-ci still running",
+                 f"for it and run `wb.py merge-check --pr {number} --head {result['head']}`, as on wait-ci's exit 0.",
+                 "A `ci` mail for another head is ignored.",
+                 "Without auto-merge: only mention a red result in chat."]
+        message = dict(to="claude", sender="relay", subject=result["summary"], body="\n".join(body), kind="ci",
+                       message_id=f"relay-ci-pr{number}-{result['key'][:8]}")
+        self.state["ci_mailed"] = result["key"]
+        self.log(f"CI mail to the planner: {result['summary']}")
+        if outbox is not None:
+            outbox.append(message)
+            return True
+        self.state["outbox"] = [*self.state.get("outbox", []), message]
+        self._save()
+        self.flush_outbox()
+        return True
+
+    def no_checks_result(self, snapshot: dict[str, Any]) -> dict[str, Any] | None:
+        """#94 r2: an OPEN PR's head whose rollup stayed empty for NO_CI_GRACE_MINUTES - a repo without CI, or
+        a head no workflow runs for - is done, as wait-ci's no-CI grace says. The clock starts at this
+        relay's first sight of that head with no check, so a restart only delays it."""
+        items = [item for item in (snapshot or {}).get("statusCheckRollup") or [] if isinstance(item, dict)]
+        if not snapshot or snapshot.get("state") != "OPEN" or not snapshot.get("headRefOid") or items:
+            self.no_checks = None
+            return None
+        head = str(snapshot["headRefOid"])
+        current = (snapshot.get("number"), head)
+        if self.no_checks is None or self.no_checks[0] != current:
+            self.no_checks = (current, now())
+        if now() - self.no_checks[1] < NO_CI_GRACE_MINUTES * 60:
+            return None
+        key = hashlib.sha256(json.dumps([snapshot.get("number"), head, "no-checks"]).encode("utf-8")).hexdigest()
+        return {"head": head, "key": key, "passed": 0, "failed": [], "failed_links": [], "skipped": 0,
+                "no_checks": True,
+                "summary": f"CI finished on {head[:7]}: no checks reported in {NO_CI_GRACE_MINUTES:g} min"}
+
     def watch_pr(self) -> bool:
         """Returns True when the PR is terminal; its filed notices must still be delivered."""
         if not self.flush_outbox():
@@ -1808,6 +1959,8 @@ class Relay:
                     terminal_mail.append([box, mid])
             if not self.dry_run:
                 self.log(f"github: {event['subject']}")
+        if snapshot.get('state') == 'OPEN':
+            self.ci_mail(snapshot, outbox)
         if not self.dry_run:
             seen_open.add(snapshot['number'])
             if snapshot.get('state') == 'OPEN':
@@ -1822,7 +1975,7 @@ class Relay:
                 self.state['completed_prs'] = sorted(completed)
             self.state.pop('event_sequence', None)  # Migrate the obsolete counter.
             if outbox:
-                self.state['outbox'] = outbox
+                self.state['outbox'] = [*self.state.get('outbox', []), *outbox]
             self._save()
             self.flush_outbox()
         return terminal

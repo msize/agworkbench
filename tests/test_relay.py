@@ -136,6 +136,69 @@ class Pointer(unittest.TestCase):
         self.assertNotIn(chr(10), relay.pointer_text(message, Path("a"), Path("b")))
 
 
+HEAD_A, HEAD_B = 'a' * 40, 'b' * 40
+
+
+def check(name, status='COMPLETED', conclusion='SUCCESS', at='2026-10-01T10:00:00Z'):
+    done = status == 'COMPLETED'
+    return {'__typename': 'CheckRun', 'name': name, 'status': status, 'conclusion': conclusion if done else None,
+            'completedAt': at if done else None, 'detailsUrl': f'https://ci/{name}/{at}'}
+
+
+def with_ci(head, *checks, **changes):
+    return with_(OPEN, headRefOid=head, statusCheckRollup=list(checks), **changes)
+
+
+class CiResult(unittest.TestCase):
+    """#94: the finished CI on the PR head, from the rollup every poll already reads."""
+
+    def test_nothing_while_ci_is_not_finished_or_the_pr_not_open(self):
+        for snapshot in (with_ci(HEAD_A), with_(OPEN, headRefOid=HEAD_A), with_ci(None, check('a')),
+                         with_ci(HEAD_A, check('a'), check('b', status='IN_PROGRESS')),
+                         with_ci(HEAD_A, check('a'), check('b', status='QUEUED')),
+                         with_ci(HEAD_A, check('a'), {'__typename': 'StatusContext', 'context': 'x', 'state': 'PENDING'}),
+                         with_ci(HEAD_A, check('a'), {'__typename': 'StatusContext', 'context': 'x', 'state': 'EXPECTED'}),
+                         with_ci(HEAD_A, check('a'), state='MERGED'), with_ci(HEAD_A, check('a'), state='CLOSED'),
+                         None):
+            with self.subTest(snapshot=snapshot):
+                self.assertIsNone(relay.ci_result(snapshot))
+
+    def test_counts_and_names(self):
+        snapshot = with_ci(HEAD_A, check('unit'), check('lint', conclusion='FAILURE'),
+                           check('docs', conclusion='SKIPPED'), check('opt', conclusion='NEUTRAL'),
+                           check('slow', conclusion='TIMED_OUT'), check('gone', conclusion=None),
+                           {'__typename': 'StatusContext', 'context': 'ext/ok', 'state': 'SUCCESS'},
+                           {'__typename': 'StatusContext', 'context': 'ext/err', 'state': 'ERROR',
+                            'targetUrl': 'https://ext/err'},
+                           'not a check')
+        result = relay.ci_result(snapshot)
+        self.assertEqual(HEAD_A, result['head'])
+        self.assertEqual((2, 2), (result['passed'], result['skipped']))
+        self.assertEqual(['lint', 'slow', 'gone', 'ext/err'], result['failed'])
+        self.assertIn(('ext/err', 'https://ext/err'), result['failed_links'])
+        self.assertEqual('CI finished on aaaaaaa: 2 passed, 4 failed (lint, slow, gone, ext/err), 2 skipped',
+                         result['summary'])
+        self.assertEqual('CI finished on aaaaaaa: 1 passed, 0 failed',
+                         relay.ci_result(with_ci(HEAD_A, check('unit')))['summary'])
+
+    def test_a_check_without_typename_falls_back_like_ci_pending(self):
+        result = relay.ci_result(with_ci(HEAD_A, {'name': 'a', 'status': 'COMPLETED', 'conclusion': 'SUCCESS'},
+                                         {'context': 'b', 'state': 'FAILURE'}))
+        self.assertEqual((1, ['b']), (result['passed'], result['failed']))
+
+    def test_the_key_names_one_finished_run_of_one_prs_head(self):
+        key = lambda snapshot: relay.ci_result(snapshot)['key']
+        base = with_ci(HEAD_A, check('a'), check('b'))
+        self.assertEqual(key(base), key(with_ci(HEAD_A, check('b'), check('a'))), 'order is not a new run')
+        self.assertEqual(key(base), key(copy.deepcopy(base)))
+        for other in (with_ci(HEAD_B, check('a'), check('b')),
+                      with_ci(HEAD_A, check('a'), check('b', at='2026-10-01T11:00:00Z')),
+                      with_ci(HEAD_A, check('a'), check('b'), check('c')),
+                      with_ci(HEAD_A, check('a'), check('b'), number=8)):
+            with self.subTest(other=other):
+                self.assertNotEqual(key(base), key(other))
+
+
 class PaneIds(unittest.TestCase):
     GOOD = "461a2dd0-4f22-49c3-a724-90e3b2cde3db"
 
@@ -1597,6 +1660,146 @@ class GithubLookup(DeliveryFixture):
         self.assertEqual(3, self.send.call_count)
         self.assertEqual([53], self.r.state['completed_prs'])
         self.assertEqual([], self.r.state['reset_pending'])
+
+
+class CiMail(DeliveryFixture):
+    """#94: the relay mails the planner when CI on the PR head finishes, once per finished run."""
+
+    def setUp(self):
+        super().setUp()
+        self.r.state['pr'] = copy.deepcopy(OPEN)
+        self.r.state['seen_open'] = [7]
+        self.r.hub.write_message = Mock(return_value=Path('ci.md'))
+
+    def poll(self, snapshot):
+        self.r.fetch_pr = Mock(return_value=relay.PrFetch(copy.deepcopy(snapshot)))
+        self.assertEqual(snapshot['state'] != 'OPEN', self.r.watch_pr())
+
+    def ci_mails(self):
+        return [c.kwargs for c in self.r.hub.write_message.call_args_list if c.kwargs['kind'] == 'ci']
+
+    def test_once_per_head_when_its_checks_finish(self):
+        self.poll(with_ci(HEAD_A, check('unit'), check('build', status='IN_PROGRESS')))
+        self.assertEqual([], self.ci_mails())
+        failing = with_ci(HEAD_A, check('unit'), check('build', conclusion='FAILURE'))
+        self.poll(failing)
+        self.poll(failing)
+        mails = self.ci_mails()
+        self.assertEqual(1, len(mails))
+        mail = mails[0]
+        self.assertEqual(('claude', 'relay'), (mail['to'], mail['sender']))
+        self.assertEqual('CI finished on aaaaaaa: 1 passed, 1 failed (build)', mail['subject'])
+        key = relay.ci_result(failing)['key']
+        self.assertEqual(f'relay-ci-pr7-{key[:8]}', mail['message_id'])
+        self.assertEqual(key, self.r.state['ci_mailed'])
+        for text in (HEAD_A, OPEN['url'], '- build: https://ci/build/2026-10-01T10:00:00Z',
+                     f'wb.py merge-check --pr 7 --head {HEAD_A}', 'merge-check decides which are required',
+                     f'Under auto-merge: if {HEAD_A} is the head you tested',
+                     'Without auto-merge: only mention a red result in chat.'):
+            self.assertIn(text, mail['body'])
+        # The next step is gated on auto-merge: no unconditional "run merge-check" (#94 r2).
+        self.assertNotIn('run merge-check', mail['body'])
+        self.poll(with_ci(HEAD_B, check('unit', status='QUEUED')))
+        self.assertEqual(1, len(self.ci_mails()))
+        self.poll(with_ci(HEAD_B, check('unit')))
+        self.poll(with_ci(HEAD_B, check('unit')))
+        self.assertEqual(['CI finished on aaaaaaa: 1 passed, 1 failed (build)', 'CI finished on bbbbbbb: 1 passed, 0 failed'],
+                         [m['subject'] for m in self.ci_mails()])
+
+    def test_a_head_with_no_checks_gets_one_mail_after_the_grace(self):
+        # #94 r2: as wait-ci's no-CI grace - a repo without CI, or a head no workflow runs for.
+        self.assertEqual(5, relay.NO_CI_GRACE_MINUTES)
+        for instant in (0, 120, 299):
+            self.t = instant
+            self.poll(with_ci(HEAD_A))
+        self.assertEqual([], self.ci_mails())
+        self.t = 300
+        self.poll(with_ci(HEAD_A))
+        mails = self.ci_mails()
+        self.assertEqual(['CI finished on aaaaaaa: no checks reported in 5 min'], [m['subject'] for m in mails])
+        self.assertIn('no check reported for this head in 5 minutes', mails[0]['body'])
+        self.assertIn(f'Under auto-merge: if {HEAD_A} is the head you tested', mails[0]['body'])
+        self.t = 400
+        self.poll(with_ci(HEAD_A))
+        self.assertEqual(1, len(self.ci_mails()))
+        # A check that shows up later and finishes is a new result.
+        self.poll(with_ci(HEAD_A, check('late', status='QUEUED')))
+        self.poll(with_ci(HEAD_A, check('late')))
+        self.assertEqual('CI finished on aaaaaaa: 1 passed, 0 failed', self.ci_mails()[-1]['subject'])
+        self.assertEqual(2, len(self.ci_mails()))
+
+    def test_a_new_head_restarts_the_no_checks_grace(self):
+        self.poll(with_ci(HEAD_A))
+        self.t = 200
+        self.poll(with_ci(HEAD_B))
+        self.t = 400
+        self.poll(with_ci(HEAD_B))
+        self.assertEqual([], self.ci_mails())
+        self.t = 500
+        self.poll(with_ci(HEAD_B))
+        self.assertEqual(['CI finished on bbbbbbb: no checks reported in 5 min'], [m['subject'] for m in self.ci_mails()])
+
+    def test_a_rerun_on_the_same_head_mails_again(self):
+        self.poll(with_ci(HEAD_A, check('unit', conclusion='FAILURE')))
+        self.poll(with_ci(HEAD_A, check('unit', status='IN_PROGRESS')))
+        self.poll(with_ci(HEAD_A, check('unit', at='2026-10-01T11:00:00Z')))
+        self.assertEqual(['CI finished on aaaaaaa: 0 passed, 1 failed (unit)', 'CI finished on aaaaaaa: 1 passed, 0 failed'],
+                         [m['subject'] for m in self.ci_mails()])
+
+    def test_a_check_that_registers_late_mails_again_once_it_finishes(self):
+        self.poll(with_ci(HEAD_A, check('a')))
+        self.poll(with_ci(HEAD_A, check('a'), check('b', status='QUEUED')))
+        self.assertEqual(1, len(self.ci_mails()))
+        self.poll(with_ci(HEAD_A, check('a'), check('b')))
+        self.poll(with_ci(HEAD_A, check('a'), check('b')))
+        self.assertEqual(2, len(self.ci_mails()))
+
+    def test_a_pr_recreated_on_the_same_head_gets_its_own_mail(self):
+        # The `previous` switch in watch_pr does not retire the old PR: the key carries the number.
+        self.assertTrue(self.r.ci_mail(with_ci(HEAD_A, check('a'), number=9), []))
+        self.assertTrue(self.r.ci_mail(with_ci(HEAD_A, check('a'), number=10), []))
+        self.assertFalse(self.r.ci_mail(with_ci(HEAD_A, check('a'), number=10), []))
+
+    def test_retire_drops_the_record(self):
+        self.poll(with_ci(HEAD_A, check('a')))
+        self.assertIn('ci_mailed', self.r.state)
+        self.r.retire(7)
+        self.assertNotIn('ci_mailed', self.r.state)
+
+    def test_no_mail_once_the_pr_is_finished(self):
+        self.poll(with_ci(HEAD_A, check('a'), state='MERGED', mergedAt='now'))
+        self.assertEqual([], self.ci_mails())
+
+    def test_a_restarted_relay_does_not_repeat_it(self):
+        self.use_disk_state()
+        finished = with_ci(HEAD_A, check('a'))
+        self.poll(finished)
+        self.assertEqual(1, len(self.ci_mails()))
+        self.restart_from_disk()
+        self.r.hub.write_message.reset_mock()
+        self.poll(finished)
+        self.assertEqual([], self.ci_mails())
+
+    def test_a_failed_write_is_retried_under_the_same_id(self):
+        self.r.hub.write_message.side_effect = [OSError('disk full'), Path('ci.md')]
+        finished = with_ci(HEAD_A, check('a'))
+        self.poll(finished)
+        self.assertEqual(1, len(self.r.state['outbox']))
+        self.poll(finished)
+        self.poll(finished)
+        ids = [m['message_id'] for m in self.ci_mails()]
+        self.assertEqual(2, len(ids))
+        self.assertEqual(1, len(set(ids)))
+        self.assertNotIn('outbox', self.r.state)
+
+    def test_dry_run_logs_once_per_run_and_records_nothing(self):
+        self.r.dry_run = True
+        self.poll(with_ci(HEAD_A, check('a')))
+        self.poll(with_ci(HEAD_A, check('a')))
+        self.poll(with_ci(HEAD_A, check('a', at='2026-10-01T11:00:00Z')))
+        self.assertEqual(2, sum('[dry-run] would mail the planner: CI finished' in line for line in self.logs))
+        self.assertEqual([], self.ci_mails())
+        self.assertNotIn('ci_mailed', self.r.state)
 
 
 class BranchState(DeliveryFixture):
