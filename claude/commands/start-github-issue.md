@@ -201,13 +201,33 @@ and the episode ended, run `wait-limit` again.
 - **Box `claude`** (you): this mail is only a record; the human was already notified. Carry on
   when you can act again.
 
+## CI results (the relay's `ci` mail, #94)
+
+On every PR poll the relay checks CI on the PR head. Once every check there has finished, it mails you
+one message from `relay`, kind `ci`, with the subject `CI finished on <sha7>: N passed, M failed
+(names)`. The body has the full head SHA and a link for each failed check. It mails again when the
+finished checks change: a rerun on the same head, a check that registered late, or a new head. It
+mails whether or not auto-merge is on. This is the same signal as wait-ci's exit 0, so `wait-ci` is
+optional: the relay keeps watching after a background wait-ci is killed under memory pressure.
+
+- Read every `ci` mail, even when there is nothing to do with it: unread mail of yours holds up the
+  autonomous close.
+- Do not act on its counts: they include optional checks, and merge-check decides which checks are
+  required.
+- Under auto-merge, when the full SHA in the body is the head you tested: stop any wait-ci still
+  running for that head (do not wait for both), and run merge-check as on wait-ci's exit 0. A `ci`
+  mail for another head is ignored.
+- Without auto-merge: mention a red result in chat. Nothing else changes.
+
 ## Stall pointers (the relay's `stall:` mail)
 
 The relay also watches for a loop that sits idle with nothing to wake it: both panes idle with an
 empty composer, no unread mail (mail held for a Kimi implementer at its usage limit does not count),
 no running helper, no PR open for review, no CI still running on an
 auto-merge PR, no usage-limit episode, and nothing recording that you wait on the human. After `stallMinutes` (default 15) it mails you once from `relay`, kind
-`stall`, subject `stall: loop idle for N min ...`. Usually your mail waiter was killed under memory
+`stall`, subject `stall: loop idle for N min ...`. If CI on the open PR's head finished and no `ci`
+mail named it yet, it sends that `ci` mail instead. If one did, the pointer adds a line
+`CI on the PR head: <summary>`. Usually your mail waiter was killed under memory
 pressure, a helper's result went unnoticed, or the implementer is waiting on a question to the human.
 The mail quotes the implementer's last line when it has one.
 
@@ -570,8 +590,8 @@ on, you merge only when **all** of these hold:
 
    | merge-check line | what you do |
    |---|---|
-   | `ci-pending:` | Any check still running, required or optional (merge-check reports nothing else about CI until all are done). Start `python "$AGWORKBENCH/lib/wb.py" wait-ci --pr <N> --head <full sha>` in the background (it is not a mail waiter; keep your one mail waiter too) and end your turn. When it ends: exit 0 (`CI DONE`) - run merge-check again; exit 4 (head changed / PR not open) - stop and look; exit 3 (timeout) - the human's. A wait-ci that was **killed** (low memory) means "rerun merge-check", never "CI done". |
-   | `ci-failed:` | Reported only once nothing is running. A GitHub Actions check: `wb.py ci-rerun --pr <N>` (once; counted only when a rerun started). Exit 0: wait-ci, then merge-check. Exit 2 is operational: retry ci-rerun, or, when it says `rerun started`, run wait-ci. Still `ci-failed:`, or ci-rerun exits 1 (external CI, or the rerun is used): `wb.py merge-round --pr <N> --kind ci-fix`, then `wb.py ci-log --pr <N>` (exit 2: no job log could be fetched yet - retry it) and a `FIX r<K>` round whose evidence is the log file it wrote; after the fix, the whole suite, push, wait-ci, merge-check. Still red, or merge-round refuses: the human's. |
+   | `ci-pending:` | Any check still running, required or optional (merge-check reports nothing else about CI until all are done). End your turn: the relay's `ci` mail for this head (see "CI results") wakes you when CI finishes, and you run merge-check again. You may also start `python "$AGWORKBENCH/lib/wb.py" wait-ci --pr <N> --head <full sha>` in the background (it is not a mail waiter; keep your one mail waiter too); whichever comes first counts, so stop the other. When wait-ci ends: exit 0 (`CI DONE`) - run merge-check again; exit 4 (head changed / PR not open) - stop and look; exit 3 (timeout) - the human's. A wait-ci that was **killed** (low memory) means "rerun merge-check", never "CI done". |
+   | `ci-failed:` | Reported only once nothing is running. A GitHub Actions check: `wb.py ci-rerun --pr <N>` (once; counted only when a rerun started). Exit 0: wait for the relay's next `ci` mail (or wait-ci), then merge-check. Exit 2 is operational: retry ci-rerun, or, when it says `rerun started`, wait as after exit 0. Still `ci-failed:`, or ci-rerun exits 1 (external CI, or the rerun is used): `wb.py merge-round --pr <N> --kind ci-fix`, then `wb.py ci-log --pr <N>` (exit 2: no job log could be fetched yet - retry it) and a `FIX r<K>` round whose evidence is the log file it wrote; after the fix, the whole suite, push, wait-ci, merge-check. Still red, or merge-round refuses: the human's. |
    | `behind:` / `conflict:` | An UPDATE round, below. |
    | `ci-optional-failed:`, `head:`, `state:`, `mergeable:`, and every other line | Final for this head: the human's. |
 

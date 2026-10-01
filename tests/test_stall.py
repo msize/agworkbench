@@ -722,6 +722,22 @@ class StallProse(unittest.TestCase):
         self.assertIn('run `wb.py status active` when you resume', rules)
         self.assertIn('`wb.py suite --label <sha7> -- <command>`', text.split('## Phase 6')[1].split('## Phase 7')[0])
 
+    def test_the_planner_knows_the_relays_ci_mail(self):
+        # #94: the relay's `ci` mail stands in for a killed wait-ci.
+        text = self.text('claude/commands/start-github-issue.md')
+        section = text.split('## CI results')[1].split('## Stall pointers')[0]
+        for needle in ('from `relay`, kind `ci`', 'same signal as wait-ci\'s exit 0', '`wait-ci` is optional',
+                       'Read every `ci` mail', 'merge-check decides which checks are required',
+                       'stop any wait-ci still running for that head', 'mail for another head is ignored',
+                       'Without auto-merge: mention a red result in chat'):
+            self.assertIn(needle, section)
+        self.assertIn("the relay's `ci` mail for this head", text.split('| `ci-pending:` |')[1].split('|')[0])
+        self.assertIn('`CI on the PR head: <summary>`', text.split('## Stall pointers')[1])
+        readme = self.text('README.md')
+        for needle in ("**The relay's CI mail (#94).**", 'once per finished run, not once per head',
+                       'A check that registers late', '`CI on the PR head: ...`'):
+            self.assertIn(needle, readme)
+
     def test_implementers_never_hide_a_suite_in_a_background_watcher(self):
         self.assertIn('wb.py" suite --label <sha7> -- <command>`', self.text('claude/commands/workbench-implementer.md'))
         for path in ('claude/commands/workbench-implementer.md', 'codex/skills/workbench-implementer/SKILL.md',

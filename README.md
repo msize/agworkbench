@@ -864,10 +864,21 @@ a clean-reviewed PR cannot merge yet itself. merge-check names each one:
 
 | line | what happens |
 |---|---|
-| `ci-pending:` | Checks are still running, required or optional (a check that never started counts too); a failure is reported only once nothing runs. `wb.py wait-ci` waits in the background, and the check runs again when CI is done. It never counts a head without any check yet as done: a repo with no CI at all is "done" only after 5 minutes of no checks. |
+| `ci-pending:` | Checks are still running, required or optional (a check that never started counts too); a failure is reported only once nothing runs. The relay mails the planner when CI on the head finishes (a `ci` mail, below), and the check runs again. `wb.py wait-ci` can also wait in the background, but it is optional. It never counts a head without any check yet as done: a repo with no CI at all is "done" only after 5 minutes of no checks. |
 | `ci-failed:` | A required check failed. A GitHub Actions run is rerun once (`wb.py ci-rerun`). If it is still red, one fix round follows, with the failed jobs' log (`wb.py ci-log`) as evidence. If it is still red after that, it's yours. |
 | `behind:` / `conflict:` | An **UPDATE round**. The planner fetches, and the implementer merges exactly that base commit into the branch with `git merge --no-ff`: never a rebase, never a force-push, and nothing else in the merge. It runs the whole suite. `wb.py update-check` then proves the result is one merge commit of that base onto the reviewed head, with a clean tree. If `git show --remerge-diff` is empty, the merge is clean. If not, the resolution is reviewed like a fix, and update-check calls the conflict **small** or **counted** (#90). |
 | `ci-optional-failed:` and everything else | Final: the PR waits for you. |
+
+**The relay's CI mail (#94).** A background `wait-ci` dies when Claude Code kills shells under memory
+pressure, and then nothing woke the planner when CI finished. So the relay watches CI on each PR poll,
+from the check rollup it already reads. Once every check on the PR head has finished, it mails the
+planner, from `relay` with kind `ci`: `CI finished on <sha7>: N passed, M failed (names)`. The body has
+the full head SHA and each failed check's link. The mail goes out with or without auto-merge. Its
+counts take every check, so the planner still runs merge-check, which decides which checks are required.
+It is sent once per finished run, not once per head. A rerun on the same head (`wb.py ci-rerun`) needs a
+second result. A check that registers late, after the others finished, also changes the result, so
+"once per head" would stay silent then. The mail's fixed id and the saved run key mean a relay restart
+never repeats it.
 
 Only the required checks count when branch protection names any; otherwise every check that ran
 counts. The limits are kept in code (`wb.py merge-round`, per PR): 3 clean catch-ups, 3 counted
@@ -918,7 +929,9 @@ CI), or during a usage-limit episode. A helper without its completion marker cou
 changes. After two periods of silence it no longer does, and the pointer names it. Your revdiff always counts.
 
 - After `stallMinutes` (default 15) the relay mails the planner one pointer (from `relay`, kind
-  `stall`). The pointer quotes the implementer's last line.
+  `stall`). The pointer quotes the implementer's last line. If CI on the open PR's head finished and
+  no `ci` mail named it, the relay sends that `ci` mail instead (#94). Otherwise the pointer names the
+  CI result in a line `CI on the PR head: ...`.
 - After two more periods with no progress, and both panes idle for a whole period, it reports the
   loop blocked: a blocked sound status and a notification, waiting.json, and `loop-state blocked` with
   a reason starting `stalled:` in queue mode.
