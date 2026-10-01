@@ -2104,10 +2104,7 @@ def kimi_frame(name):
     return (Path(__file__).resolve().parent / 'fixtures' / 'kimi' / f'{name}.txt').read_text(encoding='utf-8')
 
 
-class WaitOnLimit(UsageLimitFixture):
-    """#77: a checkout launched with -WaitOnLimit waits a usage limit out: no failover, nobody paged, a
-    probe pointer every limitRetryMinutes until the limit has reset."""
-
+class WaitOnLimitFixture(UsageLimitFixture):
     def setUp(self):
         super().setUp()
         self.use_disk_state()
@@ -2137,6 +2134,11 @@ class WaitOnLimit(UsageLimitFixture):
 
     def paged(self):
         return [c for c in self.status.call_args_list if c.args[:1] == ('blocked',)] + self.notify.call_args_list
+
+
+class WaitOnLimit(WaitOnLimitFixture):
+    """#77: a checkout launched with -WaitOnLimit waits a usage limit out: no failover, nobody paged, a
+    probe pointer every limitRetryMinutes until the limit has reset."""
 
     def test_the_limit_is_announced_as_a_wait_that_asks_for_nothing_and_pages_nobody(self):
         self.check(times=2)
@@ -2310,6 +2312,180 @@ class WaitOnLimit(UsageLimitFixture):
         self.clock = self.episode()['retryAt']
         self.check(times=3)
         self.assertEqual([], self.probes_typed())
+
+
+class ForcedWait(WaitOnLimitFixture):
+    """#88: a limit the classifier cannot place - seen by the stall watch, or reported by the planner -
+    is waited out like any other: a forced episode that only a probe can end."""
+
+    # classify() leaves this frame alone (the error rows follow a `cat`); kimi_turn_limit() finds it.
+    UNPLACED = 'kimi-tool-output-last'
+
+    def force(self, name=UNPLACED, source='stall'):
+        text = limit_frame(name)
+        self.pane.return_value = text
+        if name == self.UNPLACED:
+            self.assertIsNone(relay.limits.classify(text, 'kimi'))
+        self.assertTrue(self.r.force_wait(self.peer, relay.limits.kimi_turn_limit(text), text, source))
+
+    def request(self, **record):
+        path = self.r.hub_dir / 'state' / 'limit-request.json'
+        path.write_text(json.dumps({'box': 'codex', 'reason': 'kimi: 5-hour usage limit', 'at': self.clock, **record}),
+                        encoding='utf-8')
+        return path
+
+    def test_a_forced_episode_is_announced_as_a_wait_at_once(self):
+        self.force()
+        episode = self.episode()
+        self.assertEqual(('stall', True, True, 0, None), (episode['forced'], episode['wait'], episode['announced'],
+                                                          episode['probes'], episode['probeAt']))
+        self.assertEqual(self.clock + 30 * 60, episode['retryAt'])
+        self.assertEqual(['usage limit: codex (kimi) waiting'], [m['subject'] for m in self.mails()])
+        self.assertEqual([], self.paged())
+        self.assertTrue(json.loads(self.r.state_file.read_text(encoding='utf-8'))['limits']['codex']['wait'])
+        self.assertFalse(self.r.force_wait(self.peer, relay.limits.Limit('limited', 'again'), '', 'planner'))
+        self.assertEqual(1, len(self.mails()))
+
+    def test_classify_misses_do_not_end_it_and_the_probe_comes_at_retry_at(self):
+        self.force()
+        self.check(times=5)
+        self.assertEqual(0, self.episode()['misses'])
+        self.until_retry()
+        self.assertEqual(1, len(self.probes_typed()))
+        self.check(self.UNPLACED)                     # the probe was answered by the limit again
+        self.assertEqual((1, None), (self.episode()['probes'], self.episode()['probeAt']))
+        self.until_retry()
+        self.assertEqual(2, len(self.probes_typed()))
+        self.check('\n' + kimi_frame('running-thinking'), times=3)      # working on the probe: not misses
+        self.assertIsNotNone(self.episode())
+        self.check('\n' + kimi_frame('idle-after-turn'), times=2)
+        self.assertIsNone(self.episode())
+        self.assertIn('usage limit episode ended for codex: the limit reset (probe 2)', self.logs)
+
+    def test_a_baseline_row_never_suppresses_a_forced_episode(self):
+        self.r.limit_baseline = {}                    # this relay has just started, the row already on screen
+        self.check('kimi-limited-5hour-tool', times=3)
+        self.assertEqual(1, len(self.r.limit_baseline['codex']))
+        self.assertIsNone(self.episode())
+        self.force('kimi-limited-5hour-tool')
+        self.check(times=4)
+        self.assertEqual(0, self.episode()['misses'])
+        self.assertGreater(self.episode()['hits'], relay.LIMIT_READS)
+
+    def test_a_baseline_row_counts_for_a_forced_episode_on_a_classify_only_tool(self):
+        # FIX r4 m1: no kimi_turn_limit fallback here, so only the baseline exemption keeps the row a hit.
+        self.peer = relay.Peer('codex', 'codex', 'codex-pane')
+        self.r.peers = [self.peer]
+        self.r.limit_baseline = {}                    # this relay has just started, the row already on screen
+        self.check('codex-limited-live', times=3)
+        self.assertEqual(1, len(self.r.limit_baseline['codex']))
+        self.assertIsNone(self.episode())
+        self.assertTrue(self.r.force_wait(self.peer, relay.limits.Limit('limited', 'codex: usage limit'),
+                                          limit_frame('codex-limited-live'), 'planner'))
+        self.until_retry()
+        self.assertEqual(1, len(self.probes_typed()))
+        self.check(times=3)                           # the probe was answered by the same limit row
+        episode = self.episode()
+        self.assertIsNotNone(episode)
+        self.assertEqual((1, None, 0), (episode['probes'], episode['probeAt'], episode['misses']))
+
+    def test_the_planners_request_starts_a_forced_wait_for_a_frame_nobody_can_read(self):
+        path = self.request()
+        self.check('\n' + kimi_frame('idle-after-turn'))
+        self.assertFalse(path.exists())
+        episode = self.episode()
+        self.assertEqual(('planner', 'kimi: 5-hour usage limit', True), (episode['forced'], episode['line'], episode['wait']))
+        self.assertEqual(['usage limit: codex (kimi) waiting'], [m['subject'] for m in self.mails()])
+        self.check(times=5)
+        self.assertIsNotNone(self.episode())          # no limit on screen: misses wait for the first probe
+        self.until_retry()
+        self.assertEqual(1, len(self.probes_typed()))
+        self.check(times=2)
+        self.assertIsNone(self.episode())
+
+    def test_a_planner_request_for_another_tool_is_honoured_too(self):
+        self.peer = relay.Peer('codex', 'codex', 'codex-pane')
+        self.r.peers = [self.peer]
+        self.request(reason='codex: usage limit')
+        self.check('\n' + kimi_frame('idle-after-turn'), times=3)
+        self.assertEqual(('planner', 'codex'), (self.episode()['forced'], self.episode()['tool']))
+
+    def test_a_planner_request_outside_wait_mode_or_for_no_pane_is_dropped(self):
+        self.on_limit('failover')
+        path = self.request()
+        self.check('\n' + kimi_frame('idle-after-turn'))
+        self.assertFalse(path.exists())
+        self.assertIsNone(self.episode())
+        self.assertTrue(any('limit request' in line and 'onLimit' in line for line in self.logs), self.logs)
+        self.on_limit('wait')
+        path = self.request(box='nobody')
+        self.check()
+        self.assertFalse(path.exists())
+        self.assertIsNone(self.episode())
+        path.write_text('{not json', encoding='utf-8')
+        self.check()
+        self.assertFalse(path.exists())
+
+
+class LimitWindow(WaitOnLimitFixture):
+    """#88: Kimi's 5-hour window gives no reset time; the relay probes at window start + 5 h + 60 s, when
+    that comes before the next regular probe."""
+
+    def setUp(self):
+        super().setUp()
+        self.clock = 100_000.0
+
+    def windows(self):
+        return self.r.state.get('limitWindows', {})
+
+    def test_the_start_is_the_first_busy_read_and_a_stale_one_is_replaced(self):
+        self.check('\n' + kimi_frame('idle-after-turn'))
+        self.assertNotIn('codex', self.windows())
+        self.check('\n' + kimi_frame('running-thinking'))
+        start = self.clock
+        self.assertEqual(start, self.windows()['codex'])
+        self.check(times=3)                            # still busy: the start stays
+        self.assertEqual(start, self.windows()['codex'])
+        self.clock = start + relay.KIMI_WINDOW_SECONDS - 60
+        self.check()
+        self.assertEqual(start, self.windows()['codex'])
+        self.check()                                   # 5 h after the start: a new window
+        self.assertEqual(self.clock, self.windows()['codex'])
+        saved = json.loads(self.r.state_file.read_text(encoding='utf-8'))
+        self.assertEqual(self.clock, saved['limitWindows']['codex'])
+
+    def test_the_first_probe_is_at_the_window_end_when_sooner(self):
+        self.r.state['limitWindows'] = {'codex': self.clock - relay.KIMI_WINDOW_SECONDS + 10 * 60}
+        self.check('kimi-limited-5hour', times=2)
+        episode = self.episode()
+        ends = self.r.state['limitWindows']['codex'] + relay.KIMI_WINDOW_SECONDS
+        self.assertEqual(ends, episode['windowEndsAt'])
+        self.assertEqual(ends + 60, episode['retryAt'])
+        self.until_retry()
+        self.assertEqual(1, len(self.probes_typed()))
+        self.check('kimi-limited-5hour')               # not reset yet: back to the regular period
+        self.assertEqual(self.clock + 30 * 60, self.episode()['retryAt'])
+
+    def test_a_past_window_end_or_none_changes_nothing(self):
+        for windows in ({'codex': self.clock - 6 * 3600}, {}):
+            with self.subTest(windows=windows):
+                self.r.state.pop('limits', None)
+                self.r.state['limitWindows'] = dict(windows)
+                self.check('kimi-limited-5hour', times=2)
+                self.assertEqual(self.clock + 30 * 60, self.episode()['retryAt'])
+                self.check('\n' + kimi_frame('idle-after-turn'), times=2)
+
+    def test_a_window_end_after_the_regular_probe_changes_nothing(self):
+        self.r.state['limitWindows'] = {'codex': self.clock - 60}
+        self.check('kimi-limited-5hour', times=2)
+        self.assertEqual(self.clock + 30 * 60, self.episode()['retryAt'])
+
+    def test_the_window_is_cleared_when_the_episode_ends(self):
+        self.r.state['limitWindows'] = {'codex': self.clock - 3600}
+        self.check('kimi-limited-5hour', times=2)
+        self.check('\n' + kimi_frame('idle-after-turn'), times=2)
+        self.assertIsNone(self.episode())
+        self.assertNotIn('codex', self.windows())
 
 
 class AutonomousClose(unittest.TestCase):

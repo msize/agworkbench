@@ -13,6 +13,8 @@
   wb.py loop-state done --pr 30 --sha <sha>                       # the planner's last act (#27)
   wb.py loop-state done --no-pr --reason "duplicate"               # closed issue needing no change (#53)
   wb.py loop-state blocked --environmental --reason "codex limited" # a block the human cannot answer (#61)
+  wb.py loop-state blocked --needs-human --reason "GitHub API rate limit"  # -WaitOnLimit: not an agent limit (#88)
+  wb.py wait-limit --reason "kimi 5-hour limit"                   # -WaitOnLimit: the relay waits it out (#88)
   wb.py review-round --round 2                                    # a verified revmux round's decision (#64)
   wb.py review-round --summary                                    # why review ended, for the PR body / merge note
   wb.py merge-check --pr 12 --head <sha>                          # read-only auto-merge gate (#23)
@@ -47,6 +49,7 @@ sys.path.insert(0, str(HERE))
 import agw  # noqa: E402
 import followup  # noqa: E402
 import hub  # noqa: E402
+import limits  # noqa: E402
 import triage  # noqa: E402
 
 
@@ -279,8 +282,34 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+# Any limit in a `loop-state blocked` reason (#88), deliberately broad: two review rounds showed that no
+# free-text pattern tells an agent's usage limit ("kimi: 5h limit hit") from a real block ("GitHub API rate
+# limit", "codex limited; failover is off"). So in a -WaitOnLimit checkout every limit word is a question,
+# which the planner answers: `wb.py wait-limit` for an agent's limit, `--needs-human` for anything else.
+# The agents' own limit messages (limits.LIMITED) count too.
+LIMIT_REASON = re.compile("|".join([r"limit", r"quota", r"credit", r"5[- ]?h(?:ours?)?\b", r"\b403\b",
+                                    limits.KIMI_QUOTA,
+                                    *(pattern for patterns in limits.LIMITED.values() for pattern in patterns)]),
+                          re.IGNORECASE)
+
+
+def limit_reason(reason: str | None) -> bool:
+    return bool(LIMIT_REASON.search(limits.APOSTROPHES.sub("'", reason or "")))
+
+
 def cmd_loop_state(args: argparse.Namespace) -> int:
     # Reports stay in this checkout; the conductor alone owns the global queue.
+    if getattr(args, 'needs_human', False) and args.state != 'blocked':
+        print('wb: loop-state: --needs-human is only for blocked', file=sys.stderr)
+        return 2
+    if (args.state == 'blocked' and not getattr(args, 'needs_human', False) and limit_reason(args.reason)
+            and checkout_settings(checkout())["onLimit"] == "wait"):
+        # #88: a blocked loop waits for the human, and a -WaitOnLimit loop must resume by itself.
+        print('wb: loop-state: this checkout waits out usage limits (onLimit=wait), and the reason names a '
+              'limit. If an agent is at its usage limit, run `wb.py wait-limit --reason ...`: the relay waits '
+              'it out. If this block really needs the human (a GitHub, CI or disk limit, a Codex warning '
+              'chooser that could not fail over), rerun with --needs-human.', file=sys.stderr)
+        return 1
     if args.state == 'done':
         code = (loop_done_no_pr(checkout(), args.reason, args.pr) if getattr(args, 'no_pr', False)
                 else loop_done(checkout(), args.pr, args.sha))
@@ -302,6 +331,24 @@ def cmd_loop_state(args: argparse.Namespace) -> int:
     except (OSError, ValueError, KeyError, TypeError) as err:
         print(f'wb: loop-state: {err}', file=sys.stderr)
         return 2
+
+
+def cmd_wait_limit(args: argparse.Namespace) -> int:
+    """#88: the planner saw an agent's usage limit that the relay did not detect. In a -WaitOnLimit
+    checkout the relay turns this request into a wait episode on its next limit check (it deletes the
+    file): mail held, a probe every limitRetryMinutes, the loop resuming by itself."""
+    root = checkout()
+    if checkout_settings(root)["onLimit"] != "wait":
+        print("wb: wait-limit: this checkout fails over on a usage limit (onLimit is not wait): follow "
+              "start-github-issue.md, Usage limits, and run github-workbench.cmd <issue> -Failover",
+              file=sys.stderr)
+        return 1
+    from conductor import atomic_json
+    path = root / ".workbench" / "state" / "limit-request.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_json(path, {"box": args.box, "reason": args.reason, "at": time.time()})
+    print(f"wb: wait-limit: the relay waits out {args.box}'s usage limit from its next check")
+    return 0
 
 
 def checkout_settings(root: Path) -> dict:
@@ -2324,7 +2371,14 @@ def main() -> int:
     p.add_argument('--reason')
     p.add_argument('--environmental', action='store_true',
                    help='blocked: by a limited tool, low disk or memory, not a question; the member keeps its queue slot (#61)')
+    p.add_argument('--needs-human', action='store_true',
+                   help='blocked, in a -WaitOnLimit checkout: the reason names a limit, but not an agent usage '
+                        'limit to wait out (a GitHub, CI or disk limit, a Codex warning chooser that could not fail over); the human must answer (#88)')
     p.set_defaults(func=cmd_loop_state)
+    p = subs.add_parser('wait-limit', help='-WaitOnLimit: have the relay wait out a usage limit it did not detect (#88)')
+    p.add_argument('--box', default='codex', choices=['codex', 'claude'], help='the limited agent (default: codex)')
+    p.add_argument('--reason', required=True, help='what the pane shows, e.g. "kimi 5-hour usage limit"')
+    p.set_defaults(func=cmd_wait_limit)
     p = subs.add_parser("revmux", help="run a revmux round in its own visible session")
     p.add_argument("--round", type=int, required=True)
     p.add_argument("--scope", help="scope file, relative to the clone or absolute (required, except that a "

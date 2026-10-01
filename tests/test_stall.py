@@ -441,6 +441,64 @@ class NoFalseStalls(StallFixture):
         self.assertTrue(any('[dry-run] would report the loop blocked: stalled:' in line for line in self.logs))
 
 
+class KimiLimitFallback(StallFixture):
+    """#88: a Kimi implementer stalled on a limit error the classifier could not place (docxy #775). In a
+    -WaitOnLimit checkout the stall watch starts the wait the limit check missed; nobody is pointed at it."""
+
+    def setUp(self):
+        super().setUp()
+        self.r.peers[1] = relay.Peer('codex', 'kimi', IMPLEMENTER)
+        frame = Path(__file__).resolve().parent / 'fixtures' / 'limits' / 'kimi-tool-output-last.txt'
+        self.text[IMPLEMENTER] = frame.read_text(encoding='utf-8')
+        self.assertIsNone(relay.limits.classify(self.text[IMPLEMENTER], 'kimi'))
+
+    def on_limit(self, value):
+        self.write('implementer.json', {'tool': 'kimi', 'onLimit': value})
+
+    def waiting_notes(self):
+        box = self.hub_dir / 'inbox' / 'claude'
+        return [m for m in (hub.parse_message(p) for p in sorted(box.glob('*.md')))
+                if m.get('from') == 'relay' and m.get('subject') == 'usage limit: codex (kimi) waiting']
+
+    def test_wait_mode_starts_a_forced_wait_instead_of_the_pointer(self):
+        self.on_limit('wait')
+        self.run_until(4 * S)
+        self.assertEqual([], self.stall_mail())
+        self.assertEqual([], self.escalations())
+        episode = self.r.state['limits']['codex']
+        self.assertEqual(('stall', True, True, 'kimi'), (episode['forced'], episode['wait'], episode['announced'],
+                                                         episode['tool']))
+        self.assertTrue(episode['line'].startswith('Error: [provider.api_error]'), episode['line'])
+        self.assertEqual(1, len(self.waiting_notes()))
+        saved = json.loads((self.hub_dir / 'state' / 'relay.json').read_text(encoding='utf-8'))
+        self.assertEqual('stall', saved['limits']['codex']['forced'])
+
+    def test_failover_mode_mails_the_pointer_with_the_limit_row(self):
+        self.on_limit('failover')
+        self.run_until(S)
+        mails = self.stall_mail()
+        self.assertEqual(1, len(mails))
+        self.assertIn("The implementer's pane shows a usage-limit error: Error: [provider.api_error]", mails[0]['body'])
+        self.assertNotIn('limits', self.r.state)
+
+    def test_no_limit_on_screen_keeps_the_pointer(self):
+        self.on_limit('wait')
+        kimi = Path(__file__).resolve().parent / 'fixtures' / 'kimi' / 'idle-after-turn.txt'
+        self.text[IMPLEMENTER] = kimi.read_text(encoding='utf-8')
+        self.run_until(S)
+        self.assertEqual(1, len(self.stall_mail()))
+        self.assertNotIn('usage-limit error', self.stall_mail()[0]['body'])
+        self.assertNotIn('limits', self.r.state)
+
+    def test_a_codex_implementer_keeps_the_pointer(self):
+        self.on_limit('wait')
+        self.r.peers[1] = relay.Peer('codex', 'codex', IMPLEMENTER)
+        self.text[IMPLEMENTER] = CODEX_IDLE
+        self.run_until(S)
+        self.assertEqual(1, len(self.stall_mail()))
+        self.assertNotIn('limits', self.r.state)
+
+
 class QuietHelper(StallFixture):
     def test_a_marker_less_helper_quiet_for_two_periods_stops_exempting_and_is_named(self):
         # G2: a helper killed under memory pressure leaves its pane on screen and never writes a marker.

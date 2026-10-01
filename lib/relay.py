@@ -28,6 +28,10 @@ Six jobs, one loop, one process per issue, running in its own visible agwinterm 
    limit that has reset lets the agent continue and the row leaves the pane, which ends the episode;
    one that has not answers with its limit again, and the wait goes on. Only a pane nobody can type
    into for `limitRetryMinutes` reaches the human. A Codex warning chooser keeps the failover path.
+   A wait can also be forced (#88): by the stall watch, for a Kimi implementer whose frame ends in a
+   limit error the classifier could not place, or by the planner's `wb.py wait-limit`. A forced episode
+   ends only after a probe. For Kimi, whose message gives no reset time, a probe also comes 5 h after
+   the relay first saw it busy in the current window (`limitWindows`), when that is sooner.
 
 4. **The close after merge or a no-op issue (#27, #33, #53).** On an autonomous checkout, after a MERGED PR's final
    notices are delivered or a closed issue has a no-PR done record, it runs closer.py while it keeps delivering mail. Helper sessions close
@@ -107,6 +111,8 @@ TERMINAL_DRAIN_TIMEOUT = 30 * 60.0
 LIMIT_READS = 2          # consecutive reads that start (or end) a usage-limit episode
 STALL_MINUTES = 15.0     # the default stall period (#45); `stallMinutes` in ~/.agworkbench.json, 0 = off
 LIMIT_RETRY_MINUTES = 30.0   # between probes of an agent waiting out its limit (#77); `limitRetryMinutes`
+KIMI_WINDOW_SECONDS = 5 * 3600.0   # Kimi's usage window (#88): its limit gives no reset time
+WINDOW_SLACK = 60.0      # the window-end probe comes this long after the window's end
 PROBE_TEXT = ("the usage limit may have reset; continue where you left off "
               "(git status, .workbench, unread mail)")
 LAST_WORDS_MAX = 300     # how much of the implementer's last line a stall pointer quotes
@@ -622,8 +628,11 @@ class StallWatch:
             if self.since is None:
                 self.since = instant
                 self.note("both panes idle with nothing to wake them; stall clock started")
-            if instant - self.since >= self.period and self.pointer(instant - self.since, quiet, texts):
-                self.level, self.pointer_at = 1, instant
+            if instant - self.since >= self.period:
+                if self.wait_out_limit(texts):
+                    self.reset("usage limit")
+                elif self.pointer(instant - self.since, quiet, texts):
+                    self.level, self.pointer_at = 1, instant
         elif self.level == 1:
             # A busy pane after the pointer (the planner reading it) does not reset the level, but
             # escalation waits until both panes have been idle for a whole period: never mid-work.
@@ -635,6 +644,27 @@ class StallWatch:
                 self.fingerprint = self.current_fingerprint(sessions)
 
     # --- acting ---------------------------------------------------------------------------------
+    def implementer_limit(self, texts: dict[str, Any]) -> tuple[Peer, limits.Limit] | None:
+        """#88: a Kimi implementer whose frame ends in a limit error the limit check could not place (the
+        error glued under a tool call): the idle stall period is the evidence the owner rule stood in for."""
+        for peer in self.relay.peers:
+            text = texts.get(peer.box)
+            if peer.box == "codex" and peer.tool == "kimi" and isinstance(text, str):
+                found = limits.kimi_turn_limit(text)
+                if found:
+                    return peer, found
+        return None
+
+    def wait_out_limit(self, texts: dict[str, Any]) -> bool:
+        """In a -WaitOnLimit checkout a stalled implementer at its limit is waited out (#88), not pointed
+        at the planner: True when the relay waits now. The episode exempts the loop while it lasts."""
+        limited = self.implementer_limit(texts)
+        if not limited or self.relay.on_limit() != "wait":
+            return False
+        peer, found = limited
+        self.relay.force_wait(peer, found, texts[peer.box], "stall")
+        return True
+
     def implementer_line(self, texts: dict[str, Any]) -> str | None:
         for peer in self.relay.peers:
             if peer.box == "codex" and isinstance(texts.get(peer.box), str):
@@ -648,11 +678,14 @@ class StallWatch:
         subject = f"stall: loop idle for {minutes} min, nothing unread, no running helper"
         body = [f"The relay has seen this loop idle for {minutes} minutes: both agent panes idle with an empty",
                 "composer, no unread mail in either box, no running helper, no PR open for review or CI",
-                "running, no usage limit, and the loop neither done nor waiting on the human.", ""]
+                "running, no usage-limit episode, and the loop neither done nor waiting on the human.", ""]
         body += [f"- {line}" for line in quiet] + ([""] if quiet else [])
         words = self.implementer_line(texts)
         if words:
             body += [f"The implementer's last line: {words}", ""]
+        limited = self.implementer_limit(texts)
+        if limited:
+            body += [f"The implementer's pane shows a usage-limit error: {limited[1].line}", ""]
         body += ["Next step: check your mail waiter - it may have been killed under memory pressure; rearm it",
                  "if it is not running - and any finished helper (mail from `helper`,",
                  "`.workbench/state/helpers/*.done`, `.workbench/review/`). Then continue the loop, or, if it",
@@ -885,7 +918,9 @@ class Relay:
 
     def check_limits(self, texts: dict[str, Any]) -> None:
         """Classify each pane (texts from read_panes); an episode seen on LIMIT_READS consecutive reads
-        is announced once."""
+        is announced once. A forced episode (#88: the stall watch's or the planner's) is waited out even
+        when nothing on screen is placed: only its probe can end it."""
+        self.take_limit_request(texts)
         episodes = dict(self.state.get('limits', {}))
         changed = False
         for peer in self.peers:
@@ -895,6 +930,9 @@ class Relay:
                 continue
             found = limits.classify(text, peer.tool)
             episode = episodes.get(peer.box)
+            if episode is None and self.note_window(peer.box, text):
+                changed = True
+            forced = bool(episode and episode.get('forced'))
             if peer.box not in self.limit_baseline:
                 # Only an old `limited` row is history. A warning is Codex's modal chooser, live at
                 # the bottom of the pane: it never scrolls away, so a baseline would hide it (#61).
@@ -904,10 +942,12 @@ class Relay:
                 if self.limit_baseline[peer.box]:
                     self.log(f"limit check: ignoring {peer.box}'s limit row already on screen at start: {found.line}")
             baseline = self.limit_baseline[peer.box]
-            if found and found.line in baseline:
+            if found and found.line in baseline and not forced:
                 found = None
             elif not found and baseline and not any(line in text for line in baseline):
                 baseline.clear()
+            if not found and forced and peer.tool == 'kimi':
+                found = limits.kimi_turn_limit(text)
             if found:
                 tail = limits.tail_hash(text)
                 if episode and episode.get('kind') == found.kind:
@@ -927,20 +967,27 @@ class Relay:
                     else:
                         # Only a hard limit is waited out (#77): nobody answers a warning chooser.
                         if found.kind == 'limited' and self.on_limit() == 'wait':
-                            episode.update(wait=True, retryAt=wall() + self.retry_seconds(), probes=0, probeAt=None)
+                            self.start_wait(peer, episode)
                         self.announce_limit(peer, episode, text)
                         episode['announced'] = True
                 elif episode.get('wait') and episode['announced'] and not self.dry_run:
                     self.wait_limit(peer, episode)
                 changed = True
             elif episode:
-                if episode.get('wait') and episode.get('probeAt') is not None and is_busy(text):
+                if forced and episode.get('probeAt') is None and not episode.get('probes'):
+                    # Nothing the relay can place is on screen; the stall watch or the planner saw the
+                    # limit (#88). Only the first probe's answer can tell that it has reset.
+                    episode['misses'] = 0
+                    if episode.get('announced') and not self.dry_run:
+                        self.wait_limit(peer, episode)
+                elif episode.get('wait') and episode.get('probeAt') is not None and is_busy(text):
                     # The agent took the probe and is working (#77): its limit row may yet come back.
                     episode['misses'] = 0
                 else:
                     episode['misses'] = episode.get('misses', 0) + 1
                 if episode['misses'] >= LIMIT_READS:
                     episodes.pop(peer.box)
+                    self.state.get('limitWindows', {}).pop(peer.box, None)
                     if episode.get('wait') and episode.get('probeAt') is not None:
                         self.log(f"usage limit episode ended for {peer.box}: the limit reset "
                                  f"(probe {episode.get('probes', 0) + 1})")
@@ -1008,6 +1055,86 @@ class Relay:
     def retry_seconds(self) -> float:
         return limit_retry_setting() * 60
 
+    def note_window(self, box: str, text: str) -> bool:
+        """#88: when the agent was first seen busy in its current usage window - after the relay started,
+        after its last limit episode, or 5 h after the last start. True when it changed."""
+        if not is_busy(text):
+            return False
+        windows = self.state.setdefault('limitWindows', {})
+        start = windows.get(box)
+        if isinstance(start, (int, float)) and not isinstance(start, bool) and wall() - start < KIMI_WINDOW_SECONDS:
+            return False
+        windows[box] = wall()
+        return True
+
+    def start_wait(self, peer: Peer, episode: dict) -> None:
+        """Turn an episode into a wait (#77). A Kimi window start the relay saw gives its end (#88)."""
+        start = self.state.get('limitWindows', {}).get(peer.box)
+        if peer.tool == 'kimi' and isinstance(start, (int, float)) and not isinstance(start, bool):
+            episode['windowEndsAt'] = start + KIMI_WINDOW_SECONDS
+        episode.update(wait=True, probes=0, probeAt=None)
+        episode['retryAt'] = self.next_retry(episode)
+
+    def next_retry(self, episode: dict) -> float:
+        """limitRetryMinutes from now, or just after the usage window ends when that is sooner (#88)."""
+        retry = wall() + self.retry_seconds()
+        ends = episode.get('windowEndsAt')
+        if isinstance(ends, (int, float)) and not isinstance(ends, bool) and wall() < ends + WINDOW_SLACK < retry:
+            return ends + WINDOW_SLACK
+        return retry
+
+    def force_wait(self, peer: Peer, found: limits.Limit, text: str, source: str) -> bool:
+        """Start a wait episode now, without the two classified reads (#88): `source` is "stall" (the stall
+        watch saw a limit error the limit check could not place) or "planner" (`wb.py wait-limit`). False
+        when the box already has an episode."""
+        if peer.box in self.state.get('limits', {}):
+            return False
+        if self.dry_run:
+            self.log(f"[dry-run] would wait out {peer.box}'s usage limit ({source}): {found.line}")
+            return True
+        episode = self.state.setdefault('limits', {})[peer.box] = {
+            'kind': 'limited', 'line': found.line, 'tool': peer.tool,
+            'firstSeen': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+            'since': wall(), 'tail': limits.tail_hash(text), 'hits': LIMIT_READS, 'misses': 0,
+            'announced': False, 'exited': False, 'forced': source}
+        self.start_wait(peer, episode)
+        self.log(f"usage limit: {peer.box} ({peer.tool}) waiting, forced by the {source}")
+        self.announce_limit(peer, episode, text)
+        episode['announced'] = True
+        self._save()
+        return True
+
+    def take_limit_request(self, texts: dict[str, Any]) -> None:
+        """`wb.py wait-limit` (#88): the planner saw a limit the relay did not. The request is consumed
+        whatever happens to it, so a refused one is never retried."""
+        path = self.hub_dir / "state" / "limit-request.json"
+        if self.dry_run or not path.exists():
+            return
+        try:
+            request = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            request = None
+        try:
+            path.unlink()
+        except OSError as err:
+            self.log(f"limit request: cannot remove {path.name}: {err}")
+            return
+        if not isinstance(request, dict):
+            self.log("limit request: unreadable; ignored")
+            return
+        box = request.get('box') or 'codex'
+        peer = next((p for p in self.peers if p.box == box), None)
+        if peer is None:
+            self.log(f"limit request: no pane for box {box!r}; ignored")
+            return
+        if self.on_limit() != 'wait':
+            self.log("limit request: this checkout fails over (onLimit is not wait); ignored")
+            return
+        reason = str(request.get('reason') or 'the planner reports a usage limit').strip()
+        text = texts.get(box)
+        if not self.force_wait(peer, limits.Limit('limited', reason), text if isinstance(text, str) else '', 'planner'):
+            self.log(f"limit request: {box} already has a usage-limit episode")
+
     def announce_wait(self, peer: Peer, episode: dict, rows: list[str]) -> None:
         """One note to the planner that asks for nothing, and an idle status: no sound, no notification."""
         import agw
@@ -1031,11 +1158,12 @@ class Relay:
             self.log(f"could not set idle status for {peer.box}: {err}")
 
     def wait_limit(self, peer: Peer, episode: dict) -> None:
-        """A limit row on screen during a wait episode: after a probe it means the limit has not reset;
-        at retryAt it is time to probe."""
+        """A limit row on screen during a wait episode, or a forced episode before its first probe (#88,
+        nothing placed on screen): after a probe a limit row means the limit has not reset; at retryAt it
+        is time to probe."""
         if episode.get('probeAt') is not None:
-            episode.update(probes=episode.get('probes', 0) + 1, probeAt=None,
-                           retryAt=wall() + self.retry_seconds())
+            episode.update(probes=episode.get('probes', 0) + 1, probeAt=None)
+            episode['retryAt'] = self.next_retry(episode)
             self.log(f"usage limit: {peer.box} still limited after probe {episode['probes']}; "
                      f"next try {clock_text(episode['retryAt'])}")
             return

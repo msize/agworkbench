@@ -52,6 +52,10 @@ EXPECTED = {
     "kimi-limited-balance": ("kimi", "limited", False),
     "kimi-limited-usage": ("kimi", "limited", False),
     "kimi-limited-5hour": ("kimi", "limited", False),     # #77: the owner's evaluation, 2026-09-29/30
+    # #88: the real docxy #775 frame - the error glued under a collapsed `● Ran a command` - and the
+    # same frame in a ~60-column pane, where the error wraps over 5 rows and the hint over 3
+    "kimi-limited-5hour-tool": ("kimi", "limited", False),
+    "kimi-limited-5hour-narrow": ("kimi", "limited", False),
     "kimi-rate-limit-transient": ("kimi", None, False),
     "kimi-retrying": ("kimi", None, False),
     "kimi-tool-output": ("kimi", None, False),
@@ -137,7 +141,8 @@ class Fixtures(unittest.TestCase):
                 # The strings run may break inside a code: provider.auth_error ends one run as `.auth_error"`.
                 self.assertTrue(f'"{code}"' in kimi or f'.{code.split(".", 1)[1]}":' in kimi, code)
                 self.assertTrue(" ".join(text.split()).find(" ".join(hint.split())) >= 0 or name == "kimi-diff")
-                if kind == "limited" and name not in ("kimi-limited-usage", "kimi-limited-5hour"):
+                if kind == "limited" and name not in ("kimi-limited-usage", "kimi-limited-5hour",
+                                                         "kimi-limited-5hour-tool", "kimi-limited-5hour-narrow"):
                     self.assertTrue(any(phrase in " ".join(text.split()) for phrase in
                                         ("exceeded your current quota", "insufficient balance")), name)
 
@@ -205,6 +210,83 @@ class Position(unittest.TestCase):
         base = "\n".join(f"row {i}" for i in range(30))
         self.assertEqual(limits.tail_hash(base), limits.tail_hash("different top\n" + base + "\n\n"))
         self.assertNotEqual(limits.tail_hash(base), limits.tail_hash(base + "\nrow 30"))
+
+
+KIMI_BOX = (" ╭" + "─" * 84 + "╮\n │ >" + " " * 82 + "│\n ╰" + "─" * 84 + "╯\n"
+            " Ask When Needed  K2.8 Preview thinking: max  C:\\repo\n")
+ERROR_5H = "   Error: [provider.auth_error] 403 You've reached your 5-hour usage limit. Your quota"
+ERROR_5H_WRAPPED = [ERROR_5H, " will reset when the current 5-hour window ends."]
+HINT = "   If this persists, run `/export-debug-zip` and share the file with us for diagnosis."
+HINT_WRAPPED = [HINT, " Please don't share it publicly."]
+
+
+def kimi(*rows: str) -> str:
+    return " ✨ continue\n\n ● Working on it.\n\n" + "\n".join(rows) + "\n\n" + KIMI_BOX
+
+
+class KimiOwner(unittest.TestCase):
+    """#88: a session error glued under a successful tool call is the session's, not the tool's, only
+    when the tool's output provably cannot hold it (Kimi 2.1.1's outcomeRows: at most 3 rows, each cut
+    to one row, or ONE row marked with `…`), or when a row of it wraps to column 1."""
+
+    def test_the_issue_frame_is_limited_on_the_error_row(self):
+        found = limits.classify(frame("kimi-limited-5hour-tool"), "kimi")
+        self.assertEqual("limited", found.kind)
+        self.assertTrue(found.line.startswith("Error: [provider.auth_error] 403 You've reached your 5-hour"), found.line)
+        narrow = limits.classify(frame("kimi-limited-5hour-narrow"), "kimi")
+        self.assertEqual("Error: [provider.auth_error] 403 You've reached your", narrow.line)   # its first row
+
+    def test_one_marked_outcome_row_then_the_error(self):
+        for outcome in ("   … the last line of a long output", "   the first line of a long output …"):
+            with self.subTest(outcome=outcome):
+                text = kimi(" ● Ran a command · $ make test", outcome, ERROR_5H, HINT)
+                self.assertEqual("limited", limits.classify(text, "kimi").kind)
+
+    def test_a_width_cut_is_not_a_collapse_marker(self):
+        text = kimi(" ● Ran a command · $ cat notes.txt", "   every skipped/ignored test by na…", ERROR_5H, HINT)
+        self.assertIsNone(limits.classify(text, "kimi"))
+
+    def test_a_marked_row_with_more_output_after_it_is_not_a_collapse(self):
+        text = kimi(" ● Ran a command · $ cat notes.txt", "   … earlier", "   more output", ERROR_5H, HINT)
+        self.assertIsNone(limits.classify(text, "kimi"))
+
+    def test_output_rows_at_column_3_never_place_the_error(self):
+        # A `cat` of a 3-line file: error, hint, hint continuation - all tool output rows at column 3.
+        text = kimi(" ● Ran a command · $ cat x.txt", ERROR_5H, HINT, "   Please don't share it publicly.")
+        self.assertIsNone(limits.classify(text, "kimi"))
+
+    def test_a_row_wrapped_to_column_1_is_a_status_row(self):
+        text = kimi(" ● Ran a command · $ make test", "   ok", *ERROR_5H_WRAPPED, HINT)
+        self.assertEqual("limited", limits.classify(text, "kimi").kind)
+        text = kimi(" ● Ran a command · $ make test", "   ok", ERROR_5H, *HINT_WRAPPED)
+        self.assertEqual("limited", limits.classify(text, "kimi").kind)
+
+    def test_a_failed_call_still_owns_its_rows(self):
+        text = kimi(" ✗ Ran a command · $ make test", "   … collapsed", *ERROR_5H_WRAPPED, *HINT_WRAPPED)
+        self.assertIsNone(limits.classify(text, "kimi"))
+
+
+class KimiTurnLimit(unittest.TestCase):
+    """#88: the safety nets' rule - the frame ends in a Kimi limit session error, whatever item owns it."""
+
+    def test_the_issue_frames_and_any_owner(self):
+        for name in ("kimi-limited-5hour-tool", "kimi-limited-5hour-narrow", "kimi-limited-5hour", "kimi-tool-output-last"):
+            with self.subTest(frame=name):
+                self.assertEqual("limited", limits.kimi_turn_limit(frame(name)).kind)
+        failed = kimi(" ✗ Ran a command · $ make test", "   ok", ERROR_5H, HINT)
+        self.assertEqual("limited", limits.kimi_turn_limit(failed).kind)
+
+    def test_only_at_the_bottom_of_an_idle_pane(self):
+        for name in ("kimi-tool-output", "kimi-history", "kimi-retrying", "kimi-exited-quoted",
+                     "kimi-rate-limit-transient", "kimi-diff"):
+            with self.subTest(frame=name):
+                self.assertIsNone(limits.kimi_turn_limit(frame(name)))
+        for path in sorted(KIMI_CAPTURED.glob("*.txt")):
+            with self.subTest(frame=path.name):
+                self.assertIsNone(limits.kimi_turn_limit(path.read_text(encoding="utf-8")))
+        answered = frame("kimi-limited-5hour-tool").replace(" Please don't share it publicly.\n",
+                                                             " Please don't share it publicly.\n\n ● Done.\n")
+        self.assertIsNone(limits.kimi_turn_limit(answered))
 
 
 class Cli(unittest.TestCase):

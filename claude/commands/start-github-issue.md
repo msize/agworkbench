@@ -140,6 +140,20 @@ idle agent composer, which is theirs to clear. A Codex `warning` chooser is not 
 the failover path below. When you are the limited one, you simply resume when the relay's pointer
 reaches you: read your unread mail and carry on.
 
+**A limit the relay did not detect** (#88), in an `onLimit=wait` checkout: an agent's pane shows its
+usage-limit message but no `... waiting` mail came. **Never report `blocked` for a usage limit**:
+a blocked loop waits for the human, and this loop must resume by itself. Here `wb.py loop-state blocked`
+refuses any reason that mentions a limit (`limit`, `quota`, `credit`, `5h`, `403`, an agent's own limit
+message) until you answer which it is: an agent's usage limit goes to `wait-limit`, and a block that
+really needs the human (a GitHub, CI or disk limit, a Codex warning chooser that could not fail over) is
+reported with `--needs-human` added. Run
+`python "$AGWORKBENCH/lib/wb.py" wait-limit --reason "<the limit line>"` (add `--box claude` for your
+own limit). On its next check the relay starts the same wait: a `... waiting` mail, held mail, a probe every
+`limitRetryMinutes`. A Kimi implementer's limit is waited out without you when the relay's stall watch
+sees it. For Kimi the relay also probes about 5 hours after it first saw Kimi busy in the current
+window, since Kimi's message gives no reset time. If the limit is still on screen after a probe
+and the episode ended, run `wait-limit` again.
+
 - **The implementer is `limited` or `warning`, and `wb.py settings` says `failover=true`** (the
   default). A `warning` is Codex's "Approaching rate limits" chooser, which Codex shows when it has
   less than 10% of its limit left. Never answer the chooser: fail over exactly as for the hard limit.
@@ -169,7 +183,7 @@ reaches you: read your unread mail and carry on.
   4. Tell the human in one line which tool was stopped and which took over.
 - **`-Failover` refused** (exit 2, `Implementer switch refused: failover refused: ...`): tell the
   human the refusal line and set `wb.py status blocked --sound` (in queue mode, first
-  `wb.py loop-state blocked --environmental --reason "<the refusal line>"`). Exit 2 means nothing was stopped
+  `wb.py loop-state blocked --environmental --needs-human --reason "<the refusal line>"`). Exit 2 means nothing was stopped
   and nothing changed. A tool with a recorded limit is never switched back to automatically: the
   human clears it with `github-workbench <issue> -Implementer <tool>` once its limit has reset.
   In queue mode, tell them that this clears only the checkout's record. For new members to use
@@ -177,12 +191,13 @@ reaches you: read your unread mail and carry on.
   (plus `-QueueName <name>` for a named queue: `queueName` in `.workbench/state/queue-member.json`).
 - **`-Failover` stopped the agent but did not switch** (exit 3, `Failover incomplete: ...`): the
   limited agent may be gone, and its limit is recorded. Tell the human the line and set blocked
-  (in queue mode, with `--environmental`). They
+  (in queue mode, with `--environmental --needs-human`). They
   relaunch with `github-workbench <issue> -Implementer <other tool>` once the pane is a clean shell.
   In queue mode, also tell them that the queue keeps its own record of the limit, which
   `github-workbench -Queue <spec> -ClearLimit <tool>` (with `-QueueName` for a named queue) clears once the limit has reset.
 - **`failover=false`**: tell the human and set blocked. In queue mode, first report
-  `wb.py loop-state blocked --environmental --reason "<tool> limited; failover is off"`.
+  `wb.py loop-state blocked --environmental --needs-human --reason "<tool> limited; failover is off"`.
+  `--needs-human` answers the `onLimit=wait` refusal: a Codex warning chooser is not waited out.
 - **Box `claude`** (you): this mail is only a record; the human was already notified. Carry on
   when you can act again.
 
@@ -198,7 +213,13 @@ The mail quotes the implementer's last line when it has one.
 1. Check your background waiter. If it is gone, rearm it: one waiter, never two.
 2. Look for a finished helper: mail from `helper`, `revmux` or `human`, `.workbench/state/helpers/*.done`,
    and `.workbench/review/`. Act on the result.
-3. Continue the loop. If it really waits on the human, say so in one line and run
+3. If the implementer is at its usage limit (the mail says `The implementer's pane shows a
+   usage-limit error: ...`, or its pane shows one): in an `onLimit=wait` checkout run
+   `wb.py wait-limit --reason "<the limit line>"` and never report blocked (see "Usage limits"; a
+   reason naming any other limit needs `--needs-human` there). Otherwise
+   fail over as that section says. In a wait checkout the relay does not send this pointer for a Kimi
+   implementer at its limit: it starts the wait itself.
+4. Continue the loop. If it really waits on the human, say so in one line and run
    `wb.py status blocked --sound` (in queue mode, also `wb.py loop-state blocked --reason ...`).
 
 `wb.py status blocked` records `.workbench/state/waiting.json`. That record is a latch: while it
@@ -236,7 +257,9 @@ same conversation and the one-background-waiter rule. A PR is the queue's handof
 to merge. The conductor admits the next issue while this session continues handling its own review.
 
 A block the human cannot answer - a usage limit you could not fail over, low disk or low memory -
-is **environmental**: report it with `wb.py loop-state blocked --environmental --reason "..."`. The
+is **environmental**: report it with `wb.py loop-state blocked --environmental --reason "..."` (in an
+`onLimit=wait` checkout an agent's usage limit is never blocked: run `wb.py wait-limit`, see Usage limits;
+any other reason that mentions a limit needs `--needs-human`). The
 member keeps its queue slot, so the conductor does not start another issue on the same broken
 tool. A question for the human is a plain `loop-state blocked` and frees the slot.
 
