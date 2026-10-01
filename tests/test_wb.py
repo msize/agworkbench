@@ -1029,7 +1029,9 @@ class MergeReadiness(unittest.TestCase):
         self.state.mkdir(parents=True)
         make_origin(self.folder)
         self.addCleanup(hub.reload_paths)
-        self.enterContext(patch.dict(os.environ, {'AI_HUB': str(self.folder / '.workbench'), 'AI_BOX': 'claude'}))
+        self.config = self.folder / 'config.json'                               # never the real ~/.agworkbench.json
+        self.enterContext(patch.dict(os.environ, {'AI_HUB': str(self.folder / '.workbench'), 'AI_BOX': 'claude',
+                                                 'AGWORKBENCH_CONFIG': str(self.config)}))
         hub.reload_paths()
         (self.state / 'relay.json').write_text(json.dumps({'seen_open': [7]}), encoding='utf-8')
         self.out = io.StringIO()
@@ -1172,17 +1174,50 @@ class MergeReadiness(unittest.TestCase):
     # --- merge-round ----------------------------------------------------------------------------------
 
     def merge_round(self, pr, kind):
-        with patch.object(sys, 'argv', ['wb.py', 'merge-round', '--pr', str(pr), '--kind', kind]):
+        with patch.object(sys, 'argv', ['wb.py', 'merge-round', '--pr', str(pr)]
+                          + (['--summary'] if kind == 'summary' else ['--kind', kind])):
             return wb.main()
 
     def test_rounds_are_counted_per_kind_and_per_pr(self):
         self.assertEqual([0, 0, 0, 1], [self.merge_round(7, 'update') for _ in range(4)])
-        self.assertEqual([0, 1], [self.merge_round(7, 'conflict') for _ in range(2)])
+        self.assertEqual([0, 0, 0, 1], [self.merge_round(7, 'conflict') for _ in range(4)])     # #90: 3, was 1
         self.assertEqual([0, 1], [self.merge_round(7, 'ci-rerun') for _ in range(2)])
         self.assertEqual([0, 1], [self.merge_round('https://github.com/o/r/pull/7', 'ci-fix') for _ in range(2)])
         self.assertIn('the limit of 1 round(s) for PR #7 is reached - this goes to the human', self.out.getvalue())
         self.assertEqual(0, self.merge_round(8, 'conflict'))                   # a new PR starts again
         self.assertEqual({'pr': 8, 'conflict': 1}, json.loads((self.state / 'merge-rounds.json').read_text()))
+
+    def test_the_conflict_limit_is_configurable_and_validated(self):
+        # #90: mergeRounds.conflict; an invalid section is exit 2 with the reason, and nothing is counted.
+        self.config.write_text(json.dumps({'mergeRounds': {'conflict': 1}}), encoding='utf-8')
+        self.assertEqual([0, 1], [self.merge_round(7, 'conflict') for _ in range(2)])
+        self.assertIn('conflict: the limit of 1 round(s) for PR #7 is reached', self.out.getvalue())
+        self.config.write_text(json.dumps({'mergeRounds': {'conflict': 0}}), encoding='utf-8')
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(2, self.merge_round(7, 'update'))
+            self.assertEqual(2, self.merge_round(7, 'summary'))
+        self.assertIn('mergeRounds.conflict must be an integer from 1 to 10', err.getvalue())
+        self.assertEqual({'pr': 7, 'conflict': 1}, json.loads((self.state / 'merge-rounds.json').read_text()))
+        self.assertFalse(wb.round_used(self.folder, '7', 'conflict'))          # invalid: the code's limit (3)
+        with contextlib.redirect_stderr(io.StringIO()), patch.object(sys, 'argv', ['wb.py', 'merge-round', '--pr', '7']):
+            self.assertEqual(2, wb.main())                                     # neither --kind nor --summary
+
+    def test_the_summary_line_for_the_merge_note(self):
+        # #90
+        self.assertEqual(0, self.merge_round(7, 'summary'))
+        self.assertIn('merge rounds: none', self.out.getvalue())
+        (self.state / 'merge-rounds.json').write_text(json.dumps(
+            {'pr': 7, 'update': 1, 'conflict': 1, 'conflict-small': 2}), encoding='utf-8')
+        self.out.truncate(0)
+        self.out.seek(0)
+        self.assertEqual(0, self.merge_round(7, 'summary'))
+        self.assertEqual('merge rounds: 1 clean update; conflicts: 2 small (uncounted), 1 counted of 3\n',
+                         self.out.getvalue())
+        self.assertEqual('merge rounds: 2 clean updates; conflicts: 1 small (uncounted), 0 counted of 5; 1 CI rerun',
+                         wb.merge_summary({'update': 2, 'conflict-small': 1, 'ci-rerun': 1}, {'conflict': 5}))
+        self.assertEqual(0, self.merge_round(8, 'summary'))                    # another PR's record is not this one's
+        self.assertTrue(self.out.getvalue().endswith('merge rounds: none\n'))
 
     # --- ci-log and ci-rerun --------------------------------------------------------------------------
 
@@ -1293,7 +1328,9 @@ class UpdateCheck(unittest.TestCase):
     def setUp(self):
         self.repo = scratch(self, 'wb-update-')     # a git repo: never inside the checkout (r22b)
         (self.repo / '.workbench').mkdir(parents=True)
-        self.enterContext(patch.dict(os.environ, {'AI_HUB': str(self.repo / '.workbench')}))
+        self.config = self.repo / '.workbench/config.json'                     # never the real ~/.agworkbench.json
+        self.enterContext(patch.dict(os.environ, {'AI_HUB': str(self.repo / '.workbench'),
+                                                 'AGWORKBENCH_CONFIG': str(self.config)}))
         self.out = io.StringIO()
         self.enterContext(contextlib.redirect_stdout(self.out))
         self.git('init', '-q', '-b', 'main')
@@ -1346,7 +1383,10 @@ class UpdateCheck(unittest.TestCase):
         self.write('a.txt', 'one\nzwei/TWO\nthree\n')
         self.commit('resolve')
         self.assertEqual(0, self.check(base))
-        self.assertIn('update: conflict - review the resolution: git show --remerge-diff', self.out.getvalue())
+        self.assertIn('update: conflict (small: 1 conflict hunk in 1 file; not counted) - review the resolution: '
+                      'git show --remerge-diff', self.out.getvalue())               # #90
+        self.assertEqual({'head': self.sha('HEAD'), 'reviewed': self.reviewed, 'base': base, 'result': 'small',
+                          'hunks': 1, 'files': ['a.txt'], 'reason': ''}, self.recorded())
 
     def test_an_edit_slipped_into_a_clean_merge_is_a_conflict(self):
         # r22 m5: the merge itself needs no resolution; only the extra edit makes it non-empty.
@@ -1358,7 +1398,7 @@ class UpdateCheck(unittest.TestCase):
         self.git('add', '-A')
         self.git('commit', '-q', '-m', 'update')
         self.assertEqual(0, self.check(base))
-        self.assertIn('update: conflict', self.out.getvalue())
+        self.assertIn('update: conflict (counted: b.txt changed outside any conflict)', self.out.getvalue())
 
     def test_anything_but_one_merge_of_the_pinned_base_is_refused(self):
         base = self.main_moves()
@@ -1382,6 +1422,196 @@ class UpdateCheck(unittest.TestCase):
         self.assertEqual(1, self.check(self.sha('main~1')))                     # not the base the mail named
         self.assertIn('not the base', self.out.getvalue())
         self.assertEqual(0, self.check(base))
+
+    # --- small and counted conflicts (#90) ------------------------------------------------------------
+
+    def conflict(self, regions=1, extra=None, insert=None, resolve=None, name=None):
+        """main and the issue change the same `regions` lines of a new long file, 8 lines apart, and the
+        merge joins both sides. `extra` also edits that line of the result (a clean line the merge did
+        not conflict on), `insert` adds a line before it; `resolve` replaces the result, and False
+        commits git's markers as they are. Leaves HEAD at the merge; returns the base."""
+        name = name or f'c{uuid.uuid4().hex[:6]}.txt'
+        lines = [f'line {i}' for i in range(8 * regions + 8)]
+        at = [4 + 8 * k for k in range(regions)]
+
+        def text(tag):
+            return ''.join(f'{line} {tag}\n' if i in at else f'{line}\n' for i, line in enumerate(lines))
+
+        self.git('checkout', '-q', 'main')
+        (self.repo / name).parent.mkdir(parents=True, exist_ok=True)
+        self.write(name, text(''))
+        self.commit('a long file')
+        self.git('checkout', '-q', 'issue')
+        self.git('merge', '--no-ff', '-q', '-m', 'take the long file', 'main')           # reviewed history
+        self.write(name, text('issue'))
+        self.commit('issue edit')
+        self.reviewed = self.sha('HEAD')
+        self.git('checkout', '-q', 'main')
+        self.write(name, text('main'))
+        self.commit('main moves')
+        base = self.sha('HEAD')
+        self.git('checkout', '-q', 'issue')
+        self.assertNotEqual(0, self.git('merge', '--no-ff', '-q', '-m', 'update', base, check=False).returncode)
+        result = text('issue+main').splitlines(keepends=True)
+        if extra is not None:
+            result[extra] = result[extra].rstrip('\n') + ' edited\n'
+        if insert is not None:
+            result.insert(insert, 'an added line\n')
+        if resolve is not False:
+            self.write(name, resolve if resolve is not None else ''.join(result))
+        self.commit('resolve')
+        return base
+
+    def recorded(self):
+        return json.loads((self.repo / '.workbench/state/update-check.json').read_text(encoding='utf-8'))
+
+    def merge_round(self, kind, pr=7):
+        with patch.object(sys, 'argv', ['wb.py', 'merge-round', '--pr', str(pr), '--kind', kind]):
+            return wb.main()
+
+    def rounds(self):
+        record = json.loads((self.repo / '.workbench/state/merge-rounds.json').read_text(encoding='utf-8'))
+        return {kind: record.get(kind, 0) for kind in ('update', 'conflict', 'conflict-small')}
+
+    def test_up_to_three_conflict_regions_are_small(self):
+        self.assertEqual(0, self.check(self.conflict(3)))
+        self.assertIn('update: conflict (small: 3 conflict hunks in 1 file; not counted)', self.out.getvalue())
+
+    def test_many_conflict_regions_are_counted(self):
+        self.assertEqual(0, self.check(self.conflict(4)))                     # the default limit is 3
+        self.assertIn('update: conflict (counted: 4 conflict hunks > 3) - review the resolution', self.out.getvalue())
+        self.assertEqual(('counted', 4), (self.recorded()['result'], self.recorded()['hunks']))
+        self.config.write_text(json.dumps({'mergeRounds': {'smallConflictHunks': 4}}), encoding='utf-8')
+        self.assertEqual(0, self.check(self.sha('HEAD^2')))
+        self.assertEqual('small', self.recorded()['result'])
+        self.config.write_text(json.dumps({'mergeRounds': {'smallConflictHunks': 0}}), encoding='utf-8')
+        self.assertEqual(0, self.check(self.sha('HEAD^2')))
+        self.assertIn('counted: small conflicts are off', self.out.getvalue())
+        self.config.write_text(json.dumps({'mergeRounds': {'smallConflictHunks': 'many'}}), encoding='utf-8')
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(2, self.check(self.sha('HEAD^2')))
+        self.assertIn('mergeRounds.smallConflictHunks must be an integer from 0 to 20', err.getvalue())
+
+    def test_a_conflict_in_a_file_the_review_flagged_is_counted(self):
+        base = self.conflict(name='src/flagged.txt')
+        review = self.repo / '.workbench/review'
+        review.mkdir()
+        (review / 'revmux-r1.md').write_text(revmux_report([('Minor', 1)]).replace(
+            '### finding 0\n\nevidence', '### finding 0\n\n`src/other.txt:4-5`\n\n`src/flagged.txt:4` evidence'),
+            encoding='utf-8')
+        self.assertEqual(0, self.check(base))
+        self.assertIn('(small: 1 conflict hunk', self.out.getvalue())        # only the location line counts
+        (review / 'revmux-r2.md').write_text(revmux_report([('Major', 1)]).replace(
+            '### finding 0\n\nevidence', '### finding 0\n\n`flagged.txt:272-275`, `lib/x.py:3`\n\nevidence'),
+            encoding='utf-8')
+        self.out.truncate(0)
+        self.assertEqual(0, self.check(base))
+        self.assertIn('update: conflict (counted: src/flagged.txt was flagged by review)', self.out.getvalue())
+        (review / 'revmux-r2.md').unlink()
+        (self.repo / '.workbench/state/follow-ups.json').write_text(json.dumps(
+            [{'key': 'k', 'title': 't', 'file': 'src\\flagged.txt:12'}]), encoding='utf-8')
+        self.out.truncate(0)
+        self.assertEqual(0, self.check(base))
+        self.assertIn('update: conflict (counted: src/flagged.txt was flagged by review)', self.out.getvalue())
+
+    def test_an_edit_beside_a_conflict_is_counted(self):
+        # The plan v1 critique: an edit two lines from a conflict lands in the same @@ hunk.
+        base = self.conflict(extra=6)
+        diff = self.git('show', '--remerge-diff', '--format=', 'HEAD').stdout
+        self.assertEqual(1, diff.count('\n@@'))                                 # one hunk holds both
+        self.assertEqual(0, self.check(base))
+        self.assertRegex(self.out.getvalue(), r'update: conflict \(counted: the merge changes code outside the '
+                                              r'conflict regions in c\w+\.txt\)')
+        self.out.truncate(0)
+        self.assertEqual(0, self.check(self.conflict(extra=15)))               # far away: its own hunk
+        self.assertIn('counted: the merge changes code outside the conflict regions', self.out.getvalue())
+        self.out.truncate(0)
+        self.assertEqual(0, self.check(self.conflict(insert=7)))               # only a `+` line, two lines away
+        self.assertIn('counted: the merge changes code outside the conflict regions', self.out.getvalue())
+
+    def test_markers_left_in_the_result_are_counted(self):
+        self.assertEqual(0, self.check(self.conflict(resolve=False)))
+        self.assertRegex(self.out.getvalue(), r'counted: conflict markers left in c\w+\.txt')
+
+    def test_a_modify_delete_conflict_is_counted(self):
+        self.git('checkout', '-q', 'issue')
+        (self.repo / 'a.txt').unlink()
+        self.commit('the issue deletes a.txt')
+        self.reviewed = self.sha('HEAD')
+        self.git('checkout', '-q', 'main')
+        base = self.main_moves()
+        self.assertNotEqual(0, self.git('merge', '--no-ff', '-q', '-m', 'update', base, check=False).returncode)
+        self.git('rm', '-q', 'a.txt')
+        self.commit('keep it deleted')
+        self.assertEqual(0, self.check(base))
+        self.assertIn('update: conflict (counted: a.txt: modify/delete conflict)', self.out.getvalue())
+
+    def test_a_small_conflict_after_a_counted_one_does_not_block(self):
+        # AC1: a counted round first, then a small one: not counted, and the same HEAD only once.
+        self.config.write_text(json.dumps({'mergeRounds': {'conflict': 1}}), encoding='utf-8')
+        self.assertEqual(0, self.check(self.conflict(4)))
+        self.assertEqual(0, self.merge_round('conflict'))
+        self.assertIn('conflict round 1 of 1 for PR #7', self.out.getvalue())
+        self.assertEqual(0, self.check(self.conflict(1)))
+        self.assertIn('(small: 1 conflict hunk in 1 file; not counted)', self.out.getvalue())
+        self.assertEqual(0, self.merge_round('conflict'))
+        self.assertIn('conflict round (small, not counted): 1 small so far; 1 of 1 counted rounds used for PR #7',
+                      self.out.getvalue())
+        self.assertEqual(0, self.merge_round('conflict'))                       # the same HEAD again: a no-op
+        self.assertIn('1 small so far; 1 of 1 counted rounds used for PR #7 (already counted for', self.out.getvalue())
+        self.assertEqual({'update': 0, 'conflict': 1, 'conflict-small': 1}, self.rounds())
+        self.assertEqual(1, self.merge_round('conflict') if self.check(self.conflict(4)) == 0 else None)
+        self.assertIn('conflict: the limit of 1 round(s) for PR #7 is reached - this goes to the human',
+                      self.out.getvalue())
+
+    def test_large_conflicts_block_after_three(self):
+        # AC2
+        results = []
+        for _ in range(4):
+            self.assertEqual(0, self.check(self.conflict(4)))
+            results.append(self.merge_round('conflict'))
+        self.assertEqual([0, 0, 0, 1], results)
+        self.assertIn('conflict round 3 of 3 for PR #7', self.out.getvalue())
+        self.assertIn('conflict: the limit of 3 round(s) for PR #7 is reached - this goes to the human',
+                      self.out.getvalue())
+        self.assertEqual({'update': 0, 'conflict': 3, 'conflict-small': 0}, self.rounds())
+
+    def test_smallness_needs_update_check_for_this_head(self):
+        # AC5: no record, or one for another head, is counted; the planner never declares it small.
+        self.conflict(1)
+        self.assertEqual(0, self.merge_round('conflict'))
+        self.assertIn('conflict round 1 of 3', self.out.getvalue())
+        self.assertEqual(0, self.check(self.conflict(1)))
+        record = self.recorded()
+        (self.repo / '.workbench/state/update-check.json').write_text(
+            json.dumps({**record, 'head': self.reviewed}), encoding='utf-8')
+        self.assertEqual(0, self.merge_round('conflict'))
+        self.assertIn('conflict round 2 of 3', self.out.getvalue())
+        self.assertEqual({'update': 0, 'conflict': 2, 'conflict-small': 0}, self.rounds())
+
+    def test_a_kind_that_contradicts_update_check_is_refused(self):
+        self.assertEqual(0, self.check(self.conflict(1)))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(2, self.merge_round('update'))
+        self.assertIn('update-check said conflict for', err.getvalue())
+        self.assertFalse((self.repo / '.workbench/state/merge-rounds.json').exists())
+        self.git('checkout', '-q', 'main')
+        self.write('d.txt', 'main only\n')
+        self.commit('main moves cleanly')
+        base = self.sha('HEAD')
+        self.git('checkout', '-q', 'issue')
+        self.reviewed = self.sha('HEAD')
+        self.git('merge', '--no-ff', '-q', '-m', 'update', base)
+        self.assertEqual(0, self.check(base))
+        self.assertEqual('clean', self.recorded()['result'])
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(2, self.merge_round('conflict'))
+        self.assertIn('update-check said clean for', err.getvalue())
+        self.assertEqual(0, self.merge_round('update'))
+        self.assertEqual(0, self.merge_round('update'))                         # the same HEAD: counted once
+        self.assertEqual({'update': 1, 'conflict': 0, 'conflict-small': 0}, self.rounds())
 
 
 class Settings(unittest.TestCase):
@@ -2306,6 +2536,28 @@ class AutoMergeProse(unittest.TestCase):
             self.assertIn(needle, auto)
         self.assertNotIn('UPDATE <default>', text.split('### The human')[1])
 
+    def test_small_conflicts_and_the_merge_note(self):
+        # #90
+        root = Path(__file__).resolve().parent.parent
+        text = (root / 'claude/commands/start-github-issue.md').read_text(encoding='utf-8')
+        auto = ' '.join(text.split('### Auto-merge')[1].split('### The human')[0].split())
+        for needle in ['`(small: ...; not counted)`', '`(counted: <reason>)`', '`mergeRounds.smallConflictHunks`',
+                       'touches no file the review flagged', "merge-round reads update-check's record for the HEAD",
+                       'A kind that contradicts the record exits 2', 'a fourth counted conflict',
+                       'a small conflict is never refused', 'say **blocked** in the PR comment and in chat',
+                       "merge-round's refusal line verbatim", '<the `wb.py merge-round --pr <N> --summary` line>',
+                       '`merge rounds: 1 clean update; conflicts: 2 small (uncounted), 1 counted of 3`']:
+            self.assertIn(needle, auto)
+        self.assertNotIn('a second conflict', auto)
+        readme = ' '.join((root / 'README.md').read_text(encoding='utf-8').split())
+        for needle in ['3 counted conflict rounds (`mergeRounds.conflict`)', 'A **small** conflict is not counted at all',
+                       'at most 3 conflict hunks (`mergeRounds.smallConflictHunks`; 0 turns small conflicts off)',
+                       'the planner never declares a conflict small itself', 'Each merge commit is counted once',
+                       '`wb.py merge-round --pr <N> --summary`',
+                       '| `mergeRounds` | `{"conflict": 3, "smallConflictHunks": 3}` |']:
+            self.assertIn(needle, readme)
+        self.assertNotIn('1 conflict round', readme)
+
     def test_both_implementers_know_update(self):
         for path in ('claude/commands/workbench-implementer.md', 'codex/skills/workbench-implementer/SKILL.md'):
             with self.subTest(path=path):
@@ -2313,7 +2565,8 @@ class AutoMergeProse(unittest.TestCase):
                 for needle in ['## UPDATE - bring the branch up to date', '`git merge --no-ff <base sha>`',
                                '**Never rebase, never `git pull`, never amend, squash or force-push**',
                                'Add nothing else to the merge commit', 'Reply `UPDATED <sha>`',
-                               '`git merge --abort` and reply `CANNOT-RESOLVE <why>`', 'update-check']:
+                               '`git merge --abort` and reply `CANNOT-RESOLVE <why>`', 'update-check',
+                               'Change only the conflict hunks', 'makes it a counted conflict round']:   # #90
                     self.assertIn(needle, text)
 
     def test_implementer_never_merges(self):

@@ -326,6 +326,22 @@ def review_settings(config: dict) -> dict:
             "bigDiffLines": lines}
 
 
+def merge_round_settings(config: dict) -> dict:
+    """`mergeRounds.conflict` (default 3, an int in 1..10): the counted conflict UPDATE rounds per PR;
+    `mergeRounds.smallConflictHunks` (default 3, an int in 0..20; 0 turns it off): the most conflict
+    regions a small conflict may have, which is not counted (#90)."""
+    section = config.get("mergeRounds", {})
+    if not isinstance(section, dict):
+        raise SettingsError("mergeRounds must be an object")
+    conflict = section.get("conflict", 3)
+    if type(conflict) is not int or not 1 <= conflict <= 10:
+        raise SettingsError("mergeRounds.conflict must be an integer from 1 to 10")
+    small = section.get("smallConflictHunks", 3)
+    if type(small) is not int or not 0 <= small <= 20:
+        raise SettingsError("mergeRounds.smallConflictHunks must be an integer from 0 to 20")
+    return {"conflict": conflict, "smallConflictHunks": small}
+
+
 def triage_on(config: dict, repo: str) -> bool:
     section = config.get("triage")
     if not isinstance(section, dict):
