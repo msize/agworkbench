@@ -204,7 +204,7 @@ and the episode ended, run `wait-limit` again.
 ## Stall pointers (the relay's `stall:` mail)
 
 The relay also watches for a loop that sits idle with nothing to wake it: both panes idle with an
-empty composer, no unread mail (mail held for an implementer at its usage limit does not count),
+empty composer, no unread mail (mail held for a Kimi implementer at its usage limit does not count),
 no running helper, no PR open for review, no CI still running on an
 auto-merge PR, no usage-limit episode, and nothing recording that you wait on the human. After `stallMinutes` (default 15) it mails you once from `relay`, kind
 `stall`, subject `stall: loop idle for N min ...`. Usually your mail waiter was killed under memory

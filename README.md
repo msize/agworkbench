@@ -909,7 +909,8 @@ stop to ask you a question. Each of these looks exactly like a loop waiting corr
 30 s reads the relay also watches for a **stall**. A loop is stalled when both agent panes are
 provably idle (no turn running, an empty composer), no mail is unread, and no helper is running.
 Mail to a Kimi implementer whose pane shows its usage limit does not count as unread: ringing it
-woke nothing, and the relay holds that mail until the limit resets (#88).
+woke nothing, so the stall period still runs. With `-WaitOnLimit` the relay then waits the limit out;
+otherwise the stall pointer names the limit and the held mail (#88).
 It is not stalled when it is done, when it records that it waits on you (`wb.py status blocked`
 writes `.workbench/state/waiting.json`; loop.json `blocked` or `pr-open`), when a PR is open for
 your review (outside auto-merge), when an auto-merge PR still has a check running (the planner waits on
