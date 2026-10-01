@@ -87,6 +87,34 @@ class Wrapper(unittest.TestCase):
                                capture_output=True, env=dict(os.environ, LC_ALL='C.UTF-8'))
         self.assertEqual(b'1', found.stdout.strip(), found.stderr)
 
+    def test_an_args_file_runs_exactly_its_command(self):
+        # #86: wb.py suite passes the arguments in a file, so a long command still fits the session's line.
+        command = [sys.executable, '-c', 'import json, sys; print("ARGV " + json.dumps(sys.argv[1:]))',
+                   *[f'w{i}' for i in range(30)], 'a "quoted" é ' + 'z' * 3000, 'trailing\\']
+        args_file = self.folder / 'launch-suite-abc1234.json'
+        args_file.write_text(json.dumps(['--hub', str(self.hub_dir), '--label', 'abc1234', '--to', 'codex', '--',
+                                         *command], ensure_ascii=False), encoding='utf-8')
+        with contextlib.redirect_stdout(self.screen):
+            self.assertEqual(0, run_helper.main(['--args-file', str(args_file)]))
+        log = (self.hub_dir / 'review' / 'suite-abc1234.log').read_text(encoding='utf-8')
+        [line] = [line for line in log.splitlines() if line.startswith('ARGV ')]
+        self.assertEqual(command[3:], json.loads(line[len('ARGV '):]))
+        [mail] = self.mails('codex')
+        self.assertTrue(mail['subject'].startswith('suite abc1234: passed (exit 0'), mail['subject'])
+
+    def test_a_bad_args_file_is_refused(self):
+        bad = self.folder / 'bad.json'
+        for text in ('not json', '{"a": 1}', '["--hub", 1]'):
+            bad.write_text(text, encoding='utf-8')
+            with self.subTest(text=text), contextlib.redirect_stderr(io.StringIO()) as err, \
+                    self.assertRaises(SystemExit):
+                run_helper.main(['--args-file', str(bad)])
+            self.assertIn('--args-file', err.getvalue())
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            run_helper.main(['--args-file', str(bad), '--label', 'x'])
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            run_helper.main(['--args-file', str(self.folder / 'missing.json')])
+
     def test_the_marker_is_the_last_act(self):
         # G3: the marker's rows are exactly the pane's last rows, the mail line included - nothing is
         # printed after it, so the autonomous close can prove the pane untouched.
@@ -259,31 +287,28 @@ class SuiteCommand(unittest.TestCase):
         with patch.object(sys, 'argv', ['wb.py', 'suite', *argv]):
             return wb.main()
 
-    @unittest.skipUnless(sys.platform == 'win32', 'Windows quoting')
+    def launched(self):
+        """The arguments the suite's launch file passes to run_helper (#86)."""
+        argv = self.opened.call_args.args[2]
+        return run_helper.read_args_file(None, argv[2:])
+
     def test_the_session_and_its_command_line(self):
         self.assertEqual(0, self.suite('--label', '1f04542', '--', 'python', '-m', 'unittest', 'discover', '-s', 'my tests'))
-        name, cwd, line = self.opened.call_args.args
+        name, cwd, argv = self.opened.call_args.args
         self.assertEqual(('#45 suite 1f04542', self.folder.resolve(), False),
                          (name, cwd, self.opened.call_args.kwargs['select']))
-        import ctypes
-        from ctypes import wintypes
-        parse = ctypes.windll.shell32.CommandLineToArgvW
-        parse.argtypes, parse.restype = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)], ctypes.POINTER(wintypes.LPWSTR)
-        count = ctypes.c_int()
-        argv = parse(line, ctypes.byref(count))
-        parsed = [argv[i] for i in range(count.value)]
-        ctypes.windll.kernel32.LocalFree(argv)
-        self.assertEqual(str(wb.HERE / 'run_helper.py'), parsed[1])
+        args_file = self.folder.resolve() / '.workbench' / 'state' / 'helpers' / 'launch-suite-1f04542.json'
+        self.assertEqual([str(wb.HERE / 'run_helper.py'), '--args-file', str(args_file)], argv[1:])
         self.assertEqual(['--hub', str(self.folder.resolve() / '.workbench'), '--label', '1f04542', '--to', 'claude',
-                          '--', 'python', '-m', 'unittest', 'discover', '-s', 'my tests'], parsed[2:])
+                          '--', 'python', '-m', 'unittest', 'discover', '-s', 'my tests'], self.launched())
         self.assertIn("mail from 'helper' to claude", self.out.getvalue())
 
     def test_the_result_goes_to_the_callers_box(self):
         with patch.dict(os.environ, {'AI_BOX': 'codex'}):
             self.suite('--label', 'x', '--', 'python')
-        self.assertIn('--to codex', self.opened.call_args.args[2])
+        self.assertEqual(['--to', 'codex'], self.launched()[4:6])
         self.suite('--label', 'x', '--to', 'claude', '--', 'python')
-        self.assertIn('--to claude', self.opened.call_args.args[2])
+        self.assertEqual(['--to', 'claude'], self.launched()[4:6])
 
     @unittest.skipUnless(sys.platform == 'win32', '.cmd shims are Windows')
     def test_cmd_metacharacters_on_a_shim_are_refused_before_the_session_opens(self):

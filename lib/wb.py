@@ -68,25 +68,74 @@ def issue_number(root: Path, branch: str | None = None) -> str:
     return match.group(1) if match else "?"
 
 
-def pane_command(script: str, **params: str) -> str:
-    """A helper's command line for agwinterm's direct mode: Windows quoting, no shell around it (#33).
-    When the helper ends, its pane stays on screen with its input closed, so the close can prove it
-    untouched (closer.py)."""
+# agwinterm's limits on a direct-mode session.new command (Agwinterm.Pty/SessionCommand.cs, shared with
+# Lite's session_command.h): the app under 260 UTF-8 bytes, at most 16 arguments after it, each under
+# 2048 bytes. Past them the host creates nothing (#86).
+HOST_APP_BYTES, HOST_ARGS, HOST_ARG_BYTES = 260, 16, 2048
+HOST_LIMITS = "app 259 bytes, 16 arguments, 2047 bytes each"
+
+
+def utf8_size(text: str) -> int:
+    return len(text.encode("utf-8", "surrogatepass"))
+
+
+def fits_host(argv: list[str]) -> str | None:
+    """Why agwinterm would refuse this argv as a session command, or None when it fits."""
+    if not argv:
+        return "no command"
+    if utf8_size(argv[0]) >= HOST_APP_BYTES:
+        return f"the app is {utf8_size(argv[0])} bytes: {argv[0]}"
+    if len(argv) - 1 > HOST_ARGS:
+        return f"{len(argv) - 1} arguments after the app"
+    for arg in argv[1:]:
+        if utf8_size(arg) >= HOST_ARG_BYTES:
+            return f"an argument is {utf8_size(arg)} bytes: {arg[:80]}..."
+    return None
+
+
+def launch_file(root: Path, name: str) -> Path:
+    """Where a helper's launch file goes: beside the helpers' .done markers, which are the only
+    files there anything globs."""
+    directory = root / ".workbench" / "state" / "helpers"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / name
+
+
+def ps_quote(value: str) -> str:
+    """A PowerShell single-quoted literal. PowerShell takes the typographic single quotes as quotes
+    too, so they are doubled like '."""
+    return "'" + re.sub("(['\u2018\u2019\u201a\u201b])", r"\1\1", value) + "'"
+
+
+def pane_command(root: Path, tag: str, script: str, **params: str) -> list[str]:
+    """A helper's command for agwinterm's direct mode: no shell around it (#33). When the helper
+    ends, its pane stays on screen with its input closed, so the close can prove it untouched
+    (closer.py). The parameters go into a launch file, so the command stays short whatever they
+    are (#86): still one PowerShell process, the launcher calling the script."""
+    call = " ".join([f"& {ps_quote(str(HERE / script))}", *(f"-{key} {ps_quote(value)}" for key, value in params.items())])
+    launcher = launch_file(root, f"launch-{tag}.ps1")
+    # `exit $LASTEXITCODE` passes on the script's own `exit N`; a script that ends without one leaves
+    # its last native command's code instead of 0. Nothing reads a helper pane's exit code.
+    # The BOM makes Windows PowerShell 5.1 read it as UTF-8; newline="" keeps a value's own newlines.
+    launcher.write_text(f"# wb.py {tag} (#86)\n{call}\nexit $LASTEXITCODE\n", encoding="utf-8-sig", newline="")
     shell = shutil.which("pwsh") or shutil.which("powershell.exe") or "powershell.exe"
-    parts = [shell, "-NoLogo", "-ExecutionPolicy", "Bypass", "-File", str(HERE / script)]
-    for key, value in params.items():
-        parts += [f"-{key}", value]
-    return subprocess.list2cmdline(parts)
+    return [shell, "-NoLogo", "-ExecutionPolicy", "Bypass", "-File", str(launcher)]
 
 
-def helper_command(script: str, *args: str) -> str:
-    """A Python helper's command line for direct mode (#45): python itself runs in the pane, so when
-    the helper ends no shell is left in its foreground and the close can prove it untouched."""
-    return subprocess.list2cmdline([sys.executable or "python", str(HERE / script), *args])
+def helper_command(root: Path, tag: str, script: str, *args: str) -> list[str]:
+    """A Python helper's command for direct mode (#45): python itself runs in the pane, so when the
+    helper ends no shell is left in its foreground and the close can prove it untouched. Its
+    arguments go into a launch file it reads first (#86)."""
+    arguments = launch_file(root, f"launch-{tag}.json")
+    arguments.write_text(json.dumps(list(args), ensure_ascii=False), encoding="utf-8")
+    return [sys.executable or "python", str(HERE / script), "--args-file", str(arguments)]
 
 
-def open_session(name: str, cwd: Path, command: str, select: bool) -> str:
-    args = {"name": name, "cwd": str(cwd), "command": command, "command-mode": "direct"}
+def open_session(name: str, cwd: Path, argv: list[str], select: bool) -> str:
+    refusal = fits_host(argv)
+    if refusal:
+        raise SystemExit(f"wb: helper command exceeds agwinterm's session.new limits ({HOST_LIMITS}): {refusal}")
+    args = {"name": name, "cwd": str(cwd), "command": subprocess.list2cmdline(argv), "command-mode": "direct"}
     pane = agw.my_pane()
     found = agw.find_pane(pane, agw.tree()) if pane else None
     workspace = found[0].get('id') if found else None
@@ -156,7 +205,8 @@ def cmd_revmux(args: argparse.Namespace) -> int:
     scope = (root / scope_arg).resolve() if not Path(scope_arg).is_absolute() else Path(scope_arg)
     if not scope.is_file():
         raise SystemExit(f"wb: scope file not found: {scope}")
-    command = pane_command("run-revmux.ps1", Checkout=str(root), ScopeFile=str(scope),
+    tag = f"revmux-r{args.round}" + (f"-{params['Attempt']}" if "Attempt" in params else "")
+    command = pane_command(root, tag, "run-revmux.ps1", Checkout=str(root), ScopeFile=str(scope),
                            Round=str(args.round), Profile=args.profile or revmux_profile(root), **params)
     # The limited report is set aside last, and put back when the session does not start.
     done: list[tuple[Path, Path]] = []
@@ -176,7 +226,7 @@ def cmd_revmux(args: argparse.Namespace) -> int:
 
 def cmd_human_review(args: argparse.Namespace) -> int:
     root = checkout()
-    command = pane_command("human-review.ps1", Checkout=str(root), Base=args.base)
+    command = pane_command(root, "human-review", "human-review.ps1", Checkout=str(root), Base=args.base)
     sid = open_session(f"#{issue_number(root)} your review", root, command, select=True)
     print(f"human review open in session {sid}; annotations will arrive as mail from 'human'")
     return 0
@@ -198,7 +248,7 @@ def cmd_suite(args: argparse.Namespace) -> int:
     if not hub.BOX_RE.fullmatch(to):
         raise SystemExit(f"wb: --to is not a mailbox name: {to!r}")
     hub_dir = root / ".workbench"
-    line = helper_command("run_helper.py", "--hub", str(hub_dir), "--label", args.label, "--to", to, "--", *command)
+    line = helper_command(root, f"suite-{args.label}", "run_helper.py", "--hub", str(hub_dir), "--label", args.label, "--to", to, "--", *command)
     sid = open_session(f"#{issue_number(root)} suite {args.label}", root, line, select=False)
     print(f"suite {args.label} running in session {sid}; log: {hub_dir / 'review' / f'suite-{args.label}.log'}; "
           f"the result will arrive as mail from 'helper' to {to}")

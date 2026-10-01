@@ -8,6 +8,10 @@
     agwintermctl session new --name "#N your review" --cwd <checkout> `
       --command "pwsh -NoLogo -ExecutionPolicy Bypass -File <lib>\human-review.ps1 -Checkout <checkout> -Base origin/main"
 
+  wb.py human-review does this through a launch file (.workbench\state\helpers\launch-human-review.ps1)
+  that calls this script with its parameters, so the session's command line stays inside agwinterm's
+  limits (#86).
+
   revdiff is umputun's TUI for annotating a diff. Annotate what you want changed, press q, and the
   annotations are posted to Claude's mailbox; the relay rings Claude, which turns them into a review
   round for Codex. Quit without annotating and Claude is told you had nothing to add.

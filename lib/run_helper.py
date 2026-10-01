@@ -5,6 +5,9 @@ wb.py suite opens this in its own visible session, in agwinterm's direct mode:
 
   python lib/run_helper.py --hub <checkout>\\.workbench --label 1f04542 --to claude -- python -m unittest discover -s tests
 
+wb.py passes those arguments in a file instead, `--args-file <checkout>\\.workbench\\state\\helpers\\launch-suite-<label>.json`
+(a JSON list), so the session's command line stays inside agwinterm's limits whatever the command is (#86).
+
 It runs the command with no shell around it (argv[0] resolved on PATH with PATHEXT; a `.ps1` gets
 `pwsh -File`, a `.cmd`/`.bat` shim such as npm or gradlew gets `cmd /d /s /c`), echoes its
 output to the pane, and writes it to `.workbench/review/suite-<label>.log` as UTF-8 without a BOM,
@@ -24,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import codecs
+import json
 import os
 import re
 import shutil
@@ -232,6 +236,20 @@ def echo_to_pane(text: str) -> None:
     sys.stdout.flush()
 
 
+def read_args_file(parser: argparse.ArgumentParser, argv: list[str]) -> list[str]:
+    """`--args-file <file>`: the arguments as a JSON list, which wb.py suite writes so the session's
+    command line stays inside agwinterm's limits whatever the command is (#86)."""
+    if len(argv) != 2:
+        parser.error("--args-file takes one file and nothing else")
+    try:
+        loaded = json.loads(Path(argv[1]).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as err:
+        parser.error(f"--args-file {argv[1]}: {err}")
+    if not isinstance(loaded, list) or not all(isinstance(item, str) for item in loaded):
+        parser.error(f"--args-file {argv[1]}: not a JSON list of strings")
+    return loaded
+
+
 def main(argv: list[str] | None = None) -> int:
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
@@ -244,6 +262,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--label", required=True, help="names the log and the session, e.g. the head's short sha")
     parser.add_argument("--to", default="claude", help="the mailbox the result goes to (default claude)")
     parser.add_argument("command", nargs=argparse.REMAINDER, help="-- then the command and its arguments")
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["--args-file"]:
+        argv = read_args_file(parser, argv)
     args = parser.parse_args(argv)
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not LABEL_RE.fullmatch(args.label):
