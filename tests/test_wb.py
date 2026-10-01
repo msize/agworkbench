@@ -3202,7 +3202,11 @@ class WaitLimit(unittest.TestCase):
         'Kimi rate limited', 'codex hit rate limit', 'codex hit its rate limit', 'Kimi plan limit reached',
         'kimi is over its limit', 'codex exceeded its limit', 'codex: limited', 'kimi: limit reached', 'kimi-code limited',
         'implementer usage-limited', "claude: You've hit your limit", "claude: You’ve hit your session limit",
-        'codex out of credits', 'Kimi: Error: [provider.auth_error] 403 exceeded your current quota')
+        'codex out of credits', 'Kimi: Error: [provider.auth_error] 403 exceeded your current quota',
+        # FIX r3: the window in hours, Kimi's own wording with no limit word, and (no bare keyword) Claude's
+        # own message, which only limits.LIMITED and the apostrophe fold catch.
+        'kimi exhausted; resets in 5 hours', 'Kimi: insufficient balance; please recharge your account',
+        'kimi: Error: [provider.billing] insufficient balance', 'claude: You’ve hit your budget')
     # Rounds 1-2: real blocks that mention a limit - the human answers them, with --needs-human.
     REAL_BLOCKS = (
         'GitHub API rate limit', 'CI runner limited', 'disk quota exceeded', 'GitHub Actions minutes quota exhausted',
@@ -3265,6 +3269,10 @@ class WaitLimit(unittest.TestCase):
                         '`--environmental --needs-human`', 'wait-limit --reason'):
             with self.subTest(command=command):
                 self.assertIn(command, usage)
+        # FIX r3 M1: where the doc names an environmental block, an agent's usage limit still goes to wait-limit.
+        environmental = ' '.join(doc.split('is **environmental**')[1].split('A question for the human')[0].split())
+        self.assertIn('wb.py wait-limit', environmental)
+        self.assertLess(environmental.index('wait-limit'), environmental.index('--needs-human'))
         # Every prescribed reason that mentions a limit carries the answer.
         for command, reason in re.findall(r'(loop-state blocked[^`"]*)--reason "([^"]*)"', doc):
             if wb.limit_reason(reason):

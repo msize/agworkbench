@@ -145,7 +145,7 @@ usage-limit message but no `... waiting` mail came. **Never report `blocked` for
 a blocked loop waits for the human, and this loop must resume by itself. Here `wb.py loop-state blocked`
 refuses any reason that mentions a limit (`limit`, `quota`, `credit`, `5h`, `403`, an agent's own limit
 message) until you answer which it is: an agent's usage limit goes to `wait-limit`, and a block that
-really needs the human (a GitHub, CI or disk limit, a Codex warning chooser, a refused failover) is
+really needs the human (a GitHub, CI or disk limit, a Codex warning chooser that could not fail over) is
 reported with `--needs-human` added. Run
 `python "$AGWORKBENCH/lib/wb.py" wait-limit --reason "<the limit line>"` (add `--box claude` for your
 own limit). On its next check the relay starts the same wait: a `... waiting` mail, held mail, a probe every
@@ -258,7 +258,8 @@ to merge. The conductor admits the next issue while this session continues handl
 
 A block the human cannot answer - a usage limit you could not fail over, low disk or low memory -
 is **environmental**: report it with `wb.py loop-state blocked --environmental --reason "..."` (in an
-`onLimit=wait` checkout a reason that mentions a limit also needs `--needs-human`; see Usage limits). The
+`onLimit=wait` checkout an agent's usage limit is never blocked: run `wb.py wait-limit`, see Usage limits;
+any other reason that mentions a limit needs `--needs-human`). The
 member keeps its queue slot, so the conductor does not start another issue on the same broken
 tool. A question for the human is a plain `loop-state blocked` and frees the slot.
 

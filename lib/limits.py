@@ -58,6 +58,12 @@ CLAUDE_ITEM_RE = re.compile(r"^\s*[●⎿>❯✻✳✶✢✽⚠·]\s")
 # Codex draws each history cell from column 0 behind its glyph; indented rows belong to a cell.
 CODEX_CELL_RE = re.compile(r"^[^\s\w]\s")
 
+# Kimi's quota wording, without the session error's `Error: [provider.<x>]` prefix: wb.py's blocked-reason
+# check (#88) matches it in free text too.
+KIMI_QUOTA = (r"exceeded_current_quota_error|exceeded your current (?:token )?quota"
+              r"|insufficient balance|check your account balance|recharge your account|please recharge"
+              r"|account (?:is )?in arrears|usage limit|(?:weekly|daily|monthly|hourly|5-hour|plan) limit")
+
 LIMITED = {
     "codex": [
         r"You've hit your usage limit\b",
@@ -73,11 +79,7 @@ LIMITED = {
     ],
     # Kimi's quota code and message patterns (KIMI_QUOTA_EXHAUSTED_*, see strings-kimi.txt), plus the
     # words a plan's usage limit would use, anywhere in the session error's message.
-    "kimi": [
-        r"Error: \[provider\.[a-z_]+\] .*?(?:exceeded_current_quota_error|exceeded your current (?:token )?quota"
-        r"|insufficient balance|check your account balance|recharge your account|please recharge"
-        r"|account (?:is )?in arrears|usage limit|(?:weekly|daily|monthly|hourly|5-hour|plan) limit)",
-    ],
+    "kimi": [r"Error: \[provider\.[a-z_]+\] .*?(?:" + KIMI_QUOTA + ")"],
 }
 WARNING_CODEX = [r"Approaching rate limits\b", r"Heads up, you have less than \d+% of your \w+ limit left\b",
                  r"Switch to \S+ for lower credit usage\?"]

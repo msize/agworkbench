@@ -287,7 +287,8 @@ def cmd_status(args: argparse.Namespace) -> int:
 # limit", "codex limited; failover is off"). So in a -WaitOnLimit checkout every limit word is a question,
 # which the planner answers: `wb.py wait-limit` for an agent's limit, `--needs-human` for anything else.
 # The agents' own limit messages (limits.LIMITED) count too.
-LIMIT_REASON = re.compile("|".join([r"limit", r"quota", r"credit", r"5[- ]?h(?:our)?\b", r"\b403\b",
+LIMIT_REASON = re.compile("|".join([r"limit", r"quota", r"credit", r"5[- ]?h(?:ours?)?\b", r"\b403\b",
+                                    limits.KIMI_QUOTA,
                                     *(pattern for patterns in limits.LIMITED.values() for pattern in patterns)]),
                           re.IGNORECASE)
 
@@ -307,7 +308,7 @@ def cmd_loop_state(args: argparse.Namespace) -> int:
         print('wb: loop-state: this checkout waits out usage limits (onLimit=wait), and the reason names a '
               'limit. If an agent is at its usage limit, run `wb.py wait-limit --reason ...`: the relay waits '
               'it out. If this block really needs the human (a GitHub, CI or disk limit, a Codex warning '
-              'chooser, a refused failover), rerun with --needs-human.', file=sys.stderr)
+              'chooser that could not fail over), rerun with --needs-human.', file=sys.stderr)
         return 1
     if args.state == 'done':
         code = (loop_done_no_pr(checkout(), args.reason, args.pr) if getattr(args, 'no_pr', False)
@@ -2372,7 +2373,7 @@ def main() -> int:
                    help='blocked: by a limited tool, low disk or memory, not a question; the member keeps its queue slot (#61)')
     p.add_argument('--needs-human', action='store_true',
                    help='blocked, in a -WaitOnLimit checkout: the reason names a limit, but not an agent usage '
-                        'limit to wait out (a GitHub, CI or disk limit, a refused failover); the human must answer (#88)')
+                        'limit to wait out (a GitHub, CI or disk limit, a Codex warning chooser that could not fail over); the human must answer (#88)')
     p.set_defaults(func=cmd_loop_state)
     p = subs.add_parser('wait-limit', help='-WaitOnLimit: have the relay wait out a usage limit it did not detect (#88)')
     p.add_argument('--box', default='codex', choices=['codex', 'claude'], help='the limited agent (default: codex)')
