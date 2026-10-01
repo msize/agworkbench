@@ -9,9 +9,9 @@
     agwintermctl session new --name "#N revmux r1" --cwd <checkout> --no-select `
       --command "pwsh -NoLogo -ExecutionPolicy Bypass -File <lib>\run-revmux.ps1 -Checkout <checkout> -ScopeFile <file> -Round 1"
 
-  wb.py revmux does this through a launch file (.workbench\state\helpers\launch-revmux-r<K>.ps1) that
-  calls this script with its parameters, so the session's command line stays inside agwinterm's
-  limits however long they are (#86).
+  wb.py revmux does this through a launch file (.workbench\state\helpers\launch-revmux-r<K>.ps1, or
+  launch-revmux-r<K>-<n>.ps1 for rerun attempt n) that calls this script with its parameters, so the
+  session's command line stays inside agwinterm's limits however long they are (#86).
 
   The revmux TUI stays on screen in that session. stdout is the report and stderr is progress,
   so only stdout goes to the file - merging them makes the report unreadable. When revmux exits the
