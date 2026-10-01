@@ -1195,10 +1195,14 @@ class MergeReadiness(unittest.TestCase):
         self.config.write_text(json.dumps({'mergeRounds': {'conflict': 0}}), encoding='utf-8')
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            self.assertEqual(2, self.merge_round(7, 'update'))
+            self.assertEqual(2, self.merge_round(7, 'conflict'))
             self.assertEqual(2, self.merge_round(7, 'summary'))
         self.assertIn('mergeRounds.conflict must be an integer from 1 to 10', err.getvalue())
         self.assertEqual({'pr': 7, 'conflict': 1}, json.loads((self.state / 'merge-rounds.json').read_text()))
+        # r1 M1: an invalid mergeRounds never blocks counting the kinds it does not configure.
+        self.assertEqual([0, 0], [self.merge_round(7, 'update'), self.merge_round(7, 'ci-fix')])
+        self.assertEqual({'pr': 7, 'conflict': 1, 'update': 1, 'ci-fix': 1},
+                         json.loads((self.state / 'merge-rounds.json').read_text()))
         self.assertFalse(wb.round_used(self.folder, '7', 'conflict'))          # invalid: the code's limit (3)
         with contextlib.redirect_stderr(io.StringIO()), patch.object(sys, 'argv', ['wb.py', 'merge-round', '--pr', '7']):
             self.assertEqual(2, wb.main())                                     # neither --kind nor --summary
@@ -1287,6 +1291,17 @@ class MergeReadiness(unittest.TestCase):
             self.assertIn('rerun started: 2 check(s) pending again - start wb.py wait-ci', self.out.getvalue())
             self.assertEqual(1, wb.main())                                     # the one rerun is used
         self.assertEqual([['gh', 'run', 'rerun', '11', '--failed', '--repo', 'o/r']], [c for c in calls if c[1:3] == ['run', 'rerun']])
+
+    def test_an_invalid_merge_rounds_config_never_leaves_a_rerun_uncounted(self):
+        # #90 r1 M1: the rerun started, so it must be counted, and the next ci-rerun refused.
+        self.config.write_text(json.dumps({'mergeRounds': {'conflict': 0}}), encoding='utf-8')
+        calls = self.gh_boundary([check('build', 'fail', link='https://github.com/o/r/actions/runs/11/job/22')],
+                                 requeue_after=1)
+        with patch.object(sys, 'argv', ['wb.py', 'ci-rerun', '--pr', '7']):
+            self.assertEqual(0, wb.main())
+            self.assertEqual(1, wb.main())
+        self.assertEqual({'pr': 7, 'ci-rerun': 1}, json.loads((self.state / 'merge-rounds.json').read_text()))
+        self.assertEqual(1, len([c for c in calls if c[1:3] == ['run', 'rerun']]))
 
     def test_ci_rerun_counts_nothing_unless_a_rerun_started(self):
         # r22 M2: exit 2 is operational (retry), 1 is only a refusal; the round is spent only on a start.
@@ -1514,6 +1529,40 @@ class UpdateCheck(unittest.TestCase):
         self.out.truncate(0)
         self.assertEqual(0, self.check(base))
         self.assertIn('update: conflict (counted: src/flagged.txt was flagged by review)', self.out.getvalue())
+
+    def test_any_path_a_finding_names_is_flagged(self):
+        # r1 M2: brackets, a dot-less name with a line, and a space are paths; a bare word is not.
+        self.assertEqual('app/[id]/page.tsx', wb.location_file('app/[id]/page.tsx:12', token=True))
+        self.assertEqual('Makefile', wb.location_file('Makefile:3', token=True))
+        self.assertEqual('src/my file.py', wb.location_file('src/my file.py:3-9', token=True))
+        self.assertEqual('lib/x.py', wb.location_file('lib\\x.py:272-275:4', token=True))
+        for word in ('refuses', 'Makefile', '--force', ''):
+            self.assertEqual('', wb.location_file(word, token=True), word)
+        self.assertEqual('Makefile', wb.location_file('Makefile'))              # a follow-up's file: any path
+        review = self.repo / '.workbench/review'
+        review.mkdir()
+        (review / 'revmux-r1.md').write_text(revmux_report([('Major', 1)]).replace(
+            '### finding 0\n\nevidence', '### finding 0\n\n`src/my file.py:3` and `refuses`\n\nevidence'),
+            encoding='utf-8')
+        self.assertEqual(0, self.check(self.conflict(name='src/my file.py')))
+        self.assertIn('update: conflict (counted: src/my file.py was flagged by review)', self.out.getvalue())
+        (self.repo / '.workbench/state/follow-ups.json').write_text(json.dumps(
+            [{'key': 'k', 'title': 't', 'file': 'app/[id]/page.tsx'}]), encoding='utf-8')
+        self.out.truncate(0)
+        self.assertEqual(0, self.check(self.conflict(name='app/[id]/page.tsx')))
+        self.assertIn('update: conflict (counted: app/[id]/page.tsx was flagged by review)', self.out.getvalue())
+        self.out.truncate(0)
+        self.assertEqual(0, self.check(self.conflict(name='Makefile')))        # named by no finding: small
+        self.assertIn('(small: 1 conflict hunk in 1 file', self.out.getvalue())
+
+    def test_diff_noprefix_does_not_hide_a_flagged_file(self):
+        # r1 m1: a noprefix diff has no a/ b/, so the path would never match.
+        self.git('config', 'diff.noprefix', 'true')
+        (self.repo / '.workbench/state').mkdir(parents=True, exist_ok=True)
+        (self.repo / '.workbench/state/follow-ups.json').write_text(json.dumps(
+            [{'key': 'k', 'title': 't', 'file': 'lib/x.py:4'}]), encoding='utf-8')
+        self.assertEqual(0, self.check(self.conflict(name='lib/x.py')))
+        self.assertIn('update: conflict (counted: lib/x.py was flagged by review)', self.out.getvalue())
 
     def test_an_edit_beside_a_conflict_is_counted(self):
         # The plan v1 critique: an edit two lines from a conflict lands in the same @@ hunk.

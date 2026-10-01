@@ -2193,10 +2193,14 @@ def update_check_path(root: Path) -> Path:
     return root / ".workbench" / "state" / "update-check.json"
 
 
-def location_file(text: str | None) -> str:
-    """A finding's location (`path:272-275`, `path:3:7`, `path`) as a path, or "" when it is not one."""
-    name = LOCATION_RANGE.sub("", followup.normalise_file(text))
-    if not re.fullmatch(r"[\w./@+-]+", name) or not re.search(r"[./]", name) or name.startswith("-"):
+def location_file(text: str | None, token: bool = False) -> str:
+    """A finding's location (`path:272-275`, `path:3:7`, `path`) as a path, or "" when it is not one.
+    Any path counts (`app/[id]/page.tsx`, `src/my file.py`). A backticked `token` from a report must
+    not start with `-`, and one with neither a dot nor a slash counts only with a line (`Makefile:3`),
+    so a bare word such as `refuses` is no path."""
+    lined = bool(LOCATION_RANGE.search((text or "").strip()))
+    name = LOCATION_RANGE.sub("", followup.normalise_file(text)).strip()
+    if token and (name.startswith("-") or not (lined or re.search(r"[./]", name))):
         return ""
     return name
 
@@ -2219,7 +2223,7 @@ def review_flagged_files(root: Path) -> set[str]:
                 pending = section in sections
             elif pending and line.strip():
                 pending = False            # the first non-empty line after the heading: the location
-                files.update(name for token in re.findall(r"`([^`]+)`", line) if (name := location_file(token)))
+                files.update(name for token in re.findall(r"`([^`]+)`", line) if (name := location_file(token, token=True)))
     files.update(name for item in load_follow_ups(root) if (name := location_file(item.get("file"))))
     return files
 
@@ -2250,9 +2254,9 @@ def remerge_files(diff: str) -> list[dict]:
         elif line.startswith("Binary files "):
             files[-1]["binary"] = True
         elif line.startswith("--- a/"):
-            files[-1]["old"] = line[6:].strip('"')
+            files[-1]["old"] = line[6:].rstrip("\t").strip('"')        # git adds a TAB after a path with a space
         elif line.startswith("+++ b/"):
-            files[-1]["new"] = line[6:].strip('"')
+            files[-1]["new"] = line[6:].rstrip("\t").strip('"')
     for entry in files:
         entry["path"] = entry.pop("new") or entry.pop("old", "") or entry["path"]
         entry.pop("old", None)
@@ -2370,7 +2374,8 @@ def cmd_update_check(args: argparse.Namespace) -> int:
         if failures:
             print("\n".join(f"update-check: {line}" for line in failures))
             return 1
-        remerge = git_out(root, "-c", "core.quotepath=false", "show", "--remerge-diff", "--format=", "HEAD").strip()
+        remerge = git_out(root, "-c", "core.quotepath=false", "show", "--remerge-diff", "--format=",
+                         "--src-prefix=a/", "--dst-prefix=b/", "HEAD").strip()     # whatever diff.noprefix says
     except (RuntimeError, OSError) as err:
         print(f"update-check: {err}")
         return 1
@@ -2426,11 +2431,13 @@ def cmd_merge_round(args: argparse.Namespace) -> int:
     if bool(args.kind) == bool(summary):
         print("wb: merge-round needs --kind or --summary", file=sys.stderr)
         return 2
-    try:
-        limits = merge_round_limits()
-    except followup.SettingsError as err:
-        print(f"wb: merge-round: {err}", file=sys.stderr)
-        return 2
+    limits = ROUND_LIMITS
+    if summary or args.kind == "conflict":         # mergeRounds never blocks counting the other kinds
+        try:
+            limits = merge_round_limits()
+        except followup.SettingsError as err:
+            print(f"wb: merge-round: {err}", file=sys.stderr)
+            return 2
     path = rounds_path(root)
     try:
         record = json.loads(path.read_text(encoding="utf-8-sig"))
