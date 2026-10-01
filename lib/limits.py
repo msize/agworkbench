@@ -19,7 +19,11 @@ greps, test output and fixture dumps - so a phrase counts only by POSITION, neve
   `/export-debug-zip`..."). The message must name a quota or usage limit: a bare
   `[provider.rate_limit]` is a transient 429 that Kimi already retried, not a reason to fail over.
   Kimi draws that status row with no glyph and no blank row above it, at the same indent as a
-  message continuation, so the hint row below it is what places it.
+  message continuation, so the hint row below it is what places it. Under a tool call the rows count
+  only when the call's output provably ended above them (#88): a successful call collapsed to ONE row
+  marked `…` right above the error, or a status row wrapped to column 1 (output rows never wrap). The
+  error may wrap over up to 8 rows and the hint over 3. `kimi_turn_limit` drops the owner rule for the
+  relay's safety nets (the stall watch, a forced wait episode).
 - Any tool exited: the last row is a shell prompt and the phrase starts one of the rows just
   above it, in the output since the previous prompt.
 
@@ -241,7 +245,15 @@ def _codex_warning(rows: list[str]) -> Limit | None:
     return Limit("warning", found.strip()) if found else None
 
 
-def _kimi(rows: list[str]) -> Limit | None:
+def _kimi_collapsed(row: str) -> bool:
+    """One outcome row standing for a longer output (Kimi 2.1.1 outcomeLine): `  … last line` or `  first
+    line …`. The marker sits in a fixed head or tail, a space away from the text, so a width cut
+    (`by na…`) is not one."""
+    text = row.strip()
+    return text.startswith("… ") or text.endswith(" …")
+
+
+def _kimi(rows: list[str], owner_check: bool = True) -> Limit | None:
     filled = [i for i, row in enumerate(rows) if row.strip()]
     bottom = next((i for i in reversed(filled) if KIMI_BOTTOM_RE.match(rows[i])), None)
     if bottom is None or sum(1 for i in filled if i > bottom) > 3:
@@ -256,17 +268,15 @@ def _kimi(rows: list[str]) -> Limit | None:
         above = above[:-1]
     if not above or KIMI_SPINNER_RE.match(above[-1]):
         return None                        # a running turn, or its retries: any error on screen is old
-    # The hint is the last row, or the last two when it wraps.
-    hint = next((i for i in range(len(above) - 1, max(len(above) - 3, -1), -1) if KIMI_HINT_RE.match(above[i])), None)
+    # The hint is the last row, or starts up to 2 rows above it when it wraps (#88: 3 rows at 60 columns).
+    hint = next((i for i in range(len(above) - 1, max(len(above) - 4, -1), -1) if KIMI_HINT_RE.match(above[i])), None)
     if hint is None or any(not row.strip() or KIMI_ITEM_RE.match(row) for row in above[hint + 1:]):
         return None
-    for start in range(hint - 1, max(hint - 5, -1), -1):
+    # The error wraps over up to 7 rows below it in a narrow pane (#88).
+    for start in range(hint - 1, max(hint - 9, -1), -1):
         row = above[start]
         if KIMI_ERROR_RE.match(row):
-            # The status row is glued to the item above it, so that item decides: a message or a
-            # prompt is where a session error lands; a tool call means these are its output rows.
-            owner = next((r for r in reversed(above[:start]) if KIMI_ITEM_RE.match(r)), "")
-            if KIMI_TOOL_RE.match(owner):
+            if owner_check and not _kimi_owner_allows(above, start):
                 return None
             message = " ".join(part.strip() for part in above[start:hint])
             if _starts_with(message, LIMITED["kimi"], LIMIT_GLYPH["kimi"]):
@@ -275,6 +285,33 @@ def _kimi(rows: list[str]) -> Limit | None:
         if not row.strip() or KIMI_ITEM_RE.match(row):
             return None                    # the hint follows something else: not a session error
     return None
+
+
+def _kimi_owner_allows(above: list[str], start: int) -> bool:
+    """The status row is glued to the item above it, so that item decides: a message or a prompt is
+    where a session error lands. Under a tool call the rows may be its output (#65), unless that output
+    provably ended above them (#88): a successful call (`●`) draws at most 3 rows, each cut to one row,
+    or ONE row marked with `…` - so the error right after that one marked row is not output - and a
+    status row wraps to column 1, where no output row ever starts. A failed call (`✗`) draws its whole
+    output, as does one expanded with ctrl+o, so its rows are never placed."""
+    owner = next((i for i in range(start - 1, -1, -1) if KIMI_ITEM_RE.match(above[i])), None)
+    if owner is None or not KIMI_TOOL_RE.match(above[owner]):
+        return True
+    if above[owner].lstrip().startswith("✗"):
+        return False
+    if start == owner + 2 and _kimi_collapsed(above[owner + 1]):
+        return True
+    return any(len(row) - len(row.lstrip(" ")) == 1 for row in above[start:])
+
+
+def kimi_turn_limit(text: str) -> Limit | None:
+    """#88: the frame ends in a Kimi limit session error, whatever item owns it - `_kimi`'s positional
+    rules without the owner check. Only for the safety nets, where other evidence already stands: the
+    stall watch (15 idle minutes) and an episode the relay already waits out."""
+    rows = _rows(text)
+    if not rows or shell_prompt(rows):
+        return None
+    return _kimi(rows, owner_check=False)
 
 
 def classify(text: str, tool: str) -> Limit | None:

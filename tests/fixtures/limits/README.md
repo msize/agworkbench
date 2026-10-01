@@ -49,3 +49,12 @@ seen, add it here verbatim.
 (`Error: [provider.auth_error] 403 You've reached your 5-hour usage limit ... Your quota will reset when
 the current 5-hour window ends.`), wrapped over two rows. That text is real; the rows around it are
 synthesised like the others.
+
+`kimi-limited-5hour-tool.txt` (#88) is the first **real** Kimi limit frame: docxy #775's implementer
+pane, 2026-10-01, as the issue quotes it. Its seven rows from `● Ran a command` to `Please don't share
+it publicly.` are verbatim. Only the header's 1-column pane margin is restored, so it matches the rows
+below it. The prompt and message above them, the composer box and the status rows are synthesised. The frame shows
+what the synthesised ones could not: the session error glued under a successful tool call whose output
+collapsed to one `…` row, and a status row that wraps to column 1 while tool output sits at column 3.
+`kimi-limited-5hour-narrow.txt` is the same frame re-wrapped for a 60-column pane (`textwrap` at the
+width that reproduces the real rows): the error spans 5 rows and the hint 3.
