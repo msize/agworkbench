@@ -587,9 +587,15 @@ on, you merge only when **all** of these hold:
    It refuses anything but one merge commit of that base onto the reviewed head, with a clean tree
    (exit 1: the human's). It prints `update: clean` (git's own merge, nothing added) or
    `update: conflict` (a non-empty `git show --remerge-diff`: read that diff like a fix - resolved
-   conflicts and anything else added in the merge). Then count it:
-   `wb.py merge-round --pr <N> --kind update` for clean, `--kind conflict` for conflict. A refusal
-   (the fourth clean catch-up, or a second conflict) or `CANNOT-RESOLVE` goes to the human. Push with
+   conflicts and anything else added in the merge). A conflict is `(small: ...; not counted)` or
+   `(counted: <reason>)` (#90). It is small when it has at most `mergeRounds.smallConflictHunks`
+   conflict hunks (3), changes nothing outside them, and touches no file the review flagged. Then count
+   it: `wb.py merge-round --pr <N> --kind update` for clean, `--kind conflict` for conflict.
+   merge-round reads update-check's record for the HEAD, so a small conflict is never counted and you
+   never choose that yourself. A kind that contradicts the record exits 2. A refusal (the fourth clean
+   catch-up, or a fourth counted conflict; a small conflict is never refused) or `CANNOT-RESOLVE` goes
+   to the human. On a refusal, say **blocked** in the PR comment and in chat, with merge-round's
+   refusal line verbatim. Push with
    a plain `git push` (never `--force` or `--force-with-lease`; a rejected push means the remote
    moved - a new round), then wait-ci and merge-check with the new head.
 
@@ -607,9 +613,11 @@ gh pr comment <N> --repo <owner/repo> --body-file .workbench/merge-note.md
 ```
 
 The note states each condition as a checked fact: "Merged automatically (auto-merge is on for this
-checkout): <the `wb.py review-round --summary` line>; whole suite green on <sha> (<count> tests);
-merge-check ok." That line is `review clean after round K`, or `review stopped: round K had no Major;
-N minor finding(s) in <leftovers URL>` once the follow-ups are filed. It ends with the planner marker line. The relay then reports the merge, and Phase 7
+checkout): <the `wb.py review-round --summary` line>; <the `wb.py merge-round --pr <N> --summary`
+line>; whole suite green on <sha> (<count> tests); merge-check ok." That line is `review clean after round K`, or `review stopped: round K had no Major;
+N minor finding(s) in <leftovers URL>` once the follow-ups are filed. The merge-round line says each
+UPDATE round's decision, for example `merge rounds: 1 clean update; conflicts: 2 small (uncounted), 1
+counted of 3` (#90). It ends with the planner marker line. The relay then reports the merge, and Phase 7
 runs as for a human merge. In queue mode, report `loop-state pr-open` first, as below.
 
 If any condition fails, do not merge. Post merge-check's failure lines (or which of conditions 1-2

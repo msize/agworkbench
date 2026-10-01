@@ -864,13 +864,27 @@ a clean-reviewed PR cannot merge yet itself. merge-check names each one:
 |---|---|
 | `ci-pending:` | Checks are still running, required or optional (a check that never started counts too); a failure is reported only once nothing runs. `wb.py wait-ci` waits in the background, and the check runs again when CI is done. It never counts a head without any check yet as done: a repo with no CI at all is "done" only after 5 minutes of no checks. |
 | `ci-failed:` | A required check failed. A GitHub Actions run is rerun once (`wb.py ci-rerun`). If it is still red, one fix round follows, with the failed jobs' log (`wb.py ci-log`) as evidence. If it is still red after that, it's yours. |
-| `behind:` / `conflict:` | An **UPDATE round**. The planner fetches, and the implementer merges exactly that base commit into the branch with `git merge --no-ff`: never a rebase, never a force-push, and nothing else in the merge. It runs the whole suite. `wb.py update-check` then proves the result is one merge commit of that base onto the reviewed head, with a clean tree. If `git show --remerge-diff` is empty, the merge is clean. If not, the resolution is reviewed like a fix. |
+| `behind:` / `conflict:` | An **UPDATE round**. The planner fetches, and the implementer merges exactly that base commit into the branch with `git merge --no-ff`: never a rebase, never a force-push, and nothing else in the merge. It runs the whole suite. `wb.py update-check` then proves the result is one merge commit of that base onto the reviewed head, with a clean tree. If `git show --remerge-diff` is empty, the merge is clean. If not, the resolution is reviewed like a fix, and update-check calls the conflict **small** or **counted** (#90). |
 | `ci-optional-failed:` and everything else | Final: the PR waits for you. |
 
 Only the required checks count when branch protection names any; otherwise every check that ran
-counts. The limits are kept in code (`wb.py merge-round`, per PR): 3 clean catch-ups, 1 conflict
-round, 1 CI rerun and 1 CI fix round. Anything beyond them, or `CANNOT-RESOLVE` from the
-implementer, goes to you. Without auto-merge none of this runs: the lines are only reported.
+counts. The limits are kept in code (`wb.py merge-round`, per PR): 3 clean catch-ups, 3 counted
+conflict rounds (`mergeRounds.conflict`), 1 CI rerun and 1 CI fix round. Anything beyond them, or
+`CANNOT-RESOLVE` from the implementer, goes to you. Without auto-merge none of this runs: the lines
+are only reported.
+
+A **small** conflict is not counted at all (#90), so a long-running PR on a busy main is not stopped
+by a one-line import clash. A conflict is small when it meets all three conditions:
+- it has at most 3 conflict hunks (`mergeRounds.smallConflictHunks`; 0 turns small conflicts off);
+- the merge changes nothing outside them: no edit to code git merged cleanly, no modify/delete or
+  binary conflict, and no marker left in the result;
+- no conflicted file is one that the PR's review flagged: a revmux finding's location, or a recorded
+  follow-up's file.
+
+`update-check` decides this from the remerge-diff and records it for that merge commit.
+`merge-round --kind conflict` reads the record, so the planner never declares a conflict small itself.
+Each merge commit is counted once. The merge note carries `wb.py merge-round --pr <N> --summary`, for
+example `merge rounds: 1 clean update; conflicts: 2 small (uncounted), 1 counted of 3`.
 
 If any condition fails, the reasons go on the PR and in chat, and the PR waits for you as usual.
 The choice is saved per checkout like the implementer: a rerun without the switch keeps it,
@@ -940,6 +954,7 @@ the result mail's id and box, so the relay can close it once that mail has been 
 | `triage` | none | per product repo: `{"owner/repo": {"specRepos": [...], "model": "...", "kimiLabel": false}}`, the private spec repos `-Triage` judges against, and whether it also sets the `kimi` label (see Issue triage) |
 | `followUp` | `{"dedupe": true, "bumpAt": {"P2": 2, "P1": 3, "P0": 5}}` | `dedupe: false` skips duplicate matching: separate items keep #27's filing, leftovers still share one issue per PR (per item without `--pr`); `bumpAt` is the total number of reports that raises a matched issue to each priority |
 | `review` | `{"stopWhenNoMajor": true, "minRounds": 1, "maxRounds": 5, "maxRoundsBig": 10, "bigDiffLines": 1500}` | `stopWhenNoMajor: false` keeps reviewing until a round has no findings at all (up to the review cap); `minRounds` (1-5, at most `maxRounds`) is the first round that may stop review; `maxRounds` (1-20) is the review cap, `maxRoundsBig` (`maxRounds`-20, default the larger of 10 and `maxRounds`) the cap of a big issue, and `bigDiffLines` (1 or more) the diff size that makes an issue big |
+| `mergeRounds` | `{"conflict": 3, "smallConflictHunks": 3}` | `conflict` (1-10) is the number of counted conflict UPDATE rounds per PR; `smallConflictHunks` (0-20) is the most conflict hunks a small, uncounted conflict may have, and 0 turns small conflicts off (#90) |
 | `autonomous` | `false` | full autonomy: merge, file follow-up issues, close the sessions after the merge; implies `autoMerge` |
 | `cleanup` | `"merged"` | after an autonomous close: `merged` deletes the checkout when it is safe, `build` deletes only its build outputs, `off` keeps it (see Cleaning up checkouts) |
 | `minFreeGB` | `20` | the queue admits no member while the checkout drive has less free space (GiB); `0` turns the guard off |
