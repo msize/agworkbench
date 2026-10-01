@@ -140,6 +140,17 @@ idle agent composer, which is theirs to clear. A Codex `warning` chooser is not 
 the failover path below. When you are the limited one, you simply resume when the relay's pointer
 reaches you: read your unread mail and carry on.
 
+**A limit the relay did not detect** (#88), in an `onLimit=wait` checkout: an agent's pane shows its
+usage-limit message but no `... waiting` mail came. **Never report `blocked` for a usage limit**:
+a blocked loop waits for the human, and this loop must resume by itself (`wb.py loop-state blocked`
+refuses a reason that names a usage limit here). Run
+`python "$AGWORKBENCH/lib/wb.py" wait-limit --reason "<the limit line>"` (add `--box claude` for your
+own limit). On its next check the relay starts the same wait: a `... waiting` mail, held mail, a probe every
+`limitRetryMinutes`. A Kimi implementer's limit is waited out without you when the relay's stall watch
+sees it. For Kimi the relay also probes about 5 hours after it first saw Kimi busy in the current
+window, since Kimi's message gives no reset time. If the limit is still on screen after a probe
+and the episode ended, run `wait-limit` again.
+
 - **The implementer is `limited` or `warning`, and `wb.py settings` says `failover=true`** (the
   default). A `warning` is Codex's "Approaching rate limits" chooser, which Codex shows when it has
   less than 10% of its limit left. Never answer the chooser: fail over exactly as for the hard limit.
@@ -198,7 +209,12 @@ The mail quotes the implementer's last line when it has one.
 1. Check your background waiter. If it is gone, rearm it: one waiter, never two.
 2. Look for a finished helper: mail from `helper`, `revmux` or `human`, `.workbench/state/helpers/*.done`,
    and `.workbench/review/`. Act on the result.
-3. Continue the loop. If it really waits on the human, say so in one line and run
+3. If the implementer is at its usage limit (the mail says `The implementer's pane shows a
+   usage-limit error: ...`, or its pane shows one): in an `onLimit=wait` checkout run
+   `wb.py wait-limit --reason "<the limit line>"` and never report blocked (see "Usage limits"). Otherwise
+   fail over as that section says. In a wait checkout the relay does not send this pointer for a Kimi
+   implementer at its limit: it starts the wait itself.
+4. Continue the loop. If it really waits on the human, say so in one line and run
    `wb.py status blocked --sound` (in queue mode, also `wb.py loop-state blocked --reason ...`).
 
 `wb.py status blocked` records `.workbench/state/waiting.json`. That record is a latch: while it
