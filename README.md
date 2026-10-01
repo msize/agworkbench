@@ -878,7 +878,8 @@ counts take every check, so the planner still runs merge-check, which decides wh
 It is sent once per finished run, not once per head. A rerun on the same head (`wb.py ci-rerun`) needs a
 second result. A check that registers late, after the others finished, also changes the result, so
 "once per head" would stay silent then. The mail's fixed id and the saved run key mean a relay restart
-never repeats it. A check stuck pending (an offline runner, a status that never reports) gets no
+never repeats it. A head with no check at all gets one mail, `no checks reported in 5 min`, after 5
+minutes with no check (wait-ci's no-CI grace). A check stuck pending (an offline runner, a status that never reports) gets no
 `ci` mail. Once the pending checks on the head have been unchanged for 90 minutes, wait-ci's timeout,
 the stall watch no longer counts the loop as waiting on CI, and its pointer names the stuck checks.
 

@@ -1697,12 +1697,47 @@ class CiMail(DeliveryFixture):
                      f'Under auto-merge: if {HEAD_A} is the head you tested',
                      'Without auto-merge: only mention a red result in chat.'):
             self.assertIn(text, mail['body'])
+        # The next step is gated on auto-merge: no unconditional "run merge-check" (#94 r2).
+        self.assertNotIn('run merge-check', mail['body'])
         self.poll(with_ci(HEAD_B, check('unit', status='QUEUED')))
         self.assertEqual(1, len(self.ci_mails()))
         self.poll(with_ci(HEAD_B, check('unit')))
         self.poll(with_ci(HEAD_B, check('unit')))
         self.assertEqual(['CI finished on aaaaaaa: 1 passed, 1 failed (build)', 'CI finished on bbbbbbb: 1 passed, 0 failed'],
                          [m['subject'] for m in self.ci_mails()])
+
+    def test_a_head_with_no_checks_gets_one_mail_after_the_grace(self):
+        # #94 r2: as wait-ci's no-CI grace - a repo without CI, or a head no workflow runs for.
+        self.assertEqual(5, relay.NO_CI_GRACE_MINUTES)
+        for instant in (0, 120, 299):
+            self.t = instant
+            self.poll(with_ci(HEAD_A))
+        self.assertEqual([], self.ci_mails())
+        self.t = 300
+        self.poll(with_ci(HEAD_A))
+        mails = self.ci_mails()
+        self.assertEqual(['CI finished on aaaaaaa: no checks reported in 5 min'], [m['subject'] for m in mails])
+        self.assertIn('no check reported for this head in 5 minutes', mails[0]['body'])
+        self.assertIn(f'Under auto-merge: if {HEAD_A} is the head you tested', mails[0]['body'])
+        self.t = 400
+        self.poll(with_ci(HEAD_A))
+        self.assertEqual(1, len(self.ci_mails()))
+        # A check that shows up later and finishes is a new result.
+        self.poll(with_ci(HEAD_A, check('late', status='QUEUED')))
+        self.poll(with_ci(HEAD_A, check('late')))
+        self.assertEqual('CI finished on aaaaaaa: 1 passed, 0 failed', self.ci_mails()[-1]['subject'])
+        self.assertEqual(2, len(self.ci_mails()))
+
+    def test_a_new_head_restarts_the_no_checks_grace(self):
+        self.poll(with_ci(HEAD_A))
+        self.t = 200
+        self.poll(with_ci(HEAD_B))
+        self.t = 400
+        self.poll(with_ci(HEAD_B))
+        self.assertEqual([], self.ci_mails())
+        self.t = 500
+        self.poll(with_ci(HEAD_B))
+        self.assertEqual(['CI finished on bbbbbbb: no checks reported in 5 min'], [m['subject'] for m in self.ci_mails()])
 
     def test_a_rerun_on_the_same_head_mails_again(self):
         self.poll(with_ci(HEAD_A, check('unit', conclusion='FAILURE')))

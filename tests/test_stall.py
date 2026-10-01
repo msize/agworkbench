@@ -674,6 +674,17 @@ class CiStuck(StallFixture):
         self.assertIn('CI on PR #9 stuck: build pending, unchanged for 105 min', mails[0]['body'])
         self.run_until(self.BOUND + 4 * S, start=self.BOUND + S + 1)
         self.assertEqual(1, len(self.escalations()))
+        # #94 r2: the human hears why - waiting.json, the notification.
+        reason = json.loads((self.hub_dir / 'state' / 'waiting.json').read_text(encoding='utf-8'))['reason']
+        self.assertIn('; CI on PR #9 stuck: build pending, unchanged for', reason)
+        self.assertIn('CI on PR #9 stuck: build pending', self.notify.call_args.args[1])
+
+    def test_the_stuck_note_is_logged_once(self):
+        # #94 r2: not every tick, though another exemption (waiting.json) alternates with it.
+        self.run_until(self.BOUND + 5)
+        self.write('waiting.json', {'by': 'planner'})
+        self.run_until(self.BOUND + 20, start=self.BOUND + 6)
+        self.assertEqual(1, sum('CI on PR #9 stuck' in line for line in self.logs))
 
     def test_a_changing_pending_set_restarts_the_bound(self):
         self.run_until(60)
@@ -790,7 +801,8 @@ class StallProse(unittest.TestCase):
         self.assertNotIn('push, wait-ci, merge-check', text)
         self.assertNotIn('then wait-ci and merge-check', text)
         readme = self.text('README.md')
-        for needle in ('unchanged for 90 minutes, wait-ci\'s timeout', "**The relay's CI mail (#94).**", 'once per finished run, not once per head',
+        self.assertIn('no checks reported in 5 min', section)
+        for needle in ('no checks reported in 5 min', 'unchanged for 90 minutes, wait-ci\'s timeout', "**The relay's CI mail (#94).**", 'once per finished run, not once per head',
                        'A check that registers late', '`CI on the PR head: ...`'):
             self.assertIn(needle, readme)
 

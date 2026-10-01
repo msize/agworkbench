@@ -209,7 +209,9 @@ one message from `relay`, kind `ci`, with the subject `CI finished on <sha7>: N 
 finished checks change: a rerun on the same head, a check that registered late, or a new head. It
 mails whether or not auto-merge is on. This is the same signal as wait-ci's exit 0, so `wait-ci` is
 optional: the relay keeps watching after a background wait-ci is killed under memory pressure.
-A check stuck pending gets no `ci` mail. Once the pending checks on the head have been unchanged for
+A head with no check at all (a repo without CI, or paths no workflow runs for) gets one `ci` mail
+`CI finished on <sha7>: no checks reported in 5 min` after 5 minutes with no check, as wait-ci's
+no-CI grace did. A check stuck pending gets no `ci` mail. Once the pending checks on the head have been unchanged for
 90 minutes (wait-ci's timeout), the relay stops counting the loop as waiting on CI, and its stall
 pointer names the stuck checks.
 
