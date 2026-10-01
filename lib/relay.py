@@ -51,7 +51,8 @@ Six jobs, one loop, one process per issue, running in its own visible agwinterm 
    carry on); a merged, retired PR leaves it nothing else to watch.
 
 5. **Stalls (#45).** On the same reads it watches for a loop that sits idle with nothing to wake it:
-   both agent panes provably idle, no unread mail, no running helper, and the loop not done, not
+   both agent panes provably idle, no unread mail (mail held for a Kimi implementer whose pane shows
+   its usage limit does not count, #88), no running helper, and the loop not done, not
    waiting on the human (`state/waiting.json`, loop.json `blocked`/`pr-open`, a PR open for review),
    not waiting on CI (an auto-merge PR with a check still running), no usage-limit episode, and no
    review round waiting out a reviewer's limit (`state/review-limit.json` before its retryAt, #77).
@@ -418,12 +419,12 @@ def last_words(text: str | None, tool: str) -> str | None:
     status line, which are the pane's real last rows. None when the composer cannot be found."""
     import peerchat
     if tool == "kimi":
-        # Kimi's box (#65); a running turn's spinner row sits between the answer and the box.
-        box = peerchat.kimi_box(text or "")
-        if box is None:
+        # Kimi's box (#65); a running turn's spinner row and the todo panel (#88) sit between the answer
+        # and the box.
+        above = peerchat.kimi_above(text or "")
+        if above is None:
             return None
-        lines, top, _ = box
-        return _last_paragraph(lines[:top], lambda row: bool(peerchat.KIMI_SPINNER_RE.match(row)))
+        return _last_paragraph(above, lambda row: bool(peerchat.KIMI_SPINNER_RE.match(row)))
     lines = (text or "").splitlines()
     prompt_re = peerchat.CLAUDE_PROMPT_RE if tool == "claude" else peerchat.CODEX_PROMPT_RE
     prompt = next((i for i in range(len(lines) - 1, -1, -1) if prompt_re.match(lines[i])), None)
@@ -457,6 +458,7 @@ class StallWatch:
         self.fingerprint: tuple | None = None
         self.quiet: dict[str, tuple[str, float]] = {}   # marker-less helper pane -> (tail hash, unchanged since)
         self.sent: set[str] = set()              # this relay's stall mail: neither progress nor unread
+        self.held: list[str] = []                # unread implementer mail held by its usage limit (#88)
         self.last_note: str | None = None
 
     @property
@@ -528,8 +530,10 @@ class StallWatch:
                 found.append(f"{box}/{path.stem}")
         return found
 
-    def exemptions(self, live: list[str]) -> list[str]:
-        """Why this loop is not stalled although it may look idle. Empty when nothing exempts it."""
+    def exemptions(self, live: list[str], texts: dict[str, Any] | None = None) -> list[str]:
+        """Why this loop is not stalled although it may look idle. Empty when nothing exempts it. Unread
+        mail to an implementer whose pane shows its limit wakes nothing (#88, docxy #820): the relay rang
+        it and its turn failed. That mail is `held`, not an exemption; the stall period still applies."""
         reasons = []
         if (self.state_dir / "loop-done.json").exists():
             reasons.append("the loop is done")
@@ -546,7 +550,14 @@ class StallWatch:
             elif ci_pending(pr):
                 # Under auto-merge the planner waits on CI with a background wait-ci the relay cannot see.
                 reasons.append(f"PR #{pr.get('number')} CI running: {', '.join(ci_pending(pr))}")
-        unread = self.unread()
+        unread, held = self.unread(), []
+        if any(entry.startswith("codex/") for entry in unread) and texts is not None and self.implementer_limit(texts):
+            held = [entry for entry in unread if entry.startswith("codex/")]
+            unread = [entry for entry in unread if entry not in held]
+        if held and held != self.held:
+            self.relay.log(f"stall watch: unread mail {', '.join(held)} is held for the limited implementer; "
+                           "not an exemption")
+        self.held = held
         if unread:
             reasons.append(f"unread mail {', '.join(unread)}")
         if live:
@@ -615,7 +626,7 @@ class StallWatch:
             self.idle_since = None
         elif self.idle_since is None:
             self.idle_since = instant
-        exempt = self.exemptions(live)
+        exempt = self.exemptions(live, texts)
         if exempt:
             self.reset(exempt[0])
             self.note(f"not stalled: {'; '.join(exempt)}")
@@ -675,11 +686,15 @@ class StallWatch:
         """File the stall pointer. False when it could not be filed: the level stays, and the next
         tick tries again - an escalation never cites a pointer that does not exist."""
         minutes = f"{idle / 60:.0f}"
-        subject = f"stall: loop idle for {minutes} min, nothing unread, no running helper"
+        held = list(self.held)
+        subject = (f"stall: loop idle for {minutes} min, " + ("mail held for the limited implementer" if held
+                   else "nothing unread") + ", no running helper")
+        mail = "no unread mail but what is held for the implementer" if held else "no unread mail in either box"
         body = [f"The relay has seen this loop idle for {minutes} minutes: both agent panes idle with an empty",
-                "composer, no unread mail in either box, no running helper, no PR open for review or CI",
+                f"composer, {mail}, no running helper, no PR open for review or CI",
                 "running, no usage-limit episode, and the loop neither done nor waiting on the human.", ""]
-        body += [f"- {line}" for line in quiet] + ([""] if quiet else [])
+        notes = [f"unread mail {entry} is held for the implementer at its usage limit" for entry in held] + quiet
+        body += [f"- {line}" for line in notes] + ([""] if notes else [])
         words = self.implementer_line(texts)
         if words:
             body += [f"The implementer's last line: {words}", ""]
