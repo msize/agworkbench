@@ -3142,5 +3142,70 @@ class ForkCheckout(unittest.TestCase):
                          self.out.getvalue().strip())
         self.assertEqual([['pr', 'view']], [c[1:3] for c in gh.calls])       # nothing more is read of it
 
+
+class WaitLimit(unittest.TestCase):
+    """#88: in a -WaitOnLimit loop a usage limit is waited out by the relay, never reported blocked."""
+
+    def setUp(self):
+        import conductor
+        self.q = conductor
+        self.folder = Path(__file__).resolve().parent.parent / ('test wb wait-limit ' + uuid.uuid4().hex)
+        self.folder.mkdir()
+        self.addCleanup(shutil.rmtree, self.folder)
+        self.state = self.folder / '.workbench/state'
+        self.state.mkdir(parents=True)
+        self.loop = str(uuid.uuid4())
+        self.q.atomic_json(self.state / 'queue-member.json', dict(queue=str(self.folder / 'queue.json'), repo='o/r', number=1))
+        self.q.atomic_json(self.state / 'claude.json', dict(sessionId=self.loop))
+        self.enterContext(patch.dict(os.environ, AI_HUB=str(self.folder / '.workbench'), CLAUDE_CODE_SESSION_ID=self.loop))
+        self.enterContext(patch.object(agw, 'request', side_effect=AssertionError('terminal access')))
+        self.err = self.enterContext(contextlib.redirect_stderr(io.StringIO()))
+        self.out = self.enterContext(contextlib.redirect_stdout(io.StringIO()))
+
+    def on_limit(self, value):
+        self.q.atomic_json(self.state / 'implementer.json', {'tool': 'kimi', 'onLimit': value})
+
+    def run_wb(self, *argv):
+        with patch.object(sys, 'argv', ['wb.py', *argv]):
+            return wb.main()
+
+    def test_wait_limit_files_the_request_for_the_relay(self):
+        self.on_limit('wait')
+        self.assertEqual(0, self.run_wb('wait-limit', '--reason', 'kimi 5-hour limit, the relay missed it'))
+        request = self.q.read_json(self.state / 'limit-request.json')
+        self.assertEqual(('codex', 'kimi 5-hour limit, the relay missed it'), (request['box'], request['reason']))
+        self.assertIsInstance(request['at'], (int, float))
+        self.assertEqual(0, self.run_wb('wait-limit', '--box', 'claude', '--reason', 'my own limit'))
+        self.assertEqual('claude', self.q.read_json(self.state / 'limit-request.json')['box'])
+
+    def test_wait_limit_outside_wait_mode_says_fail_over(self):
+        for value in ('failover', None):
+            with self.subTest(onLimit=value):
+                if value:
+                    self.on_limit(value)
+                self.assertEqual(1, self.run_wb('wait-limit', '--reason', 'kimi limited'))
+                self.assertFalse((self.state / 'limit-request.json').exists())
+                self.assertIn('-Failover', self.err.getvalue())
+
+    def test_blocked_for_a_usage_limit_is_refused_in_wait_mode(self):
+        self.on_limit('wait')
+        for reason in ('implementer (kimi) at its usage limit', 'Kimi quota exhausted', 'waiting out the 5-HOUR window',
+                       'codex limited'):
+            with self.subTest(reason=reason):
+                self.assertEqual(1, self.run_wb('loop-state', 'blocked', '--reason', reason))
+                self.assertIn('wb.py wait-limit', self.err.getvalue())
+                self.assertEqual(1, self.run_wb('loop-state', 'blocked', '--environmental', '--reason', reason))
+        self.assertFalse((self.state / 'loop.json').exists())
+        for reason in ('GitHub API rate limit', 'CI runner limited', 'a question for the human'):
+            with self.subTest(reason=reason):
+                self.assertEqual(0, self.run_wb('loop-state', 'blocked', '--reason', reason))
+
+    def test_blocked_for_a_usage_limit_is_allowed_when_failing_over(self):
+        self.on_limit('failover')
+        self.assertEqual(0, self.run_wb('loop-state', 'blocked', '--environmental', '--reason',
+                                        'implementer (kimi) at its usage limit'))
+        self.assertEqual('blocked', self.q.read_json(self.state / 'loop.json')['state'])
+
+
 if __name__ == '__main__':
     unittest.main()
