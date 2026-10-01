@@ -1043,7 +1043,7 @@ class MergeReadiness(unittest.TestCase):
     # --- classification -------------------------------------------------------------------------------
 
     def test_pending_and_failed_checks_are_routed(self):
-        self.assertEqual(['ci-pending: 2 check(s) still running (build, lint) - start wb.py wait-ci'],
+        self.assertEqual(["ci-pending: 2 check(s) still running (build, lint) - wait for the relay\'s ci mail (or wb.py wait-ci)"],
                          self.classify('UNSTABLE', [check('build', 'pending'), check('lint', 'pending', 'QUEUED'),
                                                     check('docs', 'pass')]))
         self.assertEqual(['ci-failed: build FAILURE https://github.com/o/r/actions/runs/95/job/55'],
@@ -1056,14 +1056,14 @@ class MergeReadiness(unittest.TestCase):
         self.assertEqual(['ci-optional-failed: codecov/patch FAILURE (not a required check; the human decides)'], lines)
         lines = self.classify('BLOCKED', [check('build', 'pending', 'EXPECTED'), check('codecov/patch', 'pending')],
                               required=['build'])
-        self.assertEqual(['ci-pending: 2 check(s) still running (build, codecov/patch) - start wb.py wait-ci'], lines)
+        self.assertEqual(["ci-pending: 2 check(s) still running (build, codecov/patch) - wait for the relay\'s ci mail (or wb.py wait-ci)"], lines)
         self.assertEqual(['ci-failed: build CANCELLED https://github.com/o/r/actions/runs/95/job/55'],
                          self.classify('BLOCKED', [check('build', 'cancel')], required=['build']))
 
     def test_a_running_optional_check_is_waited_for(self):
         # r22 M1: GitHub keeps UNSTABLE until optional checks finish too.
         lines = self.classify('UNSTABLE', [check('build', 'pass'), check('lint-docs', 'pending')], required=['build'])
-        self.assertEqual(['ci-pending: 1 check(s) still running (lint-docs) - start wb.py wait-ci'], lines)
+        self.assertEqual(["ci-pending: 1 check(s) still running (lint-docs) - wait for the relay\'s ci mail (or wb.py wait-ci)"], lines)
         state, text = wb.ci_progress({'all': [check('build', 'pass'), check('lint-docs', 'pending')], 'required': {'build'}})
         self.assertEqual(('running', '1 check(s) running: lint-docs'), (state, text))
 
@@ -1071,7 +1071,7 @@ class MergeReadiness(unittest.TestCase):
         # r22 m4: a failed job next to running ones is judged when the run is over.
         lines = self.classify('UNSTABLE', [check('build', 'fail'), check('test', 'pending'), check('cov', 'fail')],
                               required=['build', 'test'])
-        self.assertEqual(['ci-pending: 1 check(s) still running (test) - start wb.py wait-ci'], lines)
+        self.assertEqual(["ci-pending: 1 check(s) still running (test) - wait for the relay\'s ci mail (or wb.py wait-ci)"], lines)
 
     def test_blocked_or_unstable_without_ci_trouble_stays_final(self):
         for status, checks in (('BLOCKED', [check('build', 'pass')]), ('UNSTABLE', []), ('BLOCKED', [])):
@@ -1287,7 +1287,7 @@ class MergeReadiness(unittest.TestCase):
                                  requeue_after=2)
         with patch.object(sys, 'argv', ['wb.py', 'ci-rerun', '--pr', '7']):
             self.assertEqual(0, wb.main())
-            self.assertIn('rerun started: 2 check(s) pending again - start wb.py wait-ci', self.out.getvalue())
+            self.assertIn("rerun started: 2 check(s) pending again - wait for the relay\'s ci mail (or wb.py wait-ci)", self.out.getvalue())
             self.assertEqual(1, wb.main())                                     # the one rerun is used
         self.assertEqual([['gh', 'run', 'rerun', '11', '--failed', '--repo', 'o/r']], [c for c in calls if c[1:3] == ['run', 'rerun']])
 

@@ -878,7 +878,9 @@ counts take every check, so the planner still runs merge-check, which decides wh
 It is sent once per finished run, not once per head. A rerun on the same head (`wb.py ci-rerun`) needs a
 second result. A check that registers late, after the others finished, also changes the result, so
 "once per head" would stay silent then. The mail's fixed id and the saved run key mean a relay restart
-never repeats it.
+never repeats it. A check stuck pending (an offline runner, a status that never reports) gets no
+`ci` mail. Once the pending checks on the head have been unchanged for 90 minutes, wait-ci's timeout,
+the stall watch no longer counts the loop as waiting on CI, and its pointer names the stuck checks.
 
 Only the required checks count when branch protection names any; otherwise every check that ran
 counts. The limits are kept in code (`wb.py merge-round`, per PR): 3 clean catch-ups, 3 counted
@@ -929,9 +931,9 @@ CI), or during a usage-limit episode. A helper without its completion marker cou
 changes. After two periods of silence it no longer does, and the pointer names it. Your revdiff always counts.
 
 - After `stallMinutes` (default 15) the relay mails the planner one pointer (from `relay`, kind
-  `stall`). The pointer quotes the implementer's last line. If CI on the open PR's head finished and
-  no `ci` mail named it, the relay sends that `ci` mail instead (#94). Otherwise the pointer names the
-  CI result in a line `CI on the PR head: ...`.
+  `stall`). The pointer quotes the implementer's last line, and the CI result on the open PR's head
+  in a line `CI on the PR head: ...` (#94). As a defensive backstop it sends the `ci` mail instead
+  if none named that result.
 - After two more periods with no progress, and both panes idle for a whole period, it reports the
   loop blocked: a blocked sound status and a notification, waiting.json, and `loop-state blocked` with
   a reason starting `stalled:` in queue mode.

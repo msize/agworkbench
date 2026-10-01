@@ -1693,7 +1693,9 @@ class CiMail(DeliveryFixture):
         self.assertEqual(f'relay-ci-pr7-{key[:8]}', mail['message_id'])
         self.assertEqual(key, self.r.state['ci_mailed'])
         for text in (HEAD_A, OPEN['url'], '- build: https://ci/build/2026-10-01T10:00:00Z',
-                     f'wb.py merge-check --pr 7 --head {HEAD_A}', 'merge-check decides which are required'):
+                     f'wb.py merge-check --pr 7 --head {HEAD_A}', 'merge-check decides which are required',
+                     f'Under auto-merge: if {HEAD_A} is the head you tested',
+                     'Without auto-merge: only mention a red result in chat.'):
             self.assertIn(text, mail['body'])
         self.poll(with_ci(HEAD_B, check('unit', status='QUEUED')))
         self.assertEqual(1, len(self.ci_mails()))

@@ -545,7 +545,7 @@ def classify_ci(checks: dict) -> list[str]:
     _, pending, failed, optional_failed = split_checks(checks)
     if pending:
         return [f"ci-pending: {len(pending)} check(s) still running ("
-                + ", ".join(c.get("name") or "?" for c in pending) + ") - start wb.py wait-ci"]
+                + ", ".join(c.get("name") or "?" for c in pending) + ") - wait for the relay's ci mail (or wb.py wait-ci)"]
     lines = []
     lines += [f"ci-failed: {c.get('name')} {c.get('state')} {c.get('link') or ''}".rstrip() for c in failed]
     lines += [f"ci-optional-failed: {c.get('name')} {c.get('state')} (not a required check; the human decides)"
@@ -2629,7 +2629,7 @@ def cmd_ci_rerun(args: argparse.Namespace) -> int:
         except (RuntimeError, ValueError, OSError):
             showing = []
         if showing:
-            print(f"rerun started: {len(showing)} check(s) pending again - start wb.py wait-ci")
+            print(f"rerun started: {len(showing)} check(s) pending again - wait for the relay's ci mail (or wb.py wait-ci)")
             return 0
         if now() >= deadline:
             print(f"rerun started, but its checks did not show as pending within {RERUN_SHOWS_WITHIN:.0f}s - "

@@ -595,8 +595,9 @@ class QuietHelper(StallFixture):
 
 
 class CiBackstop(StallFixture):
-    """#94: finished CI on the open PR's head that no `ci` mail named is the stall; the watch files that
-    mail. watch_pr files it with the snapshot, so only state saved before #94 reaches this."""
+    """#94: finished CI on the open PR's head that no `ci` mail named is the stall; the watch queues that
+    mail. Defensive: watch_pr queues it in the same save as the snapshot, so only state whose `ci_mailed`
+    was lost while the snapshot survived (hand-edited) reaches this; these tests plant such state."""
 
     FINISHED = {'number': 9, 'url': 'https://github.com/o/repo/pull/9', 'state': 'OPEN', 'headRefOid': 'c' * 40,
                 'statusCheckRollup': [
@@ -645,6 +646,58 @@ class CiBackstop(StallFixture):
         self.run_until(S)
         self.assertEqual([], self.ci_mail())
         self.assertNotIn('ci_mailed', self.r.state)
+
+
+class CiStuck(StallFixture):
+    """#94 r1: with wait-ci optional, a check stuck pending (an offline runner, a status that never
+    reports) must not exempt the loop forever: a pending set unchanged for CI_STUCK_MINUTES ends it."""
+
+    BOUND = int(relay.CI_STUCK_MINUTES)
+
+    def setUp(self):
+        super().setUp()
+        self.write('implementer.json', {'tool': 'codex', 'autoMerge': True})
+        self.pending(('build',))
+
+    def pending(self, names, head='c' * 40):
+        self.r.state['pr'] = {'number': 9, 'state': 'OPEN', 'headRefOid': head, 'statusCheckRollup': [
+            {'__typename': 'CheckRun', 'name': 'tests', 'status': 'COMPLETED', 'conclusion': 'SUCCESS'}] + [
+            {'__typename': 'CheckRun', 'name': name, 'status': 'QUEUED'} for name in names]}
+
+    def test_a_pending_set_unchanged_past_the_bound_is_pointed_at_then_escalated(self):
+        self.assertEqual(90, self.BOUND)
+        self.run_until(self.BOUND + S - 1, step=1)
+        self.assertEqual([], self.stall_mail())
+        self.tick(self.BOUND + S)
+        mails = self.stall_mail()
+        self.assertEqual(1, len(mails))
+        self.assertIn('CI on PR #9 stuck: build pending, unchanged for 105 min', mails[0]['body'])
+        self.run_until(self.BOUND + 4 * S, start=self.BOUND + S + 1)
+        self.assertEqual(1, len(self.escalations()))
+
+    def test_a_changing_pending_set_restarts_the_bound(self):
+        self.run_until(60)
+        self.pending(('build', 'lint'))
+        self.run_until(60 + self.BOUND - 1, start=61)
+        self.assertEqual([], self.stall_mail())
+        # The clock restarts on the first tick that sees the new set (minute 61).
+        self.run_until(61 + self.BOUND + S, start=60 + self.BOUND)
+        self.assertEqual(1, len(self.stall_mail()))
+
+    def test_a_new_head_restarts_the_bound(self):
+        self.run_until(60)
+        self.pending(('build',), head='d' * 40)
+        self.run_until(60 + self.BOUND + S - 1, start=61)
+        self.assertEqual([], self.stall_mail())
+
+    def test_finished_ci_clears_the_stuck_note(self):
+        self.run_until(self.BOUND)
+        self.assertIsNotNone(self.r.stall.ci_stuck)
+        self.r.state['pr']['statusCheckRollup'] = self.r.state['pr']['statusCheckRollup'][:1]
+        self.r.state['ci_mailed'] = relay.ci_result(self.r.state['pr'])['key']
+        self.tick(self.BOUND + 1)
+        self.assertIsNone(self.r.stall.ci_stuck)
+        self.assertIsNone(self.r.stall.ci_wait)
 
 
 class LastWords(unittest.TestCase):
@@ -733,8 +786,11 @@ class StallProse(unittest.TestCase):
             self.assertIn(needle, section)
         self.assertIn("the relay's `ci` mail for this head", text.split('| `ci-pending:` |')[1].split('|')[0])
         self.assertIn('`CI on the PR head: <summary>`', text.split('## Stall pointers')[1])
+        self.assertIn('unchanged for 90 minutes (wait-ci\'s timeout)', section)
+        self.assertNotIn('push, wait-ci, merge-check', text)
+        self.assertNotIn('then wait-ci and merge-check', text)
         readme = self.text('README.md')
-        for needle in ("**The relay's CI mail (#94).**", 'once per finished run, not once per head',
+        for needle in ('unchanged for 90 minutes, wait-ci\'s timeout', "**The relay's CI mail (#94).**", 'once per finished run, not once per head',
                        'A check that registers late', '`CI on the PR head: ...`'):
             self.assertIn(needle, readme)
 

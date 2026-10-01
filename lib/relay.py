@@ -111,6 +111,9 @@ ALERT_EVERY = 300.0
 TERMINAL_DRAIN_TIMEOUT = 30 * 60.0
 LIMIT_READS = 2          # consecutive reads that start (or end) a usage-limit episode
 STALL_MINUTES = 15.0     # the default stall period (#45); `stallMinutes` in ~/.agworkbench.json, 0 = off
+# A pending set unchanged this long is stuck, not running (#94 r1): wait-ci's default --timeout, the
+# bound the CI-running exemption had while every planner ran wait-ci.
+CI_STUCK_MINUTES = 90.0
 LIMIT_RETRY_MINUTES = 30.0   # between probes of an agent waiting out its limit (#77); `limitRetryMinutes`
 KIMI_WINDOW_SECONDS = 5 * 3600.0   # Kimi's usage window (#88): its limit gives no reset time
 WINDOW_SLACK = 60.0      # the window-end probe comes this long after the window's end
@@ -503,6 +506,8 @@ class StallWatch:
         self.quiet: dict[str, tuple[str, float]] = {}   # marker-less helper pane -> (tail hash, unchanged since)
         self.sent: set[str] = set()              # this relay's stall mail: neither progress nor unread
         self.held: list[str] = []                # unread implementer mail held by its usage limit (#88)
+        self.ci_wait: tuple[tuple, float] | None = None   # (PR, head, pending checks), unchanged since (#94 r1)
+        self.ci_stuck: str | None = None         # the pointer's note on CI stuck pending
         self.last_note: str | None = None
 
     @property
@@ -592,8 +597,23 @@ class StallWatch:
             if not (isinstance(settings, dict) and settings.get("autoMerge") is True):
                 reasons.append(f"PR #{pr.get('number')} is open for review")
             elif ci_pending(pr):
-                # Under auto-merge the planner waits on CI with a background wait-ci the relay cannot see.
-                reasons.append(f"PR #{pr.get('number')} CI running: {', '.join(ci_pending(pr))}")
+                # Under auto-merge the planner waits on CI: for the relay's `ci` mail or a wait-ci. A pending
+                # set unchanged for CI_STUCK_MINUTES is stuck (an offline runner, a status that never reports),
+                # and no `ci` mail will come: the exemption ends, as wait-ci's timeout ended its wait.
+                pending = ci_pending(pr)
+                current = (pr.get("number"), pr.get("headRefOid"), tuple(sorted(pending)))
+                if self.ci_wait is None or self.ci_wait[0] != current:
+                    self.ci_wait = (current, now())
+                waited = now() - self.ci_wait[1]
+                if waited < CI_STUCK_MINUTES * 60:
+                    self.ci_stuck = None
+                    reasons.append(f"PR #{pr.get('number')} CI running: {', '.join(pending)}")
+                else:
+                    self.ci_stuck = (f"CI on PR #{pr.get('number')} stuck: {', '.join(pending)} pending, unchanged "
+                                     f"for {waited / 60:.0f} min")
+                    self.note(self.ci_stuck)
+        if not (pr.get("state") == "OPEN" and ci_pending(pr)):
+            self.ci_wait, self.ci_stuck = None, None
         unread, held = self.unread(), []
         if any(entry.startswith("codex/") for entry in unread) and texts is not None and self.implementer_limit(texts):
             held = [entry for entry in unread if entry.startswith("codex/")]
@@ -687,7 +707,7 @@ class StallWatch:
                 if self.wait_out_limit(texts):
                     self.reset("usage limit")
                 elif self.ci_backstop():
-                    self.reset("CI mail filed")
+                    self.reset("CI mail queued")
                 elif self.pointer(instant - self.since, quiet, texts):
                     self.level, self.pointer_at = 1, instant
         elif self.level == 1:
@@ -723,9 +743,10 @@ class StallWatch:
         return True
 
     def ci_backstop(self) -> bool:
-        """#94: finished CI on the open PR's head that no `ci` mail named yet is the stall: file that mail
-        instead of the pointer. watch_pr files it in the same save as the snapshot, so this only finds
-        state saved before #94. True when it was filed."""
+        """#94: finished CI on the open PR's head that no `ci` mail named yet is the stall: queue that mail
+        instead of the pointer. Defensive: watch_pr queues it in the same save as the snapshot, so this is
+        reached only when `ci_mailed` was lost while the snapshot survived (hand-edited state). True when
+        the mail was queued (its flush may still be retried)."""
         pr = self.relay.state.get("pr")
         return bool(pr) and pr.get("state") == "OPEN" and self.relay.ci_mail(pr)
 
@@ -747,6 +768,8 @@ class StallWatch:
                 f"composer, {mail}, no running helper, no PR open for review or CI",
                 "running, no usage-limit episode, and the loop neither done nor waiting on the human.", ""]
         notes = [f"unread mail {entry} is held for the implementer at its usage limit" for entry in held] + quiet
+        if self.ci_stuck:
+            notes.append(f"{self.ci_stuck} - look at the checks; a runner or an external CI may be down")
         body += [f"- {line}" for line in notes] + ([""] if notes else [])
         words = self.implementer_line(texts)
         if words:
@@ -1840,9 +1863,10 @@ class Relay:
                                    for name, link in result["failed_links"]] + [""]
         body += ["The counts take every check; merge-check decides which are required - do not act on the",
                  "count, run merge-check.", "",
-                 f"Next step: if {result['head']} is the head you tested, stop any wait-ci still running for it",
-                 f"and run `wb.py merge-check --pr {number} --head {result['head']}`, as on wait-ci's exit 0.",
-                 "A `ci` mail for another head is ignored. Without auto-merge, mention a red result in chat."]
+                 f"Under auto-merge: if {result['head']} is the head you tested, stop any wait-ci still running",
+                 f"for it and run `wb.py merge-check --pr {number} --head {result['head']}`, as on wait-ci's exit 0.",
+                 "A `ci` mail for another head is ignored.",
+                 "Without auto-merge: only mention a red result in chat."]
         message = dict(to="claude", sender="relay", subject=result["summary"], body="\n".join(body), kind="ci",
                        message_id=f"relay-ci-pr{number}-{result['key'][:8]}")
         self.state["ci_mailed"] = result["key"]
