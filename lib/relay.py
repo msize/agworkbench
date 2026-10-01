@@ -28,6 +28,10 @@ Six jobs, one loop, one process per issue, running in its own visible agwinterm 
    limit that has reset lets the agent continue and the row leaves the pane, which ends the episode;
    one that has not answers with its limit again, and the wait goes on. Only a pane nobody can type
    into for `limitRetryMinutes` reaches the human. A Codex warning chooser keeps the failover path.
+   A wait can also be forced (#88): by the stall watch, for a Kimi implementer whose frame ends in a
+   limit error the classifier could not place, or by the planner's `wb.py wait-limit`. A forced episode
+   ends only after a probe. For Kimi, whose message gives no reset time, a probe also comes 5 h after
+   the relay first saw it busy in the current window (`limitWindows`), when that is sooner.
 
 4. **The close after merge or a no-op issue (#27, #33, #53).** On an autonomous checkout, after a MERGED PR's final
    notices are delivered or a closed issue has a no-PR done record, it runs closer.py while it keeps delivering mail. Helper sessions close
