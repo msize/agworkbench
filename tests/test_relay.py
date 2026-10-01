@@ -2372,6 +2372,23 @@ class ForcedWait(WaitOnLimitFixture):
         self.assertEqual(0, self.episode()['misses'])
         self.assertGreater(self.episode()['hits'], relay.LIMIT_READS)
 
+    def test_a_baseline_row_counts_for_a_forced_episode_on_a_classify_only_tool(self):
+        # FIX r4 m1: no kimi_turn_limit fallback here, so only the baseline exemption keeps the row a hit.
+        self.peer = relay.Peer('codex', 'codex', 'codex-pane')
+        self.r.peers = [self.peer]
+        self.r.limit_baseline = {}                    # this relay has just started, the row already on screen
+        self.check('codex-limited-live', times=3)
+        self.assertEqual(1, len(self.r.limit_baseline['codex']))
+        self.assertIsNone(self.episode())
+        self.assertTrue(self.r.force_wait(self.peer, relay.limits.Limit('limited', 'codex: usage limit'),
+                                          limit_frame('codex-limited-live'), 'planner'))
+        self.until_retry()
+        self.assertEqual(1, len(self.probes_typed()))
+        self.check(times=3)                           # the probe was answered by the same limit row
+        episode = self.episode()
+        self.assertIsNotNone(episode)
+        self.assertEqual((1, None, 0), (episode['probes'], episode['probeAt'], episode['misses']))
+
     def test_the_planners_request_starts_a_forced_wait_for_a_frame_nobody_can_read(self):
         path = self.request()
         self.check('\n' + kimi_frame('idle-after-turn'))
