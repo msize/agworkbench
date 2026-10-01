@@ -117,8 +117,9 @@ planner has fetched; merge exactly the SHA it names:
    they are.
 2. Resolve any conflicts, keeping both sides' intent. Add nothing else to the merge commit: no fixes,
    no refactors. Anything that is not a conflict resolution belongs in a later round.
-   Change only the conflict hunks: any other edit in the merge, even one line beside a conflict,
-   makes it a counted conflict round, while a small resolved conflict is not counted (#90).
+   Change only the conflict regions: editing or removing any line outside them makes it a counted
+   conflict round, while a small resolved conflict is not counted (#90). A line added right beside
+   a region cannot be told apart from the resolution, so add nothing but the resolution.
 3. Run the whole suite on the merge.
 4. Reply `UPDATED <sha>` with the suite's result and, for each conflicted file, what you kept. If
    you cannot resolve it safely, `git merge --abort` and reply `CANNOT-RESOLVE <why>`.

@@ -1440,13 +1440,16 @@ class UpdateCheck(unittest.TestCase):
 
     # --- small and counted conflicts (#90) ------------------------------------------------------------
 
-    def conflict(self, regions=1, extra=None, insert=None, resolve=None, name=None):
+    def conflict(self, regions=1, extra=None, insert=None, resolve=None, name=None, blank=False):
         """main and the issue change the same `regions` lines of a new long file, 8 lines apart, and the
         merge joins both sides. `extra` also edits that line of the result (a clean line the merge did
         not conflict on), `insert` adds a line before it; `resolve` replaces the result, and False
-        commits git's markers as they are. Leaves HEAD at the merge; returns the base."""
+        commits git's markers as they are; `blank` empties the line after the first conflict, or puts
+        that text there. Leaves HEAD at the merge; returns the base."""
         name = name or f'c{uuid.uuid4().hex[:6]}.txt'
         lines = [f'line {i}' for i in range(8 * regions + 8)]
+        if blank is not False:
+            lines[5] = '' if blank is True else blank
         at = [4 + 8 * k for k in range(regions)]
 
         def text(tag):
@@ -1554,6 +1557,35 @@ class UpdateCheck(unittest.TestCase):
         self.out.truncate(0)
         self.assertEqual(0, self.check(self.conflict(name='Makefile')))        # named by no finding: small
         self.assertIn('(small: 1 conflict hunk in 1 file', self.out.getvalue())
+
+    def test_the_users_diff_config_cannot_make_a_conflict_small(self):
+        # r2 M1: colour codes, no context, or a dropped blank context line all read a semantic edit as small.
+        for key, value, kwargs in (('color.ui', 'always', {'extra': 6}),
+                                   ('diff.context', '0', {'insert': 7}),
+                                   ('diff.suppressBlankEmpty', 'true', {'blank': True, 'insert': 6})):
+            with self.subTest(config=key):
+                self.git('config', key, value)
+                self.addCleanup(self.git, 'config', '--unset', key, check=False)
+                self.out.truncate(0)
+                self.out.seek(0)
+                self.assertEqual(0, self.check(self.conflict(**kwargs)))
+                self.assertIn('update: conflict (counted: the merge changes code outside the conflict regions',
+                              self.out.getvalue())
+                self.git('config', '--unset', key)
+
+    def test_a_diff_that_does_not_parse_is_counted(self):
+        # r2 M1: fail closed.
+        for diff in ('garbage\n', '\x1b[1mdiff --git a/x b/x\x1b[m\n\x1b[1m--- a/x\x1b[m\n@@ -1 +1 @@\n-a\n+b\n'):
+            with self.subTest(diff=diff):
+                self.assertEqual({'result': 'counted', 'hunks': 0, 'files': [],
+                                  'reason': 'the remerge-diff could not be parsed'}, wb.classify_merge(diff, set(), 3))
+
+    def test_a_heading_underline_is_no_conflict_marker(self):
+        # r2 m1: an rst underline in context beside a resolved region.
+        self.assertEqual(0, self.check(self.conflict(blank='=============')))
+        self.assertIn('(small: 1 conflict hunk in 1 file; not counted)', self.out.getvalue())
+        for marker in ('<<<<<<< HEAD', '=======', '>>>>>>> main', '||||||| base'):
+            self.assertTrue(wb.MARKER_LEFT.match(marker), marker)
 
     def test_diff_noprefix_does_not_hide_a_flagged_file(self):
         # r1 m1: a noprefix diff has no a/ b/, so the path would never match.
@@ -2601,6 +2633,7 @@ class AutoMergeProse(unittest.TestCase):
         readme = ' '.join((root / 'README.md').read_text(encoding='utf-8').split())
         for needle in ['3 counted conflict rounds (`mergeRounds.conflict`)', 'A **small** conflict is not counted at all',
                        'at most 3 conflict hunks (`mergeRounds.smallConflictHunks`; 0 turns small conflicts off)',
+                       'A line added right beside a conflict cannot be told apart from its resolution',
                        'the planner never declares a conflict small itself', 'Each merge commit is counted once',
                        '`wb.py merge-round --pr <N> --summary`',
                        '| `mergeRounds` | `{"conflict": 3, "smallConflictHunks": 3}` |']:
@@ -2615,8 +2648,10 @@ class AutoMergeProse(unittest.TestCase):
                                '**Never rebase, never `git pull`, never amend, squash or force-push**',
                                'Add nothing else to the merge commit', 'Reply `UPDATED <sha>`',
                                '`git merge --abort` and reply `CANNOT-RESOLVE <why>`', 'update-check',
-                               'Change only the conflict hunks', 'makes it a counted conflict round']:   # #90
+                               'Change only the conflict regions: editing or removing any line outside them makes it a counted conflict round',
+                               'A line added right beside a region cannot be told apart from the resolution']:   # #90
                     self.assertIn(needle, text)
+                self.assertNotIn('even one line beside a conflict', text)          # r2 m2: more than the code checks
 
     def test_implementer_never_merges(self):
         text = (Path(__file__).resolve().parent.parent / 'claude/commands/workbench-implementer.md').read_text(encoding='utf-8')

@@ -2177,16 +2177,21 @@ def git_out(root: Path, *args: str) -> str:
 
 MARKER_OPEN = re.compile(r"<{7,}(?:\s|$)")
 MARKER_CLOSE = re.compile(r">{7,}(?:\s|$)")
-MARKER_ANY = re.compile(r"(?:<{7,}|>{7,}|={7,}|\|{7,})(?:\s|$)")
+# A marker left in the result (a context or `+` line): git's own, exactly 7 wide, so a heading's
+# `=============` underline is not one.
+MARKER_LEFT = re.compile(r"(?:<{7}|>{7})(?: |$)|={7}$|\|{7}(?: |$)")
+# git's remerge-diff, whatever the user's config says about colour, context, prefixes or blank lines.
+REMERGE_DIFF = ("-c", "core.quotepath=false", "-c", "diff.suppressBlankEmpty=false", "show", "--remerge-diff",
+                "--no-color", "--no-ext-diff", "--no-textconv", "--no-relative", "-U3", "--format=",
+                "--src-prefix=a/", "--dst-prefix=b/", "HEAD")
 TEXT_CONFLICTS = ("content", "add/add")       # the conflict types that leave marker regions
 LOCATION_RANGE = re.compile(r":\d+(?:-\d+)?(?::\d+)?$")
 COUNTED_ONCE = ("update", "conflict", "conflict-small")     # a HEAD is one round of these
 
 
-def merge_round_limits(settings: dict | None = None) -> dict:
+def merge_round_limits() -> dict:
     """ROUND_LIMITS with mergeRounds.conflict over it (#90). Raises followup.SettingsError."""
-    settings = settings or followup.merge_round_settings(followup.read_config())
-    return {**ROUND_LIMITS, "conflict": settings["conflict"]}
+    return {**ROUND_LIMITS, "conflict": followup.merge_round_settings(followup.read_config())["conflict"]}
 
 
 def update_check_path(root: Path) -> Path:
@@ -2245,8 +2250,8 @@ def remerge_files(diff: str) -> list[dict]:
                           "hunks": [], "old": "", "new": ""})
         elif not files:
             continue
-        elif files[-1]["hunks"] and line[:1] in (" ", "-", "+", "\\"):
-            files[-1]["hunks"][-1].append(line)
+        elif files[-1]["hunks"] and line[:1] in (" ", "-", "+", "\\", ""):
+            files[-1]["hunks"][-1].append(line or " ")          # an empty line is a blank context line
         elif line.startswith("@@"):
             files[-1]["hunks"].append([])
         elif match := re.match(r"remerge CONFLICT \(([^)]*)\)", line):
@@ -2268,18 +2273,18 @@ def outside_regions(entry: dict) -> tuple[int, str]:
     context between them - must stay in a conflict region of the old side: every `-` line inside one
     (markers included), every `+` line inside one or in a block that touched one. A marker left in the
     result is a problem too. The region state carries across hunks: a resolution that keeps a long side
-    splits one region over two hunks."""
+    splits one region over two hunks. A block never does: each hunk ends the block it holds."""
     regions, inside, problem = 0, False, ""
     outside = f"the merge changes code outside the conflict regions in {entry['path']}"
     left = f"conflict markers left in {entry['path']}"
     block, touched = [], False
-    for hunk in entry["hunks"] + [[" "]]:        # a closing context line ends the last block
-        for line in hunk:
+    for hunk in entry["hunks"]:
+        for line in hunk + [" "]:                # a closing context line ends the hunk's last block
             tag, text = line[:1], line[1:]
             if tag == "\\":
                 continue
             if tag == " ":
-                if MARKER_ANY.match(text):
+                if MARKER_LEFT.match(text):
                     return regions, left
                 if not touched and not all(block):
                     problem = problem or outside
@@ -2293,7 +2298,7 @@ def outside_regions(entry: dict) -> tuple[int, str]:
                 if MARKER_CLOSE.match(text):
                     inside = False
             else:
-                if MARKER_ANY.match(text):
+                if MARKER_LEFT.match(text):
                     return regions, left
                 block.append(inside)
     return regions, problem or (left if inside else "")
@@ -2303,7 +2308,8 @@ def classify_merge(diff: str, flagged: set[str], small_limit: int) -> dict:
     """A non-empty remerge-diff: {"result": "small"|"counted", "hunks", "files", "reason"}. A
     structural problem is the reason first, then a flagged file, then the number of regions."""
     regions, conflicted, problem = 0, [], ""
-    for entry in remerge_files(diff):
+    entries = remerge_files(diff)
+    for entry in entries:
         if entry["conflicts"]:
             conflicted.append(entry["path"])
         other = [kind for kind in entry["conflicts"] if kind not in TEXT_CONFLICTS]
@@ -2317,6 +2323,8 @@ def classify_merge(diff: str, flagged: set[str], small_limit: int) -> dict:
             count, found = outside_regions(entry)
             regions += count
         problem = problem or found
+    if not problem and (not entries or not regions):
+        problem = "the remerge-diff could not be parsed"            # fail closed: never small by accident
     record = {"hunks": regions, "files": conflicted}
     flagged_file = next((name for name in conflicted if is_flagged(name, flagged)), None)
     if problem:
@@ -2374,8 +2382,7 @@ def cmd_update_check(args: argparse.Namespace) -> int:
         if failures:
             print("\n".join(f"update-check: {line}" for line in failures))
             return 1
-        remerge = git_out(root, "-c", "core.quotepath=false", "show", "--remerge-diff", "--format=",
-                         "--src-prefix=a/", "--dst-prefix=b/", "HEAD").strip()     # whatever diff.noprefix says
+        remerge = git_out(root, *REMERGE_DIFF).strip()
     except (RuntimeError, OSError) as err:
         print(f"update-check: {err}")
         return 1
@@ -2553,10 +2560,12 @@ def round_used(root: Path, pr: str, kind: str) -> bool:
     except (OSError, ValueError):
         return False
     number = int(str(pr).rsplit("/", 1)[-1]) if re.fullmatch(r"(?:.*/)?\d+", str(pr)) else None
-    try:
-        limit = merge_round_limits()[kind]
-    except followup.SettingsError:
-        limit = ROUND_LIMITS[kind]                  # an invalid mergeRounds never moves the CI limits
+    limit = ROUND_LIMITS[kind]
+    if kind == "conflict":                          # the only limit mergeRounds sets
+        try:
+            limit = merge_round_limits()[kind]
+        except followup.SettingsError:
+            pass
     return isinstance(record, dict) and record.get("pr") == number and int(record.get(kind) or 0) >= limit
 
 

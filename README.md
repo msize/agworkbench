@@ -876,8 +876,9 @@ are only reported.
 A **small** conflict is not counted at all (#90), so a long-running PR on a busy main is not stopped
 by a one-line import clash. A conflict is small when it meets all three conditions:
 - it has at most 3 conflict hunks (`mergeRounds.smallConflictHunks`; 0 turns small conflicts off);
-- the merge changes nothing outside them: no edit to code git merged cleanly, no modify/delete or
-  binary conflict, and no marker left in the result;
+- the merge edits or removes no line outside them (code git merged cleanly), adds no line apart
+  from them, has no modify/delete or binary conflict, and leaves no marker in the result. A line
+  added right beside a conflict cannot be told apart from its resolution;
 - no conflicted file is one that the PR's review flagged: a revmux finding's location, or a recorded
   follow-up's file.
 
