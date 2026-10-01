@@ -2177,13 +2177,16 @@ def git_out(root: Path, *args: str) -> str:
 
 MARKER_OPEN = re.compile(r"<{7,}(?:\s|$)")
 MARKER_CLOSE = re.compile(r">{7,}(?:\s|$)")
-# A marker left in the result (a context or `+` line): git's own, exactly 7 wide, so a heading's
-# `=============` underline is not one.
+# A marker left in the result: git's own, exactly 7 wide, so a heading's `=============` underline is
+# not one. In the diff only `<<<<<<<` and `>>>>>>>` are sure; a `=======` or `|||||||` (also a 7-letter
+# heading's underline) is a marker only when neither parent had that line (markers_left).
 MARKER_LEFT = re.compile(r"(?:<{7}|>{7})(?: |$)|={7}$|\|{7}(?: |$)")
-# git's remerge-diff, whatever the user's config says about colour, context, prefixes or blank lines.
+MARKER_SURE = re.compile(r"(?:<{7}|>{7})(?: |$)")
+# git's remerge-diff, whatever the user's config says about colour, context, prefixes, blank lines,
+# submodules or signatures.
 REMERGE_DIFF = ("-c", "core.quotepath=false", "-c", "diff.suppressBlankEmpty=false", "show", "--remerge-diff",
-                "--no-color", "--no-ext-diff", "--no-textconv", "--no-relative", "-U3", "--format=",
-                "--src-prefix=a/", "--dst-prefix=b/", "HEAD")
+                "--no-color", "--no-ext-diff", "--no-textconv", "--no-relative", "--submodule=short",
+                "--no-show-signature", "-U3", "--format=", "--src-prefix=a/", "--dst-prefix=b/", "HEAD")
 TEXT_CONFLICTS = ("content", "add/add")       # the conflict types that leave marker regions
 LOCATION_RANGE = re.compile(r":\d+(?:-\d+)?(?::\d+)?$")
 COUNTED_ONCE = ("update", "conflict", "conflict-small")     # a HEAD is one round of these
@@ -2284,7 +2287,7 @@ def outside_regions(entry: dict) -> tuple[int, str]:
             if tag == "\\":
                 continue
             if tag == " ":
-                if MARKER_LEFT.match(text):
+                if MARKER_SURE.match(text):
                     return regions, left
                 if not touched and not all(block):
                     problem = problem or outside
@@ -2298,15 +2301,26 @@ def outside_regions(entry: dict) -> tuple[int, str]:
                 if MARKER_CLOSE.match(text):
                     inside = False
             else:
-                if MARKER_LEFT.match(text):
+                if MARKER_SURE.match(text):
                     return regions, left
                 block.append(inside)
     return regions, problem or (left if inside else "")
 
 
-def classify_merge(diff: str, flagged: set[str], small_limit: int) -> dict:
+def markers_left(path: str, show) -> bool:
+    """Whether the merge's `path` holds a git marker line that neither parent had. A stray `=======`
+    outside every hunk is in no diff (keeping both sides, deleting only `<<<<<<<` and `>>>>>>>`)."""
+    result = [line.rstrip("\r") for line in show("HEAD", path).splitlines()]
+    if not any(MARKER_LEFT.match(line) for line in result):
+        return False
+    before = {line.rstrip("\r") for rev in ("HEAD^1", "HEAD^2") for line in show(rev, path).splitlines()}
+    return any(MARKER_LEFT.match(line) and line not in before for line in result)
+
+
+def classify_merge(diff: str, flagged: set[str], small_limit: int, show=None) -> dict:
     """A non-empty remerge-diff: {"result": "small"|"counted", "hunks", "files", "reason"}. A
-    structural problem is the reason first, then a flagged file, then the number of regions."""
+    structural problem is the reason first, then a flagged file, then the number of regions.
+    `show(rev, path)` reads a file's text at a revision ("" when absent) for markers_left."""
     regions, conflicted, problem = 0, [], ""
     entries = remerge_files(diff)
     for entry in entries:
@@ -2325,6 +2339,8 @@ def classify_merge(diff: str, flagged: set[str], small_limit: int) -> dict:
         problem = problem or found
     if not problem and (not entries or not regions):
         problem = "the remerge-diff could not be parsed"            # fail closed: never small by accident
+    if not problem and show:
+        problem = next((f"conflict markers left in {path}" for path in conflicted if markers_left(path, show)), "")
     record = {"hunks": regions, "files": conflicted}
     flagged_file = next((name for name in conflicted if is_flagged(name, flagged)), None)
     if problem:
@@ -2354,11 +2370,6 @@ def cmd_update_check(args: argparse.Namespace) -> int:
         if not re.fullmatch(r"[0-9a-fA-F]{40}", getattr(args, name) or ""):
             print(f"wb: update-check --{name} needs a full 40-character SHA", file=sys.stderr)
             return 2
-    try:
-        settings = followup.merge_round_settings(followup.read_config())
-    except followup.SettingsError as err:
-        print(f"wb: update-check: {err}", file=sys.stderr)
-        return 2
     root = checkout()
     reviewed, base = args.reviewed.lower(), args.base.lower()
     try:
@@ -2387,7 +2398,22 @@ def cmd_update_check(args: argparse.Namespace) -> int:
         print(f"update-check: {err}")
         return 1
     if remerge:
-        verdict = classify_merge(remerge, review_flagged_files(root), settings["smallConflictHunks"])
+        invalid = ""
+        try:
+            small_limit = followup.merge_round_settings(followup.read_config())["smallConflictHunks"]
+        except followup.SettingsError as err:          # fail closed: no conflict is small, and say why
+            small_limit, invalid = 0, str(err)
+            print(f"wb: update-check: {err} - the conflict is counted", file=sys.stderr)
+
+        def show(rev: str, path: str) -> str:
+            try:
+                return git_out(root, "show", f"{rev}:{path}")
+            except (RuntimeError, OSError):
+                return ""                              # not in that revision
+
+        verdict = classify_merge(remerge, review_flagged_files(root), small_limit, show)
+        if invalid and verdict["reason"].startswith("small conflicts are off"):
+            verdict["reason"] = f"mergeRounds is invalid ({invalid})"
         if verdict["result"] == "small":
             how = (f"small: {plural(verdict['hunks'], 'conflict hunk')} in {plural(len(verdict['files']), 'file')}; "
                    "not counted")
@@ -2560,13 +2586,7 @@ def round_used(root: Path, pr: str, kind: str) -> bool:
     except (OSError, ValueError):
         return False
     number = int(str(pr).rsplit("/", 1)[-1]) if re.fullmatch(r"(?:.*/)?\d+", str(pr)) else None
-    limit = ROUND_LIMITS[kind]
-    if kind == "conflict":                          # the only limit mergeRounds sets
-        try:
-            limit = merge_round_limits()[kind]
-        except followup.SettingsError:
-            pass
-    return isinstance(record, dict) and record.get("pr") == number and int(record.get(kind) or 0) >= limit
+    return isinstance(record, dict) and record.get("pr") == number and int(record.get(kind) or 0) >= ROUND_LIMITS[kind]
 
 
 def cmd_ci_rerun(args: argparse.Namespace) -> int:

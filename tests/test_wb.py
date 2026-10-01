@@ -1203,7 +1203,6 @@ class MergeReadiness(unittest.TestCase):
         self.assertEqual([0, 0], [self.merge_round(7, 'update'), self.merge_round(7, 'ci-fix')])
         self.assertEqual({'pr': 7, 'conflict': 1, 'update': 1, 'ci-fix': 1},
                          json.loads((self.state / 'merge-rounds.json').read_text()))
-        self.assertFalse(wb.round_used(self.folder, '7', 'conflict'))          # invalid: the code's limit (3)
         with contextlib.redirect_stderr(io.StringIO()), patch.object(sys, 'argv', ['wb.py', 'merge-round', '--pr', '7']):
             self.assertEqual(2, wb.main())                                     # neither --kind nor --summary
 
@@ -1440,17 +1439,18 @@ class UpdateCheck(unittest.TestCase):
 
     # --- small and counted conflicts (#90) ------------------------------------------------------------
 
-    def conflict(self, regions=1, extra=None, insert=None, resolve=None, name=None, blank=False):
-        """main and the issue change the same `regions` lines of a new long file, 8 lines apart, and the
-        merge joins both sides. `extra` also edits that line of the result (a clean line the merge did
-        not conflict on), `insert` adds a line before it; `resolve` replaces the result, and False
-        commits git's markers as they are; `blank` empties the line after the first conflict, or puts
-        that text there. Leaves HEAD at the merge; returns the base."""
+    def conflict(self, regions=1, extra=None, insert=None, resolve=None, name=None, blank=False, span=1):
+        """main and the issue change the same `regions` lines (`span` lines each) of a new long file, 8
+        lines apart, and the merge joins both sides. `extra` also edits that line of the result (a clean
+        line the merge did not conflict on), `insert` adds a line before it; `resolve` replaces the
+        result (a callable gets git's conflicted text), and False commits git's markers as they are;
+        `blank` empties the line after the first conflict, or puts that text there. Leaves HEAD at the
+        merge; returns the base."""
         name = name or f'c{uuid.uuid4().hex[:6]}.txt'
-        lines = [f'line {i}' for i in range(8 * regions + 8)]
+        lines = [f'line {i}' for i in range(8 * regions + 8 + span)]
         if blank is not False:
             lines[5] = '' if blank is True else blank
-        at = [4 + 8 * k for k in range(regions)]
+        at = [4 + 8 * k + j for k in range(regions) for j in range(span)]
 
         def text(tag):
             return ''.join(f'{line} {tag}\n' if i in at else f'{line}\n' for i, line in enumerate(lines))
@@ -1475,7 +1475,9 @@ class UpdateCheck(unittest.TestCase):
             result[extra] = result[extra].rstrip('\n') + ' edited\n'
         if insert is not None:
             result.insert(insert, 'an added line\n')
-        if resolve is not False:
+        if callable(resolve):
+            self.write(name, resolve((self.repo / name).read_text(encoding='utf-8')))
+        elif resolve is not False:
             self.write(name, resolve if resolve is not None else ''.join(result))
         self.commit('resolve')
         return base
@@ -1507,9 +1509,26 @@ class UpdateCheck(unittest.TestCase):
         self.assertIn('counted: small conflicts are off', self.out.getvalue())
         self.config.write_text(json.dumps({'mergeRounds': {'smallConflictHunks': 'many'}}), encoding='utf-8')
         err = io.StringIO()
+        self.out.truncate(0)
+        self.out.seek(0)
+        with contextlib.redirect_stderr(err):                                    # r3 i2: fail closed, not exit 2
+            self.assertEqual(0, self.check(self.sha('HEAD^2')))
+        self.assertIn('mergeRounds.smallConflictHunks must be an integer from 0 to 20 - the conflict is counted',
+                      err.getvalue())
+        self.assertIn('update: conflict (counted: mergeRounds is invalid (mergeRounds.smallConflictHunks must be',
+                      self.out.getvalue())
+        self.assertEqual('counted', self.recorded()['result'])
+
+    def test_an_invalid_config_never_stops_a_clean_merge(self):
+        # r3 i2: mergeRounds is read only for a conflict.
+        self.config.write_text(json.dumps({'mergeRounds': []}), encoding='utf-8')
+        base = self.main_moves()
+        self.git('merge', '--no-ff', '-q', '-m', 'update', base)
+        err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            self.assertEqual(2, self.check(self.sha('HEAD^2')))
-        self.assertIn('mergeRounds.smallConflictHunks must be an integer from 0 to 20', err.getvalue())
+            self.assertEqual(0, self.check(base))
+        self.assertIn('update: clean', self.out.getvalue())
+        self.assertEqual('', err.getvalue())
 
     def test_a_conflict_in_a_file_the_review_flagged_is_counted(self):
         base = self.conflict(name='src/flagged.txt')
@@ -1586,6 +1605,32 @@ class UpdateCheck(unittest.TestCase):
         self.assertIn('(small: 1 conflict hunk in 1 file; not counted)', self.out.getvalue())
         for marker in ('<<<<<<< HEAD', '=======', '>>>>>>> main', '||||||| base'):
             self.assertTrue(wb.MARKER_LEFT.match(marker), marker)
+        self.out.truncate(0)
+        self.assertEqual(0, self.check(self.conflict(blank='=======')))       # r3 m4: a 7-letter heading's
+        self.assertIn('(small: 1 conflict hunk in 1 file; not counted)', self.out.getvalue())
+
+    def test_a_separator_left_outside_every_hunk_is_counted(self):
+        # r3 m2: "keep both sides", deleting only <<<<<<< and >>>>>>>: the ======= is in no hunk.
+        def keep_both(text):
+            return ''.join(line for line in text.splitlines(keepends=True)
+                           if not line.startswith(('<<<<<<<', '>>>>>>>')))
+        base = self.conflict(resolve=keep_both, span=6)
+        diff = self.git('show', '--remerge-diff', '--format=', 'HEAD').stdout
+        self.assertNotIn('=======', diff)                                      # 7 lines from either marker
+        self.assertEqual('small', wb.classify_merge(diff, set(), 3)['result'])  # the diff alone cannot tell
+        self.assertEqual(0, self.check(base))
+        self.assertRegex(self.out.getvalue(), r'update: conflict \(counted: conflict markers left in c\w+\.txt\)')
+
+    def test_the_remerge_diff_ignores_submodule_and_signature_config(self):
+        # r3 m1, m3: diff.submodule=log and log.showSignature=true reshape git show's output.
+        for flag in ('--submodule=short', '--no-show-signature', '--no-color', '-U3'):
+            self.assertIn(flag, wb.REMERGE_DIFF)
+        self.git('config', 'diff.submodule', 'log')
+        self.git('config', 'log.showSignature', 'true')
+        base = self.main_moves()
+        self.git('merge', '--no-ff', '-q', '-m', 'update', base)
+        self.assertEqual(0, self.check(base))
+        self.assertIn('update: clean', self.out.getvalue())
 
     def test_diff_noprefix_does_not_hide_a_flagged_file(self):
         # r1 m1: a noprefix diff has no a/ b/, so the path would never match.
