@@ -678,7 +678,7 @@ class StallWatch:
         subject = f"stall: loop idle for {minutes} min, nothing unread, no running helper"
         body = [f"The relay has seen this loop idle for {minutes} minutes: both agent panes idle with an empty",
                 "composer, no unread mail in either box, no running helper, no PR open for review or CI",
-                "running, no usage limit, and the loop neither done nor waiting on the human.", ""]
+                "running, no usage-limit episode, and the loop neither done nor waiting on the human.", ""]
         body += [f"- {line}" for line in quiet] + ([""] if quiet else [])
         words = self.implementer_line(texts)
         if words:
@@ -1158,8 +1158,9 @@ class Relay:
             self.log(f"could not set idle status for {peer.box}: {err}")
 
     def wait_limit(self, peer: Peer, episode: dict) -> None:
-        """A limit row on screen during a wait episode: after a probe it means the limit has not reset;
-        at retryAt it is time to probe."""
+        """A limit row on screen during a wait episode, or a forced episode before its first probe (#88,
+        nothing placed on screen): after a probe a limit row means the limit has not reset; at retryAt it
+        is time to probe."""
         if episode.get('probeAt') is not None:
             episode.update(probes=episode.get('probes', 0) + 1, probeAt=None)
             episode['retryAt'] = self.next_retry(episode)

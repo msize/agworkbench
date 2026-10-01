@@ -280,9 +280,15 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
-# An agent's usage limit in a `loop-state blocked` reason (#88). Bare "rate limit" or "limited" are not
-# enough: a GitHub API rate limit or a limited CI runner is a real block.
-USAGE_LIMIT_REASON = re.compile(r"usage limit|quota|5-hour|\b(?:kimi|codex|claude)\b.*\blimit", re.IGNORECASE)
+# An agent's usage limit in a `loop-state blocked` reason (#88). A quota or a limit counts only next to an
+# agent's name, a few words at most and never across a `:` ("kimi hit its limit", "Kimi quota"), so real
+# blocks pass: "disk quota exceeded", "codex push failed: GitHub API rate limit", "CLAUDE.md line limit".
+_AGENT = r"\b(?:kimi|codex|claude)\b(?![.\w])(?:'s)?"
+USAGE_LIMIT_REASON = re.compile(
+    r"usage limit|5-hour"
+    rf"|(?:{_AGENT}|\b(?:plan|usage)\b)[^\w:]+quota"
+    rf"|{_AGENT}[^\w:]+(?:(?:is|at|hit|has|reached|its|out|of|the|5-hour|usage|weekly|daily)[^\w:]+){{0,4}}limit",
+    re.IGNORECASE)
 
 
 def cmd_loop_state(args: argparse.Namespace) -> int:

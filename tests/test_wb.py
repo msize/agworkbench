@@ -3183,22 +3183,34 @@ class WaitLimit(unittest.TestCase):
             with self.subTest(onLimit=value):
                 if value:
                     self.on_limit(value)
+                else:
+                    (self.state / 'implementer.json').unlink()      # no settings record: failover
+                self.err.seek(0)
+                self.err.truncate()
                 self.assertEqual(1, self.run_wb('wait-limit', '--reason', 'kimi limited'))
                 self.assertFalse((self.state / 'limit-request.json').exists())
                 self.assertIn('-Failover', self.err.getvalue())
 
     def test_blocked_for_a_usage_limit_is_refused_in_wait_mode(self):
         self.on_limit('wait')
-        for reason in ('implementer (kimi) at its usage limit', 'Kimi quota exhausted', 'waiting out the 5-HOUR window',
-                       'codex limited'):
+        for reason in ('implementer (kimi) at its usage limit', 'Kimi quota exhausted', "kimi's quota is used up",
+                       'plan quota reached', 'waiting out the 5-HOUR window', 'codex limited', 'Kimi hit its limit',
+                       'claude has reached the weekly limit'):
             with self.subTest(reason=reason):
+                self.err.seek(0)
+                self.err.truncate()
                 self.assertEqual(1, self.run_wb('loop-state', 'blocked', '--reason', reason))
                 self.assertIn('wb.py wait-limit', self.err.getvalue())
                 self.assertEqual(1, self.run_wb('loop-state', 'blocked', '--environmental', '--reason', reason))
         self.assertFalse((self.state / 'loop.json').exists())
-        for reason in ('GitHub API rate limit', 'CI runner limited', 'a question for the human'):
+        # FIX r1 M1: real blocks that mention a quota, or name an agent and later say "limit".
+        for reason in ('GitHub API rate limit', 'CI runner limited', 'a question for the human',
+                       'disk quota exceeded', 'GitHub Actions minutes quota exhausted', 'CI runner quota reached',
+                       'codex push failed: GitHub API rate limit', 'claude cannot push: GitHub API rate limit',
+                       'claude needs a human: PR body exceeds the 65536 char limit', 'kimi: CI time limit exceeded',
+                       'codex: CI runner time limit', 'codex sandbox: network limited', 'CLAUDE.md line limit question'):
             with self.subTest(reason=reason):
-                self.assertEqual(0, self.run_wb('loop-state', 'blocked', '--reason', reason))
+                self.assertEqual(0, self.run_wb('loop-state', 'blocked', '--environmental', '--reason', reason))
 
     def test_blocked_for_a_usage_limit_is_allowed_when_failing_over(self):
         self.on_limit('failover')
