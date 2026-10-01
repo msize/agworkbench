@@ -2427,6 +2427,28 @@ class ForcedWait(WaitOnLimitFixture):
         self.assertFalse(path.exists())
 
 
+class TodoPanelWait(WaitOnLimitFixture):
+    """#88 reopened (docxy #820): the limit error sits above Kimi's todo panel, not right above the box.
+    The limit check itself places it now: a plain (unforced) wait, held mail, a probe, and the end."""
+
+    def test_the_820_frame_is_waited_out_and_ends_when_the_error_is_gone(self):
+        self.check('kimi-limited-5hour-todo', times=relay.LIMIT_READS)
+        episode = self.episode()
+        self.assertEqual((True, True, None), (episode['wait'], episode['announced'], episode.get('forced')))
+        self.assertTrue(episode['line'].startswith("Error: [provider.auth_error] 403 You've reached your 5-hour"))
+        self.assertEqual(['usage limit: codex (kimi) waiting'], [m['subject'] for m in self.mails()])
+        self.tick(5)
+        self.send.assert_not_called()
+        self.assertEqual('usage limit, waiting it out', self.r.holds[('codex', 'm1')].reason)
+        self.until_retry()
+        self.assertEqual(1, len(self.probes_typed()))
+        self.check('\n' + kimi_frame('running-thinking'), times=3)      # working on the probe: not misses
+        self.assertIsNotNone(self.episode())
+        self.check('\n' + kimi_frame('idle-after-turn'), times=2)
+        self.assertIsNone(self.episode())
+        self.assertIn('usage limit episode ended for codex: the limit reset (probe 1)', self.logs)
+
+
 class LimitWindow(WaitOnLimitFixture):
     """#88: Kimi's 5-hour window gives no reset time; the relay probes at window start + 5 h + 60 s, when
     that comes before the next regular probe."""

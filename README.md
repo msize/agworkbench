@@ -776,7 +776,9 @@ What waits (#77), for a member launched with `-WaitOnLimit` (saved as `onLimit: 
   current window. The first probe after that comes 5 hours (plus a minute) after that time, when this
   is sooner than the next regular one (#88).
 - **A limit the relay could not place** still waits (#88). Kimi can draw its limit error under a tool
-  call, where it looks like that tool's output (docxy #775). When the stall watch then finds the
+  call, where it looks like that tool's output (docxy #775). Kimi's todo list, docked between the
+  transcript and the composer, is set aside before the limit check reads the rows above the box
+  (docxy #820). When the stall watch then finds the
   member idle with a Kimi limit error at the bottom of the implementer's pane, it starts the wait itself
   instead of pinging the planner. A planner that sees a limit the relay missed runs `wb.py wait-limit
   --reason "..."`, which starts the same wait. In a `-WaitOnLimit` loop `wb.py loop-state blocked`
@@ -906,6 +908,9 @@ under memory pressure, a helper may finish with nobody watching its result, or t
 stop to ask you a question. Each of these looks exactly like a loop waiting correctly. So on the same
 30 s reads the relay also watches for a **stall**. A loop is stalled when both agent panes are
 provably idle (no turn running, an empty composer), no mail is unread, and no helper is running.
+Mail to a Kimi implementer whose pane shows its usage limit does not count as unread: ringing it
+woke nothing, so the stall period still runs. With `-WaitOnLimit` the relay then waits the limit out;
+otherwise the stall pointer names the limit and the held mail (#88).
 It is not stalled when it is done, when it records that it waits on you (`wb.py status blocked`
 writes `.workbench/state/waiting.json`; loop.json `blocked` or `pr-open`), when a PR is open for
 your review (outside auto-merge), when an auto-merge PR still has a check running (the planner waits on

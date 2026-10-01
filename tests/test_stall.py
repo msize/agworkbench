@@ -499,6 +499,81 @@ class KimiLimitFallback(StallFixture):
         self.assertNotIn('limits', self.r.state)
 
 
+class HeldMail(StallFixture):
+    """#88 reopened (docxy #820): mail to a Kimi implementer at its usage limit wakes nothing - the relay
+    rang it and its turn failed - so it is held, not an exemption; the stall period still applies."""
+
+    def setUp(self):
+        super().setUp()
+        self.r.peers[1] = relay.Peer('codex', 'kimi', IMPLEMENTER)
+        frame = Path(__file__).resolve().parent / 'fixtures' / 'limits' / 'kimi-limited-5hour-todo.txt'
+        self.text[IMPLEMENTER] = frame.read_text(encoding='utf-8')
+        self.held = Path(self.mail('codex')).stem
+
+    def on_limit(self, value):
+        self.write('implementer.json', {'tool': 'kimi', 'onLimit': value})
+
+    def test_held_mail_is_not_an_exemption(self):
+        texts = self.r.read_panes()
+        self.assertEqual([], self.r.stall.exemptions([], texts))
+        self.assertEqual([f'codex/{self.held}'], self.r.stall.held)
+        self.assertEqual([f'unread mail codex/{self.held}'], self.r.stall.exemptions([]))   # no pane texts: as before
+        self.assertTrue(any(f'unread mail codex/{self.held} is held for the limited implementer' in line
+                            for line in self.logs), self.logs)
+
+    def test_wait_mode_starts_a_forced_wait(self):
+        self.on_limit('wait')
+        self.run_until(4 * S)
+        self.assertEqual([], self.stall_mail())
+        self.assertEqual([], self.escalations())
+        episode = self.r.state['limits']['codex']
+        self.assertEqual(('stall', True), (episode['forced'], episode['wait']))
+        self.assertTrue(episode['line'].startswith('Error: [provider.auth_error] 403'), episode['line'])
+
+    def test_failover_mode_points_at_the_limit_and_the_held_mail(self):
+        self.on_limit('failover')
+        self.run_until(S)
+        mails = self.stall_mail()
+        self.assertEqual(1, len(mails))
+        self.assertIn('mail held for the limited implementer', mails[0]['subject'])
+        self.assertNotIn('nothing unread', mails[0]['subject'])
+        self.assertNotIn('no unread mail in either box', mails[0]['body'])
+        self.assertIn(f'unread mail codex/{self.held} is held for the implementer at its usage limit', mails[0]['body'])
+        self.assertIn("The implementer's pane shows a usage-limit error: Error: [provider.auth_error] 403", mails[0]['body'])
+        self.assertNotIn('Todo', mails[0]['body'])
+
+    def test_a_relay_restarted_mid_limit_waits_it_out(self):
+        # The limit row was on screen when this relay started: the limit check keeps it as history, so only
+        # the stall watch's forced wait - which no baseline suppresses - can start the episode.
+        self.on_limit('wait')
+        for minute in range(0, 2 * S + 1):
+            self.t = minute * MIN
+            texts = self.r.read_panes()
+            self.r.check_limits(texts)
+            self.r.stall.tick(texts)
+            if minute < S:
+                self.assertNotIn('limits', self.r.state)
+        self.assertEqual(1, len(self.r.limit_baseline['codex']))
+        self.assertEqual('stall', self.r.state['limits']['codex']['forced'])
+        self.assertEqual([], self.stall_mail())
+
+    def test_unread_planner_mail_still_exempts(self):
+        self.on_limit('wait')
+        self.mail('claude', sender='human')
+        self.run_until(4 * S)
+        self.assertEqual([], self.stall_mail())
+        self.assertNotIn('limits', self.r.state)
+
+    def test_implementer_mail_without_a_limit_on_screen_still_exempts(self):
+        self.on_limit('wait')
+        kimi = Path(__file__).resolve().parent / 'fixtures' / 'kimi' / 'idle-after-turn.txt'
+        self.text[IMPLEMENTER] = kimi.read_text(encoding='utf-8')
+        self.run_until(4 * S)
+        self.assertEqual([], self.stall_mail())
+        self.assertEqual([], self.r.stall.held)
+        self.assertTrue(any(f'not stalled: unread mail codex/{self.held}' in line for line in self.logs), self.logs)
+
+
 class QuietHelper(StallFixture):
     def test_a_marker_less_helper_quiet_for_two_periods_stops_exempting_and_is_named(self):
         # G2: a helper killed under memory pressure leaves its pane on screen and never writes a marker.
@@ -542,6 +617,14 @@ class LastWords(unittest.TestCase):
         self.assertEqual('● Running a command · $ sleep 25 && echo slept', relay.last_words(kimi('running-tool'), 'kimi'))
         self.assertIsNone(relay.last_words(kimi('approval'), 'kimi'))       # no composer box: a dialog
         self.assertIsNone(relay.last_words(CLAUDE_IDLE, 'kimi'))
+
+    def test_kimi_last_paragraph_above_its_todo_panel(self):
+        # #88 reopened: docxy #820's stall pointer quoted the todo panel instead of the limit error.
+        frame = (Path(__file__).resolve().parent / 'fixtures' / 'limits' / 'kimi-limited-5hour-todo.txt').read_text(encoding='utf-8')
+        words = relay.last_words(frame, 'kimi')
+        self.assertTrue(words.startswith('…') and words.endswith("Please don't share it publicly."), words)
+        self.assertIn('the current 5-hour window ends', words)      # clipped from the front to LAST_WORDS_MAX
+        self.assertNotIn('Todo', words)
 
     def test_kimi_idle_blockers(self):
         kimi = lambda name: (Path(__file__).resolve().parent / 'fixtures' / 'kimi' / f'{name}.txt').read_text(encoding='utf-8')
